@@ -45,13 +45,22 @@ class SectionFeedback(BaseModel):
     Feedback specific to a section
     - **Description**:
         - Contains revision instructions for a specific section
+        - action values: 'expand', 'reduce', 'ok', 'fix_latex',
+          'resize_figures', 'move_to_appendix'
+        - structural_actions carries structured operation descriptors
     """
     section_type: str
     current_word_count: int
     target_word_count: int
-    action: str  # 'expand', 'reduce', 'ok'
+    action: str  # 'expand', 'reduce', 'ok', 'fix_latex', 'resize_figures', 'move_to_appendix'
     delta_words: int  # positive = add, negative = remove
     revision_prompt: str = ""
+    structural_actions: List[str] = Field(default_factory=list)
+    # structural_actions examples:
+    #   "figure*->figure:fig:arch"   — downgrade wide figure to single-column
+    #   "resize:fig:arch:0.8"        — resize figure width to 0.8\linewidth
+    #   "move_figure:fig:detail"     — move figure to appendix
+    #   "move_table:tab:results"     — move table to appendix
 
 
 class ReviewContext(BaseModel):

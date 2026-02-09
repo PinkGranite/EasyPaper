@@ -43,17 +43,22 @@ VENUE_CONFIGS: Dict[str, Dict] = {
     "DEFAULT": {"pages": 8, "words_per_page": 750, "abstract_limit": 150},
 }
 
-# Section word allocation ratios (sum to ~0.92, leaving room for figures/tables)
-SECTION_RATIOS: Dict[str, float] = {
-    "abstract": 0.022,      # ~150 words (fixed)
-    "introduction": 0.12,   # ~800 words
-    "related_work": 0.10,   # ~680 words
-    "method": 0.25,         # ~1700 words
-    "experiment": 0.20,     # ~1360 words
-    "result": 0.15,         # ~1020 words
-    "discussion": 0.05,     # ~340 words (optional)
-    "conclusion": 0.06,     # ~400 words
+# Fallback section word allocation ratios — ONLY used when no plan targets are
+# provided via ReviewContext.section_targets.  The Planner's per-section targets
+# are the canonical source of truth; these ratios exist solely as a safety net.
+_FALLBACK_SECTION_RATIOS: Dict[str, float] = {
+    "abstract": 0.022,
+    "introduction": 0.12,
+    "related_work": 0.10,
+    "method": 0.22,
+    "experiment": 0.18,
+    "result": 0.15,
+    "discussion": 0.05,
+    "conclusion": 0.035,
 }
+
+# Keep backward-compatible alias (deprecated; prefer plan targets)
+SECTION_RATIOS = _FALLBACK_SECTION_RATIOS
 
 # Tolerance for word count checks (percentage)
 TOLERANCE_PERCENT = 0.15  # 15% tolerance
@@ -100,14 +105,20 @@ class WordCountChecker(FeedbackChecker):
         target_words: int,
         sections: Dict[str, str],
     ) -> Dict[str, int]:
-        """Calculate target word count for each section"""
+        """
+        Calculate target word count for each section using fallback ratios.
+        - **Description**:
+            - Only called when no plan-provided section_targets exist.
+            - Uses _FALLBACK_SECTION_RATIOS for known sections.
+            - Gives unknown sections a small default allocation.
+        """
         targets = {}
         for section_type in sections.keys():
-            if section_type in SECTION_RATIOS:
-                targets[section_type] = int(target_words * SECTION_RATIOS[section_type])
+            if section_type in _FALLBACK_SECTION_RATIOS:
+                targets[section_type] = int(target_words * _FALLBACK_SECTION_RATIOS[section_type])
             else:
-                # Unknown section, give it a small allocation
-                targets[section_type] = int(target_words * 0.05)
+                # Unknown / dynamic section: give proportional allocation
+                targets[section_type] = int(target_words * 0.08)
         return targets
     
     async def check(self, context: "ReviewContext") -> "FeedbackResult":

@@ -15,6 +15,17 @@ async def lifespan(app: FastAPI):
     # Register agent routers
     register_agent_routers(app, app.state.agents)
     print(f"✅ Loaded config from env path with {len(app.state.agents)} agents.")
+    # Print model info for each agent (never print api keys)
+    for agent_cfg in config.agents:
+        model = agent_cfg.model
+        # Mask base_url to show only the host
+        base_host = model.base_url.rstrip("/").split("//")[-1].split("/")[0] if model.base_url else "default"
+        extra = ""
+        if agent_cfg.vlm_review_config and agent_cfg.vlm_review_config.vlm_model:
+            vlm = agent_cfg.vlm_review_config
+            vlm_host = vlm.vlm_base_url.rstrip("/").split("//")[-1].split("/")[0] if vlm.vlm_base_url else base_host
+            extra = f"  vlm_model={vlm.vlm_model} vlm_host={vlm_host}"
+        print(f"   {agent_cfg.name:<20} model={model.model_name:<30} base={base_host}{extra}")
     yield
     # Shutdown
     pass

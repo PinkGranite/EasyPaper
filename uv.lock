@@ -19,6 +19,7 @@ dependencies = [
     { name = "pymupdf" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "python-dotenv" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -36,6 +37,7 @@ requires-dist = [
     { name = "pymupdf", specifier = ">=1.26.7" },
     { name = "pytest", specifier = ">=7.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.21.0" },
+    { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30.0,<0.31" },
 ]
 

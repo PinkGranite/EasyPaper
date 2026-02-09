@@ -42,6 +42,8 @@ MAIN_TEX_TEMPLATE = """{{ preamble }}
 
 \\begin{document}
 
+\\maketitle
+
 {{ content }}
 
 {% if has_bibliography %}
@@ -59,6 +61,9 @@ class TypesetterAgentState(TypedDict):
     """
     messages: Annotated[list[AnyMessage], operator.add]
     latex_content: Optional[str]
+    sections: Optional[Dict[str, str]]  # Multi-file mode: section_type -> content
+    section_order: Optional[List[str]]  # Multi-file mode: body section ordering
+    section_titles: Optional[Dict[str, str]]  # Multi-file mode: section_type -> display title
     template_path: Optional[str]
     template_config: Optional[TemplateConfig]  # Template configuration with constraints
     figure_ids: Optional[List[str]]
@@ -74,6 +79,7 @@ class TypesetterAgentState(TypedDict):
     resources: Optional[List[ResourceInfo]]
     bib_entries: Optional[List[BibEntry]]
     compiled_tex: Optional[str]
+    section_file_map: Optional[Dict[str, str]]  # Multi-file mode: section_type -> rel path
     compilation_result: Optional[CompilationResult]
     llm_calls: int
 
@@ -537,6 +543,156 @@ class TypesetterAgent(BaseAgent):
         
         return "\n".join(preamble_parts)
 
+    # Default section ordering and titles for multi-file mode
+    DEFAULT_SECTION_ORDER = [
+        "introduction", "related_work", "method", "experiment", "result", "conclusion",
+    ]
+    DEFAULT_SECTION_TITLES = {
+        "introduction": "Introduction",
+        "related_work": "Related Work",
+        "method": "Methodology",
+        "experiment": "Experiments",
+        "result": "Results",
+        "conclusion": "Conclusion",
+        "appendix": "Appendix",
+    }
+
+    @staticmethod
+    def _strip_leading_section_command(content: str) -> str:
+        """
+        Strip all leading \\section{} and \\section*{} commands from content.
+        - **Description**:
+            - WriterAgent output may already contain \\section{Title} commands
+            - Since _write_section_files always prepends its own canonical
+              \\section{Title}, any existing ones must be removed to avoid duplicates
+            - Also strips multiple consecutive section commands (e.g. \\section{Results}
+              followed by \\section*{Result})
+
+        - **Args**:
+            - `content` (str): Raw LaTeX section content
+
+        - **Returns**:
+            - `str`: Content with leading section commands removed
+        """
+        # Repeatedly strip leading \section{...} or \section*{...} commands
+        # Also handle optional \label{...} right after the section command
+        pattern = r'^\s*\\section\*?\{[^}]*\}\s*(?:\\label\{[^}]*\}\s*)?'
+        prev = None
+        while prev != content:
+            prev = content
+            content = re.sub(pattern, '', content, count=1)
+        return content.strip()
+
+    def _write_section_files(
+        self,
+        work_dir: str,
+        sections: Dict[str, str],
+        section_order: Optional[List[str]] = None,
+        section_titles: Optional[Dict[str, str]] = None,
+        citation_style: str = "cite",
+    ) -> Dict[str, str]:
+        """
+        Write each section to an independent .tex file under work_dir/sections/.
+        - **Description**:
+            - Creates a sections/ subdirectory inside the working directory
+            - Writes each section as a standalone .tex file
+            - Body sections get a \\section{Title} command prepended
+            - Abstract does not get a \\section{} command
+            - Applies citation style conversion to each section
+
+        - **Args**:
+            - `work_dir` (str): The LaTeX compilation working directory
+            - `sections` (Dict[str, str]): section_type -> raw LaTeX content
+            - `section_order` (List[str], optional): Order of body sections
+            - `section_titles` (Dict[str, str], optional): section_type -> display title
+            - `citation_style` (str): Citation command style to apply
+
+        - **Returns**:
+            - `section_file_map` (Dict[str, str]): section_type -> relative path from work_dir
+        """
+        order = section_order or self.DEFAULT_SECTION_ORDER
+        titles = section_titles or self.DEFAULT_SECTION_TITLES
+
+        sections_dir = os.path.join(work_dir, "sections")
+        os.makedirs(sections_dir, exist_ok=True)
+
+        section_file_map: Dict[str, str] = {}
+
+        # Write abstract separately (no \section{} command)
+        if "abstract" in sections and sections["abstract"].strip():
+            abstract_content = sections["abstract"].strip()
+            # Strip any existing \begin{abstract}/\end{abstract} tags
+            abstract_content = re.sub(r'^\\begin\{abstract\}\s*', '', abstract_content)
+            abstract_content = re.sub(r'\s*\\end\{abstract\}$', '', abstract_content)
+            abstract_content = self._apply_citation_style(abstract_content, citation_style)
+            # Escape unescaped % characters
+            abstract_content = re.sub(r'(?<!\\)%', r'\\%', abstract_content)
+
+            abstract_path = os.path.join(sections_dir, "abstract.tex")
+            with open(abstract_path, "w", encoding="utf-8") as f:
+                f.write(abstract_content + "\n")
+            section_file_map["abstract"] = "sections/abstract"
+            logger.info("typesetter.write_section file=sections/abstract.tex chars=%d", len(abstract_content))
+
+        # Write body sections in order
+        for section_type in order:
+            if section_type not in sections or not sections[section_type].strip():
+                continue
+
+            content = sections[section_type].strip()
+            # Strip any leading \section{} or \section*{} already in the content
+            # to avoid duplicates (WriterAgent may include them)
+            content = self._strip_leading_section_command(content)
+            content = self._apply_citation_style(content, citation_style)
+            # Escape unescaped % characters
+            content = re.sub(r'(?<!\\)%', r'\\%', content)
+
+            title = titles.get(section_type, section_type.replace("_", " ").title())
+
+            # Appendix sections get \appendix prefix instead of plain \section
+            if section_type == "appendix":
+                file_content = f"\\appendix\n\\section{{{title}}}\n\n{content}\n"
+            else:
+                file_content = f"\\section{{{title}}}\n\n{content}\n"
+
+            file_name = f"{section_type}.tex"
+            file_path = os.path.join(sections_dir, file_name)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(file_content)
+            section_file_map[section_type] = f"sections/{section_type}"
+            logger.info("typesetter.write_section file=sections/%s chars=%d", file_name, len(file_content))
+
+        # Write any remaining sections not in the order list (excluding abstract)
+        for section_type, content in sections.items():
+            if section_type == "abstract" or section_type in section_file_map:
+                continue
+            if not content.strip():
+                continue
+
+            content = content.strip()
+            content = self._strip_leading_section_command(content)
+            content = self._apply_citation_style(content, citation_style)
+            content = re.sub(r'(?<!\\)%', r'\\%', content)
+
+            title = titles.get(section_type, section_type.replace("_", " ").title())
+
+            # Appendix sections get \appendix prefix
+            if section_type == "appendix":
+                file_content = f"\\appendix\n\\section{{{title}}}\n\n{content}\n"
+            else:
+                file_content = f"\\section{{{title}}}\n\n{content}\n"
+
+            file_name = f"{section_type}.tex"
+            file_path = os.path.join(sections_dir, file_name)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(file_content)
+            section_file_map[section_type] = f"sections/{section_type}"
+            logger.info("typesetter.write_section file=sections/%s chars=%d", file_name, len(file_content))
+
+        logger.info("typesetter.write_sections total=%d files=%s",
+                     len(section_file_map), list(section_file_map.keys()))
+        return section_file_map
+
     def _apply_citation_style(self, content: str, citation_style: str) -> str:
         """
         Apply citation style to content
@@ -755,11 +911,17 @@ class TypesetterAgent(BaseAgent):
                         f'\\maketitle\n\n{body_content}'
                     )
             else:
-                # Insert after \begin{document}
-                result = result.replace(
-                    '\\begin{document}',
-                    f'\\begin{{document}}\n\n{body_content}'
-                )
+                # Insert after \begin{document}, adding \maketitle if missing
+                if '\\maketitle' not in result:
+                    result = result.replace(
+                        '\\begin{document}',
+                        f'\\begin{{document}}\n\n\\maketitle\n\n{body_content}'
+                    )
+                else:
+                    result = result.replace(
+                        '\\begin{document}',
+                        f'\\begin{{document}}\n\n{body_content}'
+                    )
         
         # Step 5: Ensure bibliography is included (fallback if not preserved from template)
         if bib_entries and '\\bibliography' not in result and '\\printbibliography' not in result:
@@ -783,6 +945,10 @@ class TypesetterAgent(BaseAgent):
         """
         Inject content into LaTeX template
         - **Description**:
+            - Supports two modes:
+              1. Legacy: single latex_content string, parsed and injected inline
+              2. Multi-file: sections dict, each section written to its own .tex file,
+                 main.tex uses \\input{sections/xxx} commands
             - Smart injection that handles title, abstract, and sections
             - Uses detected main_tex_path from template
             - Falls back to building from TemplateConfig if no template
@@ -791,12 +957,15 @@ class TypesetterAgent(BaseAgent):
             - `state` (TypesetterAgentState): Current workflow state
 
         - **Returns**:
-            - `dict`: Updated state with compiled_tex
+            - `dict`: Updated state with compiled_tex and optionally section_file_map
         """
         logger.info("typesetter.inject_template start")
         
         work_dir = state.get("work_dir")
         latex_content = state.get("latex_content", "")
+        sections_dict = state.get("sections")  # Multi-file mode
+        section_order = state.get("section_order")
+        section_titles = state.get("section_titles")
         resources = state.get("resources", [])
         bib_entries = state.get("bib_entries", [])
         template_config = state.get("template_config")
@@ -805,6 +974,115 @@ class TypesetterAgent(BaseAgent):
         # Create default template_config if not provided
         if template_config is None:
             template_config = TemplateConfig()
+        
+        # Determine final main.tex path
+        final_main_tex = os.path.join(work_dir, "main.tex")
+        
+        # =====================================================================
+        # Multi-file mode: sections dict provided
+        # =====================================================================
+        if sections_dict:
+            logger.info("typesetter.inject_template mode=multi-file sections=%s",
+                        list(sections_dict.keys()))
+            
+            # Replace figure placeholders in each section
+            for resource in resources:
+                if resource.status == "downloaded" and resource.local_path:
+                    rel_path = os.path.relpath(resource.local_path, work_dir)
+                    rel_path_no_ext = os.path.splitext(rel_path)[0]
+                    for sec_type in list(sections_dict.keys()):
+                        sections_dict[sec_type] = sections_dict[sec_type].replace(
+                            f"\\includegraphics{{{resource.resource_id}}}",
+                            f"\\includegraphics{{{rel_path_no_ext}}}"
+                        )
+                        sections_dict[sec_type] = re.sub(
+                            rf'\\includegraphics\[([^\]]*)\]\{{{resource.resource_id}\}}',
+                            rf'\\includegraphics[\1]{{{rel_path_no_ext}}}',
+                            sections_dict[sec_type]
+                        )
+            
+            # Write individual section files
+            section_file_map = self._write_section_files(
+                work_dir=work_dir,
+                sections=sections_dict,
+                section_order=section_order,
+                section_titles=section_titles,
+                citation_style=template_config.citation_style,
+            )
+            
+            # Build \input{} commands for body sections
+            order = section_order or self.DEFAULT_SECTION_ORDER
+            input_commands = []
+            for sec_type in order:
+                if sec_type in section_file_map:
+                    input_commands.append(f"\\input{{{section_file_map[sec_type]}}}")
+            # Add any extra sections not in the order
+            for sec_type, rel_path in section_file_map.items():
+                if sec_type != "abstract" and sec_type not in order:
+                    input_commands.append(f"\\input{{{rel_path}}}")
+            
+            body_input_text = "\n\n".join(input_commands)
+            
+            # Abstract \input command
+            abstract_input = ""
+            if "abstract" in section_file_map:
+                abstract_input = f"\\input{{{section_file_map['abstract']}}}"
+            
+            # Inject into template
+            if main_tex_path and os.path.exists(main_tex_path):
+                logger.info("typesetter.using_template file=%s", os.path.basename(main_tex_path))
+                with open(main_tex_path, "r", encoding="utf-8", errors="ignore") as f:
+                    template_content = f.read()
+                
+                # Build a sections dict compatible with _smart_inject_content
+                # but using \input commands instead of inline content
+                input_sections = {
+                    "abstract": abstract_input,
+                    "body": body_input_text,
+                }
+                compiled_tex = self._smart_inject_content(
+                    template_content, input_sections, template_config, bib_entries
+                )
+                
+                # Copy template directory files if needed
+                if main_tex_path != final_main_tex:
+                    template_dir = os.path.dirname(main_tex_path)
+                    if template_dir != work_dir:
+                        for item in os.listdir(template_dir):
+                            src = os.path.join(template_dir, item)
+                            dst = os.path.join(work_dir, item)
+                            if os.path.isfile(src) and not os.path.exists(dst):
+                                shutil.copy2(src, dst)
+            else:
+                # No template - build from config with \input commands
+                logger.info("typesetter.no_template building_from_config mode=multi-file")
+                preamble = self._build_preamble_from_config(template_config)
+                
+                full_content = ""
+                if abstract_input:
+                    full_content = f"\\begin{{abstract}}\n{abstract_input}\n\\end{{abstract}}\n\n"
+                full_content += body_input_text
+                
+                bib_style = template_config.bib_style or "plain"
+                template = Template(MAIN_TEX_TEMPLATE)
+                compiled_tex = template.render(
+                    preamble=preamble,
+                    content=full_content,
+                    has_bibliography=len(bib_entries) > 0,
+                    bib_style=bib_style,
+                )
+            
+            # Write main.tex
+            with open(final_main_tex, "w", encoding="utf-8") as f:
+                f.write(compiled_tex)
+            logger.info("typesetter.written_main_tex chars=%d mode=multi-file", len(compiled_tex))
+            
+            return {"compiled_tex": compiled_tex, "section_file_map": section_file_map}
+        
+        # =====================================================================
+        # Legacy mode: single latex_content string
+        # =====================================================================
+        logger.info("typesetter.inject_template mode=legacy")
         
         # Apply citation style to content
         latex_content = self._apply_citation_style(latex_content, template_config.citation_style)
@@ -829,9 +1107,6 @@ class TypesetterAgent(BaseAgent):
         logger.info("typesetter.parsed_sections abstract_chars=%d body_chars=%d", 
                     len(sections.get('abstract', '')), len(sections.get('body', '')))
         
-        # Determine final main.tex path
-        final_main_tex = os.path.join(work_dir, "main.tex")
-        
         if main_tex_path and os.path.exists(main_tex_path):
             # Use detected template main tex
             logger.info("typesetter.using_template file=%s", os.path.basename(main_tex_path))
@@ -849,7 +1124,6 @@ class TypesetterAgent(BaseAgent):
             # If the original file wasn't main.tex, we still write to main.tex
             # but also copy other template files
             if main_tex_path != final_main_tex:
-                # Template was in a different file, copy its directory structure
                 template_dir = os.path.dirname(main_tex_path)
                 if template_dir != work_dir:
                     for item in os.listdir(template_dir):
@@ -881,7 +1155,7 @@ class TypesetterAgent(BaseAgent):
         # Write main.tex
         with open(final_main_tex, "w", encoding="utf-8") as f:
             f.write(compiled_tex)
-        logger.info("typesetter.written_main_tex chars=%d", len(compiled_tex))
+        logger.info("typesetter.written_main_tex chars=%d mode=legacy", len(compiled_tex))
         
         return {"compiled_tex": compiled_tex}
 
@@ -933,6 +1207,15 @@ class TypesetterAgent(BaseAgent):
                     if os.path.isfile(fig_src):
                         fig_dst = os.path.join(output_figures, fig_file)
                         files_to_copy.append((fig_src, fig_dst))
+            elif os.path.isdir(src_path) and item == 'sections':
+                # Copy sections directory (multi-file mode)
+                output_sections = os.path.join(output_dir, "sections")
+                os.makedirs(output_sections, exist_ok=True)
+                for sec_file in os.listdir(src_path):
+                    sec_src = os.path.join(src_path, sec_file)
+                    if os.path.isfile(sec_src):
+                        sec_dst = os.path.join(output_sections, sec_file)
+                        files_to_copy.append((sec_src, sec_dst))
         
         # Perform the copy
         for src, dst in files_to_copy:
@@ -961,6 +1244,7 @@ class TypesetterAgent(BaseAgent):
         
         work_dir = state.get("work_dir")
         output_dir = state.get("output_dir")
+        section_file_map = state.get("section_file_map")  # From inject_template multi-file mode
         main_tex = os.path.join(work_dir, "main.tex")
         
         result = CompilationResult(
@@ -969,6 +1253,13 @@ class TypesetterAgent(BaseAgent):
             errors=[],
             warnings=[],
         )
+        
+        # Populate section_files if we have the mapping
+        if section_file_map:
+            result.section_files = {
+                sec_type: os.path.join(work_dir, rel_path + ".tex")
+                for sec_type, rel_path in section_file_map.items()
+            }
         
         for attempt in range(MAX_COMPILE_ATTEMPTS):
             result.attempts = attempt + 1
@@ -1054,6 +1345,12 @@ class TypesetterAgent(BaseAgent):
                             log_content = f.read()
                             result.log_content = log_content[-5000:]
                             result.warnings = self._extract_warnings(log_content)
+                            # Also extract section-level errors (may exist even on success)
+                            if section_file_map:
+                                result.errors = self._extract_errors(log_content)
+                                result.section_errors = self._extract_section_errors(
+                                    log_content, section_file_map
+                                )
                     
                     logger.info("typesetter.compile_success")
                     
@@ -1074,8 +1371,15 @@ class TypesetterAgent(BaseAgent):
                             log_content = f.read()
                             result.log_content = log_content[-5000:]
                             result.errors = self._extract_errors(log_content)
+                            # Extract per-section errors if multi-file mode
+                            if section_file_map:
+                                result.section_errors = self._extract_section_errors(
+                                    log_content, section_file_map
+                                )
                     
-                    logger.warning("typesetter.compile_failed errors=%s", result.errors[:2])
+                    logger.warning("typesetter.compile_failed errors=%s section_errors=%s",
+                                   result.errors[:2],
+                                   {k: v[:1] for k, v in result.section_errors.items()} if result.section_errors else {})
                     
                     # Try to fix errors
                     if attempt < MAX_COMPILE_ATTEMPTS - 1:
@@ -1130,6 +1434,109 @@ class TypesetterAgent(BaseAgent):
         
         return list(set(warnings))[:10]
 
+    def _extract_section_errors(
+        self,
+        log_content: str,
+        section_file_map: Dict[str, str],
+    ) -> Dict[str, List[str]]:
+        """
+        Extract per-section errors from LaTeX log using file tracking.
+        - **Description**:
+            - pdflatex logs file switches with parentheses: (./sections/intro.tex ... )
+            - Tracks the current file context as the log is parsed line by line
+            - Maps errors to their source section based on the active file
+
+        - **Args**:
+            - `log_content` (str): Full LaTeX compilation log
+            - `section_file_map` (Dict[str, str]): section_type -> relative path (no .tex)
+
+        - **Returns**:
+            - `section_errors` (Dict[str, List[str]]): section_type -> list of error messages
+        """
+        # Build reverse mapping: filename -> section_type
+        # section_file_map is like {"introduction": "sections/introduction"}
+        file_to_section: Dict[str, str] = {}
+        for section_type, rel_path in section_file_map.items():
+            # Match both "sections/introduction.tex" and "./sections/introduction.tex"
+            fname = rel_path + ".tex"
+            file_to_section[fname] = section_type
+            file_to_section["./" + fname] = section_type
+
+        section_errors: Dict[str, List[str]] = {}
+        
+        # Track the file stack (pdflatex uses nested parentheses for file context)
+        file_stack: List[str] = []
+        current_section: Optional[str] = None
+        
+        lines = log_content.split('\n')
+        for line in lines:
+            # Track file context changes via parentheses
+            # Opening: (./sections/introduction.tex
+            # Closing: )
+            # These can appear multiple times on a single line
+            i = 0
+            while i < len(line):
+                if line[i] == '(' and i + 1 < len(line):
+                    # Find the file path after '('
+                    rest = line[i + 1:]
+                    # Extract path: up to space, newline, or another '('
+                    match = re.match(r'([^\s()]+)', rest)
+                    if match:
+                        fpath = match.group(1)
+                        file_stack.append(fpath)
+                        # Check if this file is one of our sections
+                        sec = file_to_section.get(fpath)
+                        if sec:
+                            current_section = sec
+                        i += 1 + len(match.group(0))
+                        continue
+                elif line[i] == ')':
+                    if file_stack:
+                        popped = file_stack.pop()
+                        popped_sec = file_to_section.get(popped)
+                        if popped_sec and popped_sec == current_section:
+                            # Exiting the current section file
+                            # Recompute current_section from remaining stack
+                            current_section = None
+                            for f in reversed(file_stack):
+                                sec = file_to_section.get(f)
+                                if sec:
+                                    current_section = sec
+                                    break
+                    i += 1
+                    continue
+                i += 1
+            
+            # Check if this line contains an error
+            if line.startswith('!'):
+                error_msg = line[2:].strip() if len(line) > 2 else line.strip()
+                if current_section and error_msg:
+                    if current_section not in section_errors:
+                        section_errors[current_section] = []
+                    section_errors[current_section].append(error_msg)
+            
+            # Also check for line-number references: "l.42 ..."
+            # These confirm the error location within the current file
+            line_match = re.match(r'^l\.(\d+)\s+(.*)', line)
+            if line_match and current_section:
+                line_num = line_match.group(1)
+                context = line_match.group(2).strip()
+                if context and section_errors.get(current_section):
+                    # Append line context to the last error for this section
+                    last_err = section_errors[current_section][-1]
+                    if f" (line {line_num})" not in last_err:
+                        section_errors[current_section][-1] = f"{last_err} (line {line_num})"
+
+        # Limit errors per section
+        for sec_type in section_errors:
+            section_errors[sec_type] = section_errors[sec_type][:10]
+        
+        if section_errors:
+            logger.info("typesetter.section_errors %s",
+                        {k: len(v) for k, v in section_errors.items()})
+        
+        return section_errors
+
     async def _try_fix_errors(self, work_dir: str, main_tex: str, errors: List[str]) -> bool:
         """
         Try to fix common LaTeX errors
@@ -1180,7 +1587,10 @@ class TypesetterAgent(BaseAgent):
         return False
 
     async def run(self,
-                  latex_content: str,
+                  latex_content: str = "",
+                  sections: Optional[Dict[str, str]] = None,
+                  section_order: Optional[List[str]] = None,
+                  section_titles: Optional[Dict[str, str]] = None,
                   template_path: Optional[str] = None,
                   template_config: Optional[TemplateConfig] = None,
                   figure_ids: Optional[List[str]] = None,
@@ -1193,8 +1603,16 @@ class TypesetterAgent(BaseAgent):
                   converted_tables: Optional[Dict[str, str]] = None):
         """
         Run the Typesetter Agent
+        - **Description**:
+            - Supports two content modes (mutually exclusive):
+              1. latex_content: Single concatenated LaTeX body (legacy)
+              2. sections: Per-section content dict for multi-file output
+
         - **Args**:
-            - `latex_content` (str): LaTeX content to compile
+            - `latex_content` (str): LaTeX content to compile (legacy single-string mode)
+            - `sections` (Dict[str, str], optional): Per-section content (multi-file mode)
+            - `section_order` (List[str], optional): Body section ordering for multi-file mode
+            - `section_titles` (Dict[str, str], optional): section_type -> display title
             - `template_path` (str, optional): Path to template zip
             - `template_config` (TemplateConfig, optional): Template configuration with constraints
             - `figure_ids` (List[str], optional): Figure IDs to fetch
@@ -1211,6 +1629,9 @@ class TypesetterAgent(BaseAgent):
         """
         return await self.agent.ainvoke({
             "latex_content": latex_content,
+            "sections": sections,
+            "section_order": section_order,
+            "section_titles": section_titles,
             "template_path": template_path,
             "template_config": template_config,
             "figure_ids": figure_ids or [],

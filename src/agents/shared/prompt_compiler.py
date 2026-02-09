@@ -368,6 +368,7 @@ def compile_body_section_prompt(
     section_plan: Any = None,  # SectionPlan from planner
     figures: List[Any] = None,  # FigureSpec list
     tables: List[Any] = None,   # TableSpec list
+    converted_tables: Optional[Dict[str, str]] = None,  # table_id -> LaTeX code
 ) -> str:
     """
     Compile prompt for Body section generation (Phase 2)
@@ -503,28 +504,38 @@ def compile_body_section_prompt(
                 table_map[tbl_id] = tbl
     
     # Add tables to DEFINE (create \begin{table} environment)
+    _converted = converted_tables or {}
     if tables_to_define:
         prompt += f"\n## Tables to DEFINE in this section\n"
-        prompt += "**CREATE the complete table environment for each table below.**\n\n"
+        prompt += "**Include the complete table environment for each table below.**\n\n"
         for tbl_id in tables_to_define:
             tbl = table_map.get(tbl_id)
             if tbl:
                 caption = tbl.caption if hasattr(tbl, 'caption') else tbl.get('caption', '')
                 desc = tbl.description if hasattr(tbl, 'description') else tbl.get('description', '')
-                content = tbl.content if hasattr(tbl, 'content') else tbl.get('content', '')
                 wide = tbl.wide if hasattr(tbl, 'wide') else tbl.get('wide', False)
-                
-                # Use table* for wide tables (double-column spanning)
                 env_name = "table*" if wide else "table"
-                
-                prompt += f"- **{tbl_id}**: {caption}\n"
-                if desc:
-                    prompt += f"  Description: {desc}\n"
-                if content:
-                    prompt += f"  Data:\n  {content[:500]}\n"
-                if wide:
-                    prompt += f"  **Note: This is a WIDE table - use {env_name} to span both columns.**\n"
-                prompt += f"  **Required: Create \\\\begin{{{env_name}}}...\\\\end{{{env_name}}} with \\\\label{{{tbl_id}}}**\n\n"
+
+                # If pre-converted LaTeX exists, give it directly (like figures)
+                if tbl_id in _converted:
+                    prompt += f"- **{tbl_id}**: {caption}\n"
+                    if desc:
+                        prompt += f"  Description: {desc}\n"
+                    prompt += f"  **Required LaTeX (include this exact table in your output):**\n"
+                    prompt += f"  ```latex\n"
+                    prompt += f"  {_converted[tbl_id]}\n"
+                    prompt += f"  ```\n\n"
+                else:
+                    # Fallback: ask Writer to create from raw content
+                    content = tbl.content if hasattr(tbl, 'content') else tbl.get('content', '')
+                    prompt += f"- **{tbl_id}**: {caption}\n"
+                    if desc:
+                        prompt += f"  Description: {desc}\n"
+                    if content:
+                        prompt += f"  Data:\n  {content[:500]}\n"
+                    if wide:
+                        prompt += f"  **Note: This is a WIDE table - use {env_name} to span both columns.**\n"
+                    prompt += f"  **Required: Create \\\\begin{{{env_name}}}...\\\\end{{{env_name}}} with \\\\label{{{tbl_id}}}**\n\n"
     
     # Add tables to REFERENCE only (use \ref{})
     if tables_to_reference:

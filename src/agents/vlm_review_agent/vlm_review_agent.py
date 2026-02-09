@@ -54,7 +54,8 @@ Return ONLY this JSON structure:
     "is_overflow": <true if content beyond margins>,
     "blank_spaces": [{"location": "<top/bottom/left/right/center>", "size": "<small/medium/large>"}],
     "layout_issues": [{"type": "<widow/orphan/bad_figure/equation_overflow>", "description": "<details>", "severity": "<low/medium/high>"}],
-    "is_references_page": <true if this page contains bibliography/references>
+    "is_references_page": <true if this page contains bibliography/references>,
+    "is_appendix_page": <true if this page is part of an appendix section (look for "Appendix" heading or "A.", "B." style section numbering)>
 }"""
 
 LAST_PAGE_PROMPT = """Analyze this LAST page of an academic paper. Respond with JSON only.
@@ -251,19 +252,30 @@ class VLMReviewAgent(BaseAgent):
             return {"total_pages": 0, "error": str(e)}
     
     async def _check_overflow_quick(self, state: VLMReviewState) -> Dict[str, Any]:
-        """Quick check for page overflow using page count"""
+        """
+        Quick check for page overflow using page count.
+        - **Description**:
+            - Page limits apply to the MAIN BODY only (excluding references
+              and appendix).  Since this quick check has no VLM info to
+              distinguish page types, we add a buffer of 2 pages to allow
+              for references (~1 page) and appendix (~1 page).
+            - The precise check happens later in _generate_result() after
+              VLM classifies each page.
+        """
         total_pages = state["total_pages"]
         page_limit = state["request"].page_limit
         
-        is_overflow = total_pages > page_limit
-        overflow_pages = max(0, total_pages - page_limit)
+        # Allow extra pages for references + appendix (no VLM data yet)
+        quick_limit = page_limit + 2
+        is_overflow = total_pages > quick_limit
+        overflow_pages = max(0, total_pages - quick_limit)
         
         if is_overflow:
-            print(f"[VLMReview] OVERFLOW: {total_pages} pages > limit {page_limit}")
+            print(f"[VLMReview] QUICK OVERFLOW: {total_pages} pages > limit {page_limit}+2 buffer")
             issue = LayoutIssue(
                 issue_type=IssueType.OVERFLOW,
                 severity=IssueSeverity.CRITICAL,
-                description=f"PDF has {total_pages} pages, exceeds limit of {page_limit}",
+                description=f"PDF has {total_pages} pages, likely exceeds body limit of {page_limit}",
                 page_number=page_limit + 1,
             )
             return {
@@ -271,7 +283,7 @@ class VLMReviewAgent(BaseAgent):
                 "issues": [issue],
             }
         else:
-            print(f"[VLMReview] Page count OK: {total_pages} <= {page_limit}")
+            print(f"[VLMReview] Quick page count OK: {total_pages} <= {page_limit}+2 buffer")
             return {"overflow_detected": False}
     
     def _should_analyze_with_vlm(self, state: VLMReviewState) -> str:
@@ -349,8 +361,8 @@ class VLMReviewAgent(BaseAgent):
                     # Collect issues
                     issues.extend(analysis.layout_issues)
                     
-                    # Check for underfill on last page
-                    if is_last and not analysis.is_references_page:
+                    # Check for underfill on last page (only if it's body content)
+                    if is_last and not analysis.is_references_page and not analysis.is_appendix_page:
                         if analysis.fill_percentage < request.min_fill_percentage * 100:
                             underfill_detected = True
                             issues.append(LayoutIssue(
@@ -381,24 +393,50 @@ class VLMReviewAgent(BaseAgent):
         }
     
     async def _generate_result(self, state: VLMReviewState) -> Dict[str, Any]:
-        """Generate final review result"""
+        """
+        Generate final review result.
+        - **Description**:
+            - Page limit applies to main body only (excludes references
+              and appendix pages).  Uses content_pages for overflow check.
+        """
         request = state["request"]
         total_pages = state["total_pages"]
         page_analyses = state.get("page_analyses", [])
         issues = state.get("issues", [])
-        overflow_detected = state.get("overflow_detected", False)
+        overflow_detected_quick = state.get("overflow_detected", False)
         underfill_detected = state.get("underfill_detected", False)
         
-        # Calculate overflow
-        overflow_pages = max(0, total_pages - request.page_limit)
-        
-        # Estimate content pages (exclude references)
+        # Estimate content pages (exclude references AND appendix)
         content_pages = total_pages
-        for analysis in reversed(page_analyses):
-            if analysis.is_references_page:
+        for analysis in page_analyses:
+            if analysis.is_references_page or analysis.is_appendix_page:
                 content_pages -= 1
-            else:
-                break
+
+        # Precise overflow based on content pages (body only)
+        overflow_pages = max(0, content_pages - request.page_limit)
+        overflow_detected = content_pages > request.page_limit
+
+        print(
+            f"[VLMReview] Page breakdown: total={total_pages} "
+            f"content(body)={content_pages} refs+appendix={total_pages - content_pages} "
+            f"limit={request.page_limit} overflow={overflow_pages}"
+        )
+
+        # Remove quick-check overflow issues if precise check says OK
+        if overflow_detected_quick and not overflow_detected:
+            issues = [i for i in issues if i.issue_type != IssueType.OVERFLOW]
+            print("[VLMReview] Quick overflow was false positive (refs/appendix pages)")
+        # Add precise overflow issue if needed and not already present
+        if overflow_detected and not any(i.issue_type == IssueType.OVERFLOW for i in issues):
+            issues.append(LayoutIssue(
+                issue_type=IssueType.OVERFLOW,
+                severity=IssueSeverity.CRITICAL,
+                description=(
+                    f"Body has {content_pages} pages, exceeds limit of "
+                    f"{request.page_limit} (total PDF: {total_pages} pages)"
+                ),
+                page_number=request.page_limit + 1,
+            ))
         
         # Generate section recommendations
         section_recommendations = self._generate_section_advice(
@@ -414,8 +452,15 @@ class VLMReviewAgent(BaseAgent):
         trim_target = overflow_pages * words_per_page if overflow_detected else 0
         expand_target = 0
         if underfill_detected and page_analyses:
-            last_fill = page_analyses[-1].fill_percentage / 100
-            expand_target = int((1 - last_fill) * words_per_page * 0.8)  # 80% of available
+            # Find last content page for underfill calculation
+            last_content = None
+            for a in reversed(page_analyses):
+                if not a.is_references_page and not a.is_appendix_page:
+                    last_content = a
+                    break
+            if last_content:
+                last_fill = last_content.fill_percentage / 100
+                expand_target = int((1 - last_fill) * words_per_page * 0.8)
         
         # Determine if passed
         has_critical = any(i.severity == IssueSeverity.CRITICAL for i in issues)
@@ -500,15 +545,32 @@ class VLMReviewAgent(BaseAgent):
                 page_number=page_number,
             ))
         
+        # Use `or` instead of relying on dict.get() default — VLM may return
+        # explicit null values for these fields, and get() won't fall back
+        # to the default when the key exists with value None.
+        fill_pct = data.get("fill_percentage")
+        if fill_pct is None:
+            fill_pct = 50.0
+        is_overflow = data.get("is_overflow")
+        if is_overflow is None:
+            is_overflow = False
+        is_refs_page = data.get("is_references_page")
+        if is_refs_page is None:
+            is_refs_page = False
+        is_appendix = data.get("is_appendix_page")
+        if is_appendix is None:
+            is_appendix = False
+
         return PageAnalysis(
             page_number=page_number,
-            fill_percentage=data.get("fill_percentage", 50),
-            is_overflow=data.get("is_overflow", False),
+            fill_percentage=float(fill_pct),
+            is_overflow=bool(is_overflow),
             has_significant_blank=len(blank_spaces) > 0,
             blank_spaces=blank_spaces,
             layout_issues=layout_issues,
-            is_last_content_page=is_last and not data.get("is_references_page", False),
-            is_references_page=data.get("is_references_page", False),
+            is_last_content_page=is_last and not is_refs_page and not is_appendix,
+            is_references_page=bool(is_refs_page),
+            is_appendix_page=bool(is_appendix),
             raw_vlm_response=raw_response,
         )
     
@@ -610,10 +672,10 @@ class VLMReviewAgent(BaseAgent):
         """Generate human-readable summary"""
         parts = []
         
-        parts.append(f"PDF has {total_pages} pages (limit: {page_limit}).")
+        parts.append(f"PDF has {total_pages} total pages (body limit: {page_limit}).")
         
         if overflow_detected:
-            parts.append(f"CRITICAL: Exceeds page limit by {total_pages - page_limit} page(s). Content must be trimmed.")
+            parts.append(f"CRITICAL: Body content exceeds page limit. Content must be trimmed.")
         elif underfill_detected:
             parts.append("Last page has significant blank space. Consider expanding content.")
         else:

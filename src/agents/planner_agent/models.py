@@ -119,9 +119,30 @@ class PaperPlan(BaseModel):
         return [s.section_type for s in self.sections]
     
     def get_body_sections(self) -> List[SectionPlan]:
-        """Get non-abstract, non-conclusion sections"""
+        """Get non-abstract, non-conclusion sections (the parallel-writable body)"""
         excluded = {"abstract", "conclusion"}
         return [s for s in self.sections if s.section_type not in excluded]
+
+    def get_body_section_types(self) -> List[str]:
+        """Get ordered list of body section type strings (no abstract/conclusion)"""
+        return [s.section_type for s in self.get_body_sections()]
+
+    def get_compile_section_order(self) -> List[str]:
+        """
+        Get section order for LaTeX compilation.
+        - **Description**:
+            - Returns the ordered list of section types excluding abstract
+              (abstract is handled separately in the template).
+            - Includes all body sections and conclusion.
+        """
+        return [
+            s.section_type for s in self.sections
+            if s.section_type != "abstract"
+        ]
+
+    def get_section_titles(self) -> Dict[str, str]:
+        """Get a mapping from section_type -> display title"""
+        return {s.section_type: s.section_title for s in self.sections}
     
     def validate_word_budget(self) -> bool:
         """Check if section budgets sum to total"""
@@ -235,9 +256,60 @@ VENUE_WORD_LIMITS = {
 }
 
 
-def calculate_total_words(target_pages: Optional[int], style_guide: Optional[str]) -> int:
-    """Calculate total word budget from pages and venue"""
+# Estimated page cost for non-text elements (consistent with MetaDataAgent)
+ELEMENT_PAGE_COST = {
+    "figure*": 0.4,
+    "figure": 0.2,
+    "table*": 0.3,
+    "table": 0.15,
+}
+
+
+def calculate_total_words(
+    target_pages: Optional[int],
+    style_guide: Optional[str],
+    n_figures: int = 0,
+    n_tables: int = 0,
+    n_wide_figures: int = 0,
+    n_wide_tables: int = 0,
+) -> int:
+    """
+    Calculate total word budget from pages, venue, and non-text elements.
+    - **Description**:
+        - Estimates the page space consumed by figures and tables
+        - Subtracts that from total pages to get effective text pages
+        - Ensures at least 40% of pages are reserved for text
+
+    - **Args**:
+        - `target_pages` (Optional[int]): Target page count
+        - `style_guide` (Optional[str]): Venue name (ICML, NeurIPS, etc.)
+        - `n_figures` (int): Total number of figures
+        - `n_tables` (int): Total number of tables
+        - `n_wide_figures` (int): Number of wide (figure*) figures
+        - `n_wide_tables` (int): Number of wide (table*) tables
+
+    - **Returns**:
+        - `int`: Effective word budget for text content
+    """
     venue_key = (style_guide or "DEFAULT").upper().split()[0]
     config = VENUE_WORD_LIMITS.get(venue_key, VENUE_WORD_LIMITS["DEFAULT"])
     pages = target_pages or config["pages"]
-    return pages * config["words_per_page"]
+    words_per_page = config["words_per_page"]
+
+    # Estimate pages consumed by non-text elements
+    n_narrow_figures = max(0, n_figures - n_wide_figures)
+    n_narrow_tables = max(0, n_tables - n_wide_tables)
+    figure_pages = (
+        n_wide_figures * ELEMENT_PAGE_COST["figure*"]
+        + n_narrow_figures * ELEMENT_PAGE_COST["figure"]
+    )
+    table_pages = (
+        n_wide_tables * ELEMENT_PAGE_COST["table*"]
+        + n_narrow_tables * ELEMENT_PAGE_COST["table"]
+    )
+    non_text_pages = figure_pages + table_pages
+
+    # Effective text pages (at least 40% of total)
+    text_pages = max(pages - non_text_pages, pages * 0.4)
+
+    return int(text_pages * words_per_page)

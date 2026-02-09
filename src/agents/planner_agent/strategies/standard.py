@@ -17,6 +17,8 @@ from ..models import (
     NarrativeStyle,
     SECTION_RATIOS_BY_TYPE,
     DEFAULT_EMPIRICAL_SECTIONS,
+    VENUE_WORD_LIMITS,
+    ELEMENT_PAGE_COST,
     calculate_total_words,
 )
 
@@ -29,10 +31,15 @@ PLANNING_SYSTEM_PROMPT = """You are an expert academic paper planner. Your job i
 Given the paper's idea/hypothesis, method, data, experiments, references, figures, and tables, you must:
 1. Determine the paper type (empirical, theoretical, survey, position, system, benchmark)
 2. Identify the key contributions (usually 2-4)
-3. Plan what each section should cover
-4. Suggest which references to cite in each section
-5. Assign figures and tables to appropriate sections
-6. Provide specific writing guidance
+3. **Design the section structure** — you are free to choose which sections to include.
+   - "abstract" and "conclusion" are REQUIRED.
+   - For the body, you may use standard sections like "introduction", "related_work", "method", "experiment", "result",
+     or you may merge / rename / add sections (e.g. "experiments_and_results", "discussion", "case_study").
+   - Choose whatever structure best fits this particular paper.
+4. Plan what each section should cover
+5. Suggest which references to cite in each section
+6. Assign figures and tables to appropriate sections
+7. Provide a per-section word budget that sums to the total effective word budget
 
 Output a JSON object with this structure:
 {
@@ -50,17 +57,24 @@ Output a JSON object with this structure:
     "sections": [
         {
             "section_type": "introduction",
+            "section_title": "Introduction",
+            "target_words": 800,
             "key_points": ["Point 1", "Point 2"],
             "content_sources": ["idea_hypothesis", "method"],
             "references_to_cite": ["ref_key1", "ref_key2"],
-            "figures_to_use": ["fig:architecture"],
-            "tables_to_use": ["tab:results"],
+            "figures_to_define": ["fig:architecture"],
+            "tables_to_define": ["tab:results"],
             "writing_guidance": "Specific guidance for this section"
         }
     ]
 }
 
-Be specific and actionable. The plan will guide an AI writer."""
+IMPORTANT:
+- The sum of all section target_words should equal the effective word budget.
+- Sections that contain figures/tables should have FEWER words because those elements take space.
+  Roughly deduct ~170 words per narrow figure, ~340 per wide figure, ~120 per narrow table, ~240 per wide table.
+- "abstract" typically needs 100-200 words; "conclusion" needs 200-350 words.
+- Be specific and actionable. The plan will guide an AI writer."""
 
 
 PLANNING_USER_PROMPT_TEMPLATE = """Create a detailed paper plan for:
@@ -88,14 +102,19 @@ PLANNING_USER_PROMPT_TEMPLATE = """Create a detailed paper plan for:
 **Available Tables**:
 {table_info}
 
-**Target**: {target_pages} pages ({total_words} words) for {style_guide}
+**Space Budget**:
+- Target: {target_pages} pages for {style_guide}
+- Non-text elements (figures + tables) occupy approximately {non_text_pages:.1f} pages
+- Effective text space: approximately {effective_text_pages:.1f} pages ({total_words} words)
+- When allocating words per section, subtract ~170 words per narrow figure and ~340 per wide figure defined in that section
 
 Analyze this content and create a comprehensive writing plan. Focus on:
 1. What are the 2-4 key contributions?
-2. How should content be distributed across sections?
-3. Which references should be cited where?
-4. Which figures and tables should appear in which sections?
-5. What specific guidance helps each section?
+2. Which sections should the paper have? (you decide the structure)
+3. How should word budget be distributed? (each section gets a target_words value)
+4. Which references should be cited where?
+5. Which figures and tables should be DEFINED in which sections?
+6. What specific guidance helps each section?
 
 Output valid JSON only."""
 
@@ -125,10 +144,53 @@ class StandardPlanningStrategy(PlanningStrategy):
     ) -> PaperPlan:
         """Create a paper plan using LLM analysis"""
         
-        # Calculate total word budget
-        total_words = calculate_total_words(request.target_pages, request.style_guide)
+        # Count figures/tables and detect wide elements
+        n_figures = len(request.figures) if request.figures else 0
+        n_tables = len(request.tables) if request.tables else 0
+        n_wide_figures = sum(
+            1 for f in (request.figures or []) if self._should_be_wide_figure(f)
+        )
+        n_wide_tables = sum(
+            1 for t in (request.tables or []) if self._should_be_wide_table(t)
+        )
+
+        # Calculate total word budget (subtracting figure/table space)
+        total_words = calculate_total_words(
+            request.target_pages,
+            request.style_guide,
+            n_figures=n_figures,
+            n_tables=n_tables,
+            n_wide_figures=n_wide_figures,
+            n_wide_tables=n_wide_tables,
+        )
         target_pages = request.target_pages or 8
         style_guide = request.style_guide or "DEFAULT"
+
+        # Calculate raw words for display (without figure/table deduction)
+        venue_key = (style_guide).upper().split()[0]
+        _cfg = VENUE_WORD_LIMITS.get(venue_key, VENUE_WORD_LIMITS["DEFAULT"])
+        raw_total = (target_pages) * _cfg["words_per_page"]
+        words_per_page = _cfg["words_per_page"]
+
+        # Estimate non-text element space for the prompt
+        n_narrow_fig = max(0, n_figures - n_wide_figures)
+        n_narrow_tbl = max(0, n_tables - n_wide_tables)
+        fig_pages = (
+            n_wide_figures * ELEMENT_PAGE_COST["figure*"]
+            + n_narrow_fig * ELEMENT_PAGE_COST["figure"]
+        )
+        tbl_pages = (
+            n_wide_tables * ELEMENT_PAGE_COST["table*"]
+            + n_narrow_tbl * ELEMENT_PAGE_COST["table"]
+        )
+        non_text_pages = fig_pages + tbl_pages
+
+        logger.info(
+            "planner.word_budget raw=%d adjusted=%d non_text_pages=%.1f "
+            "figs=%d(wide=%d) tables=%d(wide=%d)",
+            raw_total, total_words, non_text_pages,
+            n_figures, n_wide_figures, n_tables, n_wide_tables,
+        )
         
         # Extract reference keys from BibTeX
         reference_keys = self._extract_reference_keys(request.references)
@@ -159,6 +221,10 @@ class StandardPlanningStrategy(PlanningStrategy):
                 tbl_lines.append(line)
             table_info = "\n".join(tbl_lines)
         
+        # Calculate effective text pages for the prompt
+        effective_text_pages = target_pages - non_text_pages
+        effective_text_pages = max(effective_text_pages, target_pages * 0.4)
+
         # Build prompt
         user_prompt = PLANNING_USER_PROMPT_TEMPLATE.format(
             title=request.title,
@@ -172,6 +238,8 @@ class StandardPlanningStrategy(PlanningStrategy):
             target_pages=target_pages,
             total_words=total_words,
             style_guide=style_guide,
+            non_text_pages=non_text_pages,
+            effective_text_pages=effective_text_pages,
         )
         
         try:
@@ -245,7 +313,14 @@ class StandardPlanningStrategy(PlanningStrategy):
         request: PlanRequest,
         total_words: int,
     ) -> PaperPlan:
-        """Build PaperPlan from LLM output"""
+        """
+        Build PaperPlan from LLM output.
+        - **Description**:
+            - Uses LLM-returned section list as primary structure.
+            - Ensures 'abstract' and 'conclusion' always exist.
+            - Falls back to DEFAULT_EMPIRICAL_SECTIONS only when LLM
+              returns empty / invalid sections.
+        """
         
         # Determine paper type
         paper_type_str = plan_data.get("paper_type", "empirical").lower()
@@ -254,7 +329,7 @@ class StandardPlanningStrategy(PlanningStrategy):
         except ValueError:
             paper_type = PaperType.EMPIRICAL
         
-        # Get word ratios for this paper type
+        # Get word ratios for this paper type (used as fallback for unknown sections)
         ratios = SECTION_RATIOS_BY_TYPE.get(paper_type, SECTION_RATIOS_BY_TYPE[PaperType.EMPIRICAL])
         
         # Determine narrative style
@@ -264,18 +339,64 @@ class StandardPlanningStrategy(PlanningStrategy):
         except ValueError:
             narrative_style = NarrativeStyle.TECHNICAL
         
-        # Build section plans
+        # Resolve words_per_page for per-section figure deduction
+        venue_key = ((request.style_guide or "DEFAULT").upper().split()[0])
+        _wpp_cfg = VENUE_WORD_LIMITS.get(venue_key, VENUE_WORD_LIMITS["DEFAULT"])
+        words_per_page = _wpp_cfg["words_per_page"]
+
+        # --- Determine section ordering ---
+        # Primary: use the LLM-returned sections list
         llm_sections = plan_data.get("sections", [])
-        section_map = {s.get("section_type"): s for s in llm_sections if s.get("section_type")}
-        
+        section_map: Dict[str, Dict[str, Any]] = {}
+        llm_section_order: List[str] = []
+        for s in llm_sections:
+            st = s.get("section_type")
+            if st and st not in section_map:
+                section_map[st] = s
+                llm_section_order.append(st)
+
+        # Validate: must contain at least 3 sections including abstract & conclusion
+        if len(llm_section_order) >= 3 and "abstract" not in llm_section_order:
+            llm_section_order.insert(0, "abstract")
+        if len(llm_section_order) >= 3 and "conclusion" not in llm_section_order:
+            llm_section_order.append("conclusion")
+
+        use_llm_structure = len(llm_section_order) >= 3
+        if use_llm_structure:
+            section_type_order = llm_section_order
+            logger.info(
+                "planner.dynamic_sections using LLM structure: %s",
+                section_type_order,
+            )
+        else:
+            section_type_order = list(DEFAULT_EMPIRICAL_SECTIONS)
+            logger.info(
+                "planner.dynamic_sections fallback to default: %s",
+                section_type_order,
+            )
+
+        # --- Distribute word budget ---
+        # If LLM provided custom sections, distribute remaining budget evenly
+        # among sections not in the predefined ratios.
+        known_ratio_sum = sum(
+            ratios.get(st, 0) for st in section_type_order if st in ratios
+        )
+        unknown_sections = [st for st in section_type_order if st not in ratios]
+        # Reserve remaining ratio for unknown sections
+        remaining_ratio = max(0.0, 1.0 - known_ratio_sum)
+        per_unknown_ratio = (remaining_ratio / len(unknown_sections)) if unknown_sections else 0.0
+
         sections = []
-        for order, section_type in enumerate(DEFAULT_EMPIRICAL_SECTIONS):
-            # Get ratio and calculate target words
-            ratio = ratios.get(section_type, 0.1)
-            target_words_section = int(total_words * ratio)
-            
-            # Get LLM-provided details if available
+        for order, section_type in enumerate(section_type_order):
+            # Get ratio: predefined or evenly distributed remainder
+            ratio = ratios.get(section_type, per_unknown_ratio)
+            # Allow LLM to override target_words directly
             llm_section = section_map.get(section_type, {})
+            llm_target = llm_section.get("target_words")
+            if isinstance(llm_target, (int, float)) and llm_target > 0:
+                target_words_section = int(llm_target)
+            else:
+                target_words_section = int(total_words * ratio)
             
             # Determine default content sources
             default_sources = self._get_default_sources(section_type)
@@ -294,9 +415,25 @@ class StandardPlanningStrategy(PlanningStrategy):
             if not tables_to_define and not tables_to_reference:
                 tables_to_reference = llm_section.get("tables_to_use", [])
             
+            # Deduct per-section space consumed by figures/tables defined here
+            n_figs_in_section = len(figures_to_define)
+            n_tbls_in_section = len(tables_to_define)
+            if n_figs_in_section > 0 or n_tbls_in_section > 0:
+                fig_page_cost = n_figs_in_section * ELEMENT_PAGE_COST["figure"]
+                tbl_page_cost = n_tbls_in_section * ELEMENT_PAGE_COST["table"]
+                deduction = int((fig_page_cost + tbl_page_cost) * words_per_page)
+                # Don't reduce below 30% of original allocation
+                target_words_section = max(
+                    target_words_section - deduction,
+                    int(target_words_section * 0.3),
+                )
+            
+            # Use LLM-provided title or auto-generate
+            section_title = llm_section.get("section_title") or self._get_section_title(section_type)
+
             section_plan = SectionPlan(
                 section_type=section_type,
-                section_title=self._get_section_title(section_type),
+                section_title=section_title,
                 target_words=target_words_section,
                 key_points=llm_section.get("key_points", []),
                 content_sources=llm_section.get("content_sources", default_sources),
@@ -579,12 +716,15 @@ class StandardPlanningStrategy(PlanningStrategy):
                     if target_section:
                         break
             
-            # Default: assign to method section
+            # Default: assign to method section, or first body section if method missing
             if not target_section:
-                for section in paper_plan.sections:
+                body = paper_plan.get_body_sections()
+                for section in body:
                     if section.section_type == "method":
                         target_section = section
                         break
+                if not target_section and body:
+                    target_section = body[0]
             
             # Assign to definition
             if target_section:
@@ -624,12 +764,15 @@ class StandardPlanningStrategy(PlanningStrategy):
                     if target_section:
                         break
             
-            # Default: assign to experiment section
+            # Default: assign to experiment section, or last body section
             if not target_section:
-                for section in paper_plan.sections:
+                body = paper_plan.get_body_sections()
+                for section in body:
                     if section.section_type == "experiment":
                         target_section = section
                         break
+                if not target_section and body:
+                    target_section = body[-1]
             
             if target_section:
                 target_section.tables_to_define.append(tbl_id)

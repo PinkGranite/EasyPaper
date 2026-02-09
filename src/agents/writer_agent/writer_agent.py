@@ -37,10 +37,17 @@ CRITICAL RULES:
 6. Maintain formal academic writing style
 7. Be precise and evidence-based
 8. Structure content logically with appropriate subsections if needed
-9. **CITATION CONSTRAINT**: You MUST ONLY use citation keys that are explicitly provided in the resources/references list. 
+9. CITATION CONSTRAINT: You MUST ONLY use citation keys that are explicitly provided in the resources/references list. 
    DO NOT invent, hallucinate, or use any citation keys that are not in the provided list.
    DO NOT use placeholder citations like \\cite{need_citation} or similar.
    If you need to cite something but no suitable reference is provided, simply omit the \\cite command entirely and describe the concept without citation.
+10. NEVER use Markdown formatting. This is a LaTeX document, NOT Markdown.
+    - NO **bold** or __bold__ — use \\textbf{bold}
+    - NO *italic* or _italic_ — use \\textit{italic}
+    - NO ## headings — use \\subsection{} or \\subsubsection{}
+    - NO - bullet lists — use \\begin{itemize} ... \\item ... \\end{itemize}
+    - NO 1. numbered lists — use \\begin{enumerate} ... \\item ... \\end{enumerate}
+    - NO `code` backticks — use \\texttt{code}
 
 FORMATTING GUIDELINES:
 - For equations: use \\begin{equation} or inline $...$ 
@@ -62,6 +69,7 @@ IMPORTANT:
 - Make minimal changes needed to address the issues
 - If citations were flagged as invalid, REMOVE them entirely (don't replace with other citations)
 - If word count was too high, cut content; if too low, expand appropriately
+- NEVER use Markdown formatting — this is LaTeX. Use \\textbf{}, \\textit{}, \\subsection{}, \\begin{itemize}, etc.
 
 Return ONLY the revised LaTeX content."""
 
@@ -434,6 +442,10 @@ class WriterAgent(BaseAgent):
     def _clean_latex_output(self, content: str) -> str:
         """
         Clean LLM output to ensure pure LaTeX.
+        - **Description**:
+            - Removes markdown code fences
+            - Removes accidental document structure
+            - Converts residual markdown formatting to LaTeX equivalents
         """
         # Remove markdown code blocks
         content = re.sub(r'^```(?:latex|tex)?\s*\n', '', content)
@@ -446,6 +458,20 @@ class WriterAgent(BaseAgent):
         content = re.sub(r'\\begin\{document\}', '', content)
         content = re.sub(r'\\end\{document\}', '', content)
         content = re.sub(r'\\usepackage.*?\n', '', content)
+        
+        # --- Convert residual markdown formatting to LaTeX ---
+        # Bold: **text** or __text__ -> \textbf{text}
+        content = re.sub(r'\*\*(.+?)\*\*', r'\\textbf{\1}', content)
+        content = re.sub(r'__(.+?)__', r'\\textbf{\1}', content)
+        # Italic: *text* or _text_ -> \textit{text}
+        # (Be careful not to match LaTeX subscripts like a_i or already-converted \textbf{})
+        content = re.sub(r'(?<![\\{])\*([^*\n]+?)\*', r'\\textit{\1}', content)
+        content = re.sub(r'(?<=\s)_([^_\n]+?)_(?=[\s.,;:)])', r'\\textit{\1}', content)
+        # Inline code: `text` -> \texttt{text}
+        content = re.sub(r'`([^`\n]+?)`', r'\\texttt{\1}', content)
+        # Headings: ## Title -> \subsection{Title}
+        content = re.sub(r'^###\s+(.+)$', r'\\subsubsection{\1}', content, flags=re.MULTILINE)
+        content = re.sub(r'^##\s+(.+)$', r'\\subsection{\1}', content, flags=re.MULTILINE)
         
         return content.strip()
 

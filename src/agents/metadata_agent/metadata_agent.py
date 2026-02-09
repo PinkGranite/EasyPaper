@@ -57,7 +57,7 @@ from ..planner_agent.models import (
 )
 from ..shared.table_converter import convert_tables
 from ..reviewer_agent.models import ReviewResult, FeedbackResult, Severity, SectionFeedback
-from .models import FigureSpec, TableSpec
+from .models import FigureSpec, TableSpec, StructuralAction, SpaceEstimate
 
 
 class MetaDataAgent(BaseAgent):
@@ -309,7 +309,12 @@ class MetaDataAgent(BaseAgent):
             # Phase 2: Body Sections (can be parallel)
             # =================================================================
             print(f"[MetaDataAgent] Phase 2: Generating Body Sections...")
-            body_section_types = ["related_work", "method", "experiment", "result"]
+            # Dynamic: read body section types from the plan (no hardcoding)
+            if paper_plan:
+                body_section_types = paper_plan.get_body_section_types()
+            else:
+                body_section_types = ["related_work", "method", "experiment", "result"]
+            print(f"[MetaDataAgent] Body sections from plan: {body_section_types}")
             
             # Generate body sections (can be parallelized)
             body_tasks = []
@@ -327,6 +332,7 @@ class MetaDataAgent(BaseAgent):
                     section_plan=section_plan,
                     figures=section_figures,
                     tables=section_tables,
+                    converted_tables=converted_tables,
                 )
                 body_tasks.append(task)
             
@@ -620,6 +626,7 @@ class MetaDataAgent(BaseAgent):
         section_plan: Optional[SectionPlan] = None,
         figures: Optional[List[FigureSpec]] = None,
         tables: Optional[List[TableSpec]] = None,
+        converted_tables: Optional[Dict[str, str]] = None,
     ) -> SectionResult:
         """Generate a body section (Method, Experiment, Results, Related Work)"""
         try:
@@ -650,6 +657,7 @@ class MetaDataAgent(BaseAgent):
                 section_plan=section_plan,
                 figures=figures,
                 tables=tables,
+                converted_tables=converted_tables,
             )
             
             # Adjust max_tokens based on target words
@@ -915,9 +923,9 @@ class MetaDataAgent(BaseAgent):
             latex += sections["abstract"] + "\n"
             latex += r"\end{abstract}" + "\n\n"
         
-        # Add sections in order
-        section_order = ["introduction", "related_work", "method", "experiment", "result", "discussion", "conclusion"]
-        section_titles = {
+        # Add sections in order (handle dynamic sections)
+        _default_order = ["introduction", "related_work", "method", "experiment", "result", "discussion", "conclusion"]
+        _default_titles = {
             "introduction": "Introduction",
             "related_work": "Related Work",
             "method": "Methodology",
@@ -926,10 +934,15 @@ class MetaDataAgent(BaseAgent):
             "discussion": "Discussion",
             "conclusion": "Conclusion",
         }
+        # Build final order: known sections first, then any extras
+        section_order = [s for s in _default_order if s in sections]
+        for s in sections:
+            if s != "abstract" and s not in section_order:
+                section_order.append(s)
         
         for section_type in section_order:
             if section_type in sections and sections[section_type]:
-                title = section_titles.get(section_type, section_type.title())
+                title = _default_titles.get(section_type, section_type.replace("_", " ").title())
                 latex += f"\\section{{{title}}}\n"
                 # Fix common LaTeX reference syntax errors
                 content = self._fix_latex_references(sections[section_type])
@@ -1033,14 +1046,16 @@ class MetaDataAgent(BaseAgent):
         import re
         
         # Find all citation keys in the content
-        # Handle \cite{key1, key2} and \cite{key} formats
-        cite_pattern = r'\\cite\{([^}]+)\}'
+        # Handle \cite{key1, key2}, \citep{key}, \citet{key}, etc.
+        # Captures group(1) = command name, group(2) = keys string
+        cite_pattern = r'\\(cite[pt]?|citeauthor|citeyear|citealt|citealp)\{([^}]+)\}'
         
         invalid_keys = []
         valid_keys_used = []
         
         def process_cite(match):
-            cite_content = match.group(1)
+            cmd_name = match.group(1)   # e.g. "cite", "citep", "citet"
+            cite_content = match.group(2)
             keys = [k.strip() for k in cite_content.split(',')]
             
             valid_in_cite = []
@@ -1055,7 +1070,7 @@ class MetaDataAgent(BaseAgent):
             
             if remove_invalid:
                 if valid_in_cite:
-                    return f'\\cite{{{", ".join(valid_in_cite)}}}'
+                    return f'\\{cmd_name}{{{", ".join(valid_in_cite)}}}'
                 else:
                     # All keys invalid, remove entire citation
                     return ''
@@ -1065,8 +1080,8 @@ class MetaDataAgent(BaseAgent):
         fixed_content = re.sub(cite_pattern, process_cite, content)
         
         # Clean up empty citations and dangling text
-        # Remove patterns like "text \cite{} more" -> "text more"
-        fixed_content = re.sub(r'\\cite\{\s*\}', '', fixed_content)
+        # Remove empty citation commands: \cite{}, \citep{}, \citet{}, etc.
+        fixed_content = re.sub(r'\\(?:cite[pt]?|citeauthor|citeyear|citealt|citealp)\{\s*\}', '', fixed_content)
         # Clean up double spaces
         fixed_content = re.sub(r'  +', ' ', fixed_content)
         # Clean up space before punctuation
@@ -1103,6 +1118,17 @@ class MetaDataAgent(BaseAgent):
         # Build figure lookup
         figure_map = {fig.id: fig for fig in figures}
         
+        # Pre-scan ALL sections (including appendix) to find which figures
+        # already have their environments defined somewhere in the paper.
+        # This prevents re-injecting figures that were moved to the appendix
+        # by structural overflow actions.
+        globally_defined_figs: set = set()
+        all_content = "\n".join(generated_sections.values())
+        for fig in figures:
+            fig_pattern = rf'\\begin{{figure\*?}}.*?\\label{{{re.escape(fig.id)}}}.*?\\end{{figure\*?}}'
+            if re.search(fig_pattern, all_content, re.DOTALL):
+                globally_defined_figs.add(fig.id)
+        
         for section in paper_plan.sections:
             section_type = section.section_type
             figures_to_define = getattr(section, 'figures_to_define', []) or []
@@ -1117,14 +1143,12 @@ class MetaDataAgent(BaseAgent):
                 if not fig:
                     continue
                 
-                # Check if figure environment exists with this label
-                # Look for \begin{figure} or \begin{figure*} with \label{fig_id}
-                fig_pattern = rf'\\begin{{figure\*?}}.*?\\label{{{re.escape(fig_id)}}}.*?\\end{{figure\*?}}'
-                if re.search(fig_pattern, content, re.DOTALL):
-                    # Figure already defined
+                # Skip if this figure is already defined ANYWHERE in the paper
+                # (including appendix — it may have been moved there deliberately)
+                if fig_id in globally_defined_figs:
                     continue
                 
-                # Figure not defined - inject it
+                # Figure not defined anywhere - inject it
                 print(f"[EnsureFigures] Injecting missing figure '{fig_id}' in '{section_type}'")
                 
                 # Determine environment and width based on wide flag
@@ -1161,6 +1185,117 @@ class MetaDataAgent(BaseAgent):
         
         return generated_sections
     
+    def _ensure_tables_defined(
+        self,
+        generated_sections: Dict[str, str],
+        paper_plan: Optional[PaperPlan],
+        tables: Optional[List[TableSpec]],
+        converted_tables: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        """
+        Ensure all tables assigned for definition have their environments created.
+        - **Description**:
+            - Mirrors _ensure_figures_defined for tables.
+            - If a table is in section_plan.tables_to_define but no \\begin{table}
+              exists with matching label, inject the table environment using
+              pre-converted LaTeX from converted_tables when available.
+
+        - **Args**:
+            - `generated_sections` (Dict[str, str]): Section contents keyed by type
+            - `paper_plan` (Optional[PaperPlan]): Paper plan with table assignments
+            - `tables` (Optional[List[TableSpec]]): Table specifications
+            - `converted_tables` (Optional[Dict[str, str]]): table_id -> LaTeX code
+
+        - **Returns**:
+            - `generated_sections` (Dict[str, str]): Updated sections dict
+        """
+        import re
+
+        if not paper_plan or not tables:
+            return generated_sections
+
+        _converted = converted_tables or {}
+
+        # Build table lookup
+        table_map = {tbl.id: tbl for tbl in tables}
+
+        # Pre-scan ALL sections to find which tables are already defined
+        # (prevents re-injecting tables moved to appendix)
+        globally_defined_tables: set = set()
+        all_content = "\n".join(generated_sections.values())
+        for tbl in tables:
+            tbl_pattern = rf'\\begin{{table\*?}}.*?\\label{{{re.escape(tbl.id)}}}.*?\\end{{table\*?}}'
+            if re.search(tbl_pattern, all_content, re.DOTALL):
+                globally_defined_tables.add(tbl.id)
+
+        for section in paper_plan.sections:
+            section_type = section.section_type
+            tables_to_define = getattr(section, 'tables_to_define', []) or []
+
+            if not tables_to_define or section_type not in generated_sections:
+                continue
+
+            content = generated_sections[section_type]
+
+            for tbl_id in tables_to_define:
+                tbl = table_map.get(tbl_id)
+                if not tbl:
+                    continue
+
+                # Skip if already defined anywhere in the paper
+                if tbl_id in globally_defined_tables:
+                    continue
+
+                # Table not defined — inject it
+                print(f"[EnsureTables] Injecting missing table '{tbl_id}' in '{section_type}'")
+
+                env_name = "table*" if tbl.wide else "table"
+
+                if tbl_id in _converted:
+                    # Use pre-converted LaTeX (best quality)
+                    table_latex = _converted[tbl_id]
+                    # Ensure it has a \label
+                    if f"\\label{{{tbl_id}}}" not in table_latex:
+                        # Insert label before \end{table...}
+                        label_str = f"\\label{{{tbl_id}}}"
+                        table_latex = re.sub(
+                            rf'(\\end{{{env_name}}})',
+                            lambda m: f"{label_str}\n{m.group(1)}",
+                            table_latex,
+                        )
+                else:
+                    # Generate a placeholder table
+                    caption = tbl.caption or tbl_id
+                    table_latex = (
+                        f"\\begin{{{env_name}}}[t]\n"
+                        f"\\centering\n"
+                        f"\\caption{{{caption}}}\\label{{{tbl_id}}}\n"
+                        f"\\begin{{tabular}}{{lcc}}\n"
+                        f"\\hline\n"
+                        f"Column 1 & Column 2 & Column 3 \\\\\n"
+                        f"\\hline\n"
+                        f"-- & -- & -- \\\\\n"
+                        f"\\hline\n"
+                        f"\\end{{tabular}}\n"
+                        f"\\end{{{env_name}}}"
+                    )
+
+                # Find a good insertion point:
+                # 1. After a sentence referencing this table
+                # 2. Or at the end of the section
+                ref_pattern = rf'(Table~?\\ref{{{re.escape(tbl_id)}}}[^.]*\.)'
+                match = re.search(ref_pattern, content)
+                if match:
+                    insert_pos = match.end()
+                    content = content[:insert_pos] + "\n" + table_latex + "\n" + content[insert_pos:]
+                else:
+                    # Append at the end of the section
+                    content = content + "\n" + table_latex + "\n"
+
+                generated_sections[section_type] = content
+
+        return generated_sections
+
     def _mini_review_section(
         self,
         section_type: str,
@@ -1341,47 +1476,62 @@ class MetaDataAgent(BaseAgent):
         converted_tables: Optional[Dict[str, str]] = None,
         paper_plan: Optional[PaperPlan] = None,
         figures: Optional[List[FigureSpec]] = None,
-    ) -> Tuple[Optional[str], Optional[str]]:
+        metadata_tables: Optional[List[TableSpec]] = None,
+    ) -> Tuple[Optional[str], Optional[str], List[str], Dict[str, List[str]]]:
         """
-        Compile PDF using Typesetter Agent
-        
-        Args:
-            generated_sections: Dict of section_type -> latex_content
-            template_path: Path to .zip template file
-            references: Parsed reference list
-            output_dir: Output directory
-            paper_title: Paper title
-            figures_source_dir: Optional directory with figure files (legacy)
-            figure_paths: Dict of figure_id -> file_path
-            converted_tables: Dict of table_id -> LaTeX table code
-            paper_plan: Optional paper plan with figure/table assignments
-            figures: Optional list of figure specifications
-        
-        Returns:
-            Tuple of (pdf_path, latex_path) or (None, None) on failure
+        Compile PDF using Typesetter Agent (multi-file mode).
+        - **Description**:
+            - Passes sections as a dict to the TypesetterAgent, which writes each
+              section to its own .tex file and uses \\input{} in main.tex
+            - This enables precise error-to-section mapping from LaTeX logs
+
+        - **Args**:
+            - `generated_sections` (Dict[str, str]): Section contents
+            - `template_path` (str): Path to .zip template file
+            - `references` (List[Dict[str, Any]]): Parsed reference list
+            - `output_dir` (Path): Output directory
+            - `paper_title` (str): Paper title
+            - `figures_source_dir` (Optional[str]): Directory with figure files (legacy)
+            - `figure_paths` (Optional[Dict[str, str]]): figure_id -> file_path
+            - `converted_tables` (Optional[Dict[str, str]]): table_id -> LaTeX table code
+            - `paper_plan` (Optional[PaperPlan]): Paper plan with figure/table assignments
+            - `figures` (Optional[List[FigureSpec]]): Figure specifications
+            - `metadata_tables` (Optional[List[TableSpec]]): Table specifications
+
+        - **Returns**:
+            - Tuple of (pdf_path, latex_path, compile_errors, section_errors)
+            - On success: (pdf_path, latex_path, [], {})
+            - On failure: (None, None, [error1, ...], {"section_type": [errors]})
         """
         print(f"[MetaDataAgent] Phase 4: Compiling PDF with template: {template_path}")
         
         try:
-            # Build the sections content for Typesetter
-            # The Typesetter expects content without \section{} commands
-            section_order = ["introduction", "related_work", "method", "experiment", "result", "conclusion"]
-            section_titles = {
-                "introduction": "Introduction",
-                "related_work": "Related Work", 
-                "method": "Methodology",
-                "experiment": "Experiments",
-                "result": "Results",
-                "conclusion": "Conclusion",
-            }
+            # Dynamic: read section order and titles from the plan
+            if paper_plan:
+                section_order = paper_plan.get_compile_section_order()
+                section_titles = paper_plan.get_section_titles()
+            else:
+                section_order = ["introduction", "related_work", "method", "experiment", "result", "conclusion"]
+                section_titles = {
+                    "introduction": "Introduction",
+                    "related_work": "Related Work",
+                    "method": "Methodology",
+                    "experiment": "Experiments",
+                    "result": "Results",
+                    "conclusion": "Conclusion",
+                }
+            # Include any generated sections not in plan (e.g. appendix from review loop)
+            for st in generated_sections:
+                if st != "abstract" and st not in section_order:
+                    section_order.append(st)
+                if st not in section_titles:
+                    section_titles[st] = st.replace("_", " ").title()
             
             # Final citation validation pass (safety net)
-            # This ensures no invalid citations slip through after Review Loop revisions
             valid_citation_keys = self._extract_valid_citation_keys(references)
             total_invalid_removed = 0
             for section_type in list(generated_sections.keys()):
                 content = generated_sections[section_type]
-                # Also apply LaTeX fixes (escaped comments, etc.)
                 content = self._fix_latex_references(content)
                 fixed_content, invalid, valid = self._validate_and_fix_citations(
                     content, valid_citation_keys, remove_invalid=True
@@ -1402,25 +1552,14 @@ class MetaDataAgent(BaseAgent):
                     figures=figures,
                 )
             
-            # Build full latex content with section markers
-            # The Typesetter expects content with markers like "% === Section: xxx ==="
-            latex_parts = []
-            
-            # Add abstract with marker (Typesetter parses this)
-            abstract_content = generated_sections.get("abstract", "")
-            if abstract_content:
-                latex_parts.append("% === Section: abstract ===")
-                latex_parts.append(abstract_content)
-            
-            # Add body sections
-            for section_type in section_order:
-                if section_type in generated_sections and generated_sections[section_type]:
-                    title = section_titles.get(section_type, section_type.title())
-                    latex_parts.append(f"% === Section: {section_type} ===")
-                    latex_parts.append(f"\\section{{{title}}}")
-                    latex_parts.append(generated_sections[section_type])
-            
-            latex_body = "\n\n".join(latex_parts)
+            # Ensure all assigned tables have their environments created
+            if paper_plan and metadata_tables:
+                generated_sections = self._ensure_tables_defined(
+                    generated_sections=generated_sections,
+                    paper_plan=paper_plan,
+                    tables=metadata_tables,
+                    converted_tables=converted_tables,
+                )
             
             # Prepare references for Typesetter
             typesetter_refs = []
@@ -1431,58 +1570,74 @@ class MetaDataAgent(BaseAgent):
                         "bibtex": ref.get("bibtex"),
                     })
             
-            # Call Typesetter Agent API
-            # TypesetterPayload expects: request_id, user_id, payload (dict with actual data)
-            # Note: abstract is embedded in latex_content with "% === Section: abstract ===" marker
+            # Call Typesetter Agent API with multi-file sections dict
             async with httpx.AsyncClient(timeout=600.0) as client:
                 response = await client.post(
                     "http://localhost:8000/agent/typesetter/compile",
                     json={
                         "request_id": str(uuid.uuid4()),
                         "payload": {
-                            "latex_content": latex_body,
+                            "sections": generated_sections,
+                            "section_order": section_order,
+                            "section_titles": section_titles,
                             "template_path": template_path,
                             "template_config": {
-                                "paper_title": paper_title,  # Use paper_title to match TemplateConfig
+                                "paper_title": paper_title,
                             },
                             "references": typesetter_refs,
                             "output_dir": str(output_dir),
                             "figures_source_dir": figures_source_dir,
-                            "figure_paths": figure_paths or {},  # Structured figure paths
-                            "converted_tables": converted_tables or {},  # Pre-converted table LaTeX
+                            "figure_paths": figure_paths or {},
+                            "converted_tables": converted_tables or {},
                         }
                     }
                 )
                 
                 if response.status_code != 200:
                     print(f"[MetaDataAgent] Typesetter error: {response.status_code} - {response.text}")
-                    return None, None
+                    return None, None, [f"Typesetter HTTP {response.status_code}"], {}
                 
                 result = response.json()
                 
-                # TypesetterResult structure: {status, result: {pdf_path, source_path}, error}
                 if result.get("status") == "ok" and result.get("result"):
                     compilation_result = result["result"]
                     pdf_path = compilation_result.get("pdf_path")
                     latex_path = compilation_result.get("source_path")
+                    compile_warnings = compilation_result.get("warnings", [])
+                    section_errors = compilation_result.get("section_errors", {})
                     
                     if pdf_path:
                         print(f"[MetaDataAgent] PDF compiled successfully: {pdf_path}")
+                        if compile_warnings:
+                            print(f"[MetaDataAgent] Compile warnings: {compile_warnings[:5]}")
+                        if section_errors:
+                            print(f"[MetaDataAgent] Section errors (on success): {section_errors}")
                     else:
                         print(f"[MetaDataAgent] PDF compilation failed: compilation result has no pdf_path")
                     
-                    return pdf_path, latex_path
+                    return pdf_path, latex_path, [], section_errors
                 else:
+                    # Compilation failed - extract errors from result
+                    compile_errors: List[str] = []
+                    section_errors: Dict[str, List[str]] = {}
                     error_msg = result.get("error", "Unknown error")
+                    if result.get("result"):
+                        compile_errors = result["result"].get("errors", [])
+                        section_errors = result["result"].get("section_errors", {})
+                    if not compile_errors:
+                        compile_errors = [e.strip() for e in error_msg.split(";") if e.strip()]
                     print(f"[MetaDataAgent] PDF compilation failed: {error_msg}")
-                    return None, None
+                    print(f"[Typesetter] Compile errors: {compile_errors}")
+                    if section_errors:
+                        print(f"[Typesetter] Section errors: {section_errors}")
+                    return None, None, compile_errors, section_errors
                 
         except httpx.ConnectError:
             print("[MetaDataAgent] Error: Could not connect to Typesetter Agent")
-            return None, None
+            return None, None, ["Could not connect to Typesetter Agent"], {}
         except Exception as e:
             print(f"[MetaDataAgent] PDF compilation error: {e}")
-            return None, None
+            return None, None, [str(e)], {}
     
     # =========================================================================
     # Phase 5: VLM Review
@@ -1625,16 +1780,20 @@ class MetaDataAgent(BaseAgent):
     def _build_vlm_feedback(
         self,
         vlm_result: Dict[str, Any],
+        structural_actions: Optional[List[StructuralAction]] = None,
     ) -> Tuple[List[FeedbackResult], List[SectionFeedback]]:
         """
         Build feedback and section revisions from VLM result.
         - **Description**:
             - Converts VLM review output into Reviewer-compatible feedback
             - Maps overflow/underfill to FeedbackResult and section advice to SectionFeedback
-        
+            - When structural_actions are provided, enriches revision prompts with
+              global strategy context (e.g. what was moved to appendix, resized)
+
         - **Args**:
             - `vlm_result` (Dict[str, Any]): Raw VLM review result dict
-        
+            - `structural_actions` (Optional[List[StructuralAction]]): Planned/executed actions
+
         - **Returns**:
             - `feedbacks` (List[FeedbackResult]): Aggregated feedback results
             - `section_feedbacks` (List[SectionFeedback]): Per-section revision guidance
@@ -1644,6 +1803,11 @@ class MetaDataAgent(BaseAgent):
         
         if not vlm_result:
             return feedbacks, section_feedbacks
+
+        # try:
+        #     print("[VLMReview] RawResult:\n" + json.dumps(vlm_result, ensure_ascii=False, indent=2))
+        # except Exception as e:
+        #     print(f"[VLMReview] RawResult log failed: {e}")
         
         overflow_pages = vlm_result.get("overflow_pages", 0)
         needs_trim = vlm_result.get("needs_trim", False)
@@ -1681,6 +1845,43 @@ class MetaDataAgent(BaseAgent):
                 details={"source": "vlm_review"},
             ))
         
+        print(
+            "[VLMReview] Summary: "
+            f"{vlm_result.get('summary', 'No summary')} | "
+            f"overflow_pages={overflow_pages} needs_trim={needs_trim} needs_expand={needs_expand}"
+        )
+        
+        # Build structural context string for enriched revision prompts
+        structural_context = None
+        if structural_actions:
+            ctx_parts = [
+                f"This paper exceeds the page limit by {overflow_pages:.1f} pages. "
+                "The following structural adjustments have been applied:"
+            ]
+            moved_count = sum(1 for a in structural_actions if a.action_type in ("move_figure", "move_table"))
+            resized_count = sum(1 for a in structural_actions if a.action_type == "resize_figure")
+            downgraded_count = sum(1 for a in structural_actions if a.action_type == "downgrade_wide")
+            appendix_created = any(a.action_type == "create_appendix" for a in structural_actions)
+
+            if appendix_created:
+                ctx_parts.append("- An Appendix section has been created.")
+            if moved_count > 0:
+                moved_ids = [a.target_id for a in structural_actions if a.action_type in ("move_figure", "move_table")]
+                ctx_parts.append(f"- {moved_count} figure(s)/table(s) moved to Appendix: {', '.join(moved_ids)}.")
+            if downgraded_count > 0:
+                ctx_parts.append(f"- {downgraded_count} wide figure(s) converted to single-column.")
+            if resized_count > 0:
+                ctx_parts.append(f"- {resized_count} figure(s) resized to smaller width.")
+
+            total_saved = sum(a.estimated_savings for a in structural_actions)
+            remaining_trim = max(0, overflow_pages - total_saved)
+            if remaining_trim > 0:
+                ctx_parts.append(
+                    f"After these adjustments, an estimated {remaining_trim:.1f} pages of word-level "
+                    "trimming is still needed across sections."
+                )
+            structural_context = " ".join(ctx_parts)
+
         section_recommendations = vlm_result.get("section_recommendations", {}) or {}
         for section_type, advice in section_recommendations.items():
             recommended_action = getattr(advice, "recommended_action", None) or advice.get("recommended_action")
@@ -1697,11 +1898,21 @@ class MetaDataAgent(BaseAgent):
                 action = "ok"
                 delta_words = 0
             
+            # Build per-section structural action descriptors
+            section_struct_actions = []
+            if structural_actions:
+                section_struct_actions = [
+                    f"{a.action_type}:{a.target_id}"
+                    for a in structural_actions
+                    if a.section == section_type
+                ]
+            
             revision_prompt = self._build_vlm_revision_prompt(
                 section_type=section_type,
                 action=action,
                 delta_words=delta_words,
                 guidance=guidance,
+                structural_context=structural_context if action == "reduce" else None,
             )
             
             section_feedbacks.append(SectionFeedback(
@@ -1711,7 +1922,14 @@ class MetaDataAgent(BaseAgent):
                 action=action,
                 delta_words=delta_words,
                 revision_prompt=revision_prompt,
+                structural_actions=section_struct_actions,
             ))
+            print(
+                "[VLMReview] Advice: "
+                f"section={section_type} action={action} delta_words={delta_words} "
+                f"guidance={guidance or 'n/a'}"
+                + (f" structural_actions={section_struct_actions}" if section_struct_actions else "")
+            )
         
         return feedbacks, section_feedbacks
     
@@ -1721,32 +1939,743 @@ class MetaDataAgent(BaseAgent):
         action: str,
         delta_words: int,
         guidance: Optional[str] = None,
+        structural_context: Optional[str] = None,
     ) -> str:
         """
-        Build revision prompt from VLM guidance.
+        Build revision prompt from VLM guidance with optional structural context.
         - **Description**:
-            - Produces a concise revision instruction for the writer agent
-            - Ensures prompt is compatible with _revise_section()
-        
+            - Produces a detailed revision instruction for the writer agent
+            - When structural_context is provided, includes information about
+              overall page-reduction strategy so the writer knows what has changed
+
         - **Args**:
             - `section_type` (str): Section name to revise
             - `action` (str): "reduce" or "expand"
             - `delta_words` (int): Target word change (+/-)
             - `guidance` (Optional[str]): Extra VLM guidance
-        
+            - `structural_context` (Optional[str]): Global strategy summary
+
         - **Returns**:
             - `prompt` (str): Revision instruction prompt
         """
         action_text = "reduce" if action == "reduce" else "expand"
         delta = abs(delta_words) if delta_words else 0
-        guidance_text = f"Guidance: {guidance}" if guidance else ""
+
+        parts = []
+
+        # Global strategy context (if structural actions were planned)
+        if structural_context:
+            parts.append(structural_context)
+
+        parts.append(
+            f"Revise the {section_type} section to {action_text} by approximately {delta} words."
+        )
+
+        if action == "reduce":
+            parts.append(
+                "Prioritize: (1) removing redundant explanations of figures/tables that may "
+                "have been moved to the Appendix, (2) condensing verbose passages, "
+                "(3) merging overlapping sentences. Preserve factual consistency, "
+                "citations, equations, and LaTeX formatting."
+            )
+        else:
+            parts.append(
+                "Prioritize expanding with additional evidence, details, or analysis. "
+                "Preserve factual consistency, citations, and LaTeX formatting."
+            )
+
+        if guidance:
+            parts.append(f"Additional guidance: {guidance}")
+
+        return " ".join(parts)
+    
+    # =====================================================================
+    # Smart page-limit control: structural overflow strategy
+    # =====================================================================
+
+    # Estimated page cost for non-text elements
+    _ELEMENT_PAGE_COST = {
+        "figure*": 0.4,
+        "figure": 0.2,
+        "table*": 0.3,
+        "table": 0.15,
+    }
+
+    def _estimate_section_space(
+        self,
+        section_type: str,
+        content: str,
+    ) -> SpaceEstimate:
+        """
+        Estimate non-text space usage in a section.
+        - **Description**:
+            - Counts figure/table environments and their LaTeX labels
+            - Returns a SpaceEstimate with per-type counts and total page cost
+
+        - **Args**:
+            - `section_type` (str): Section name (for logging)
+            - `content` (str): LaTeX content of the section
+
+        - **Returns**:
+            - `SpaceEstimate` with element counts, ids, and estimated pages
+        """
+        est = SpaceEstimate()
+
+        # Count wide/narrow figures
+        est.wide_figures = len(re.findall(r"\\begin\{figure\*\}", content))
+        est.narrow_figures = (
+            len(re.findall(r"\\begin\{figure\}", content)) - est.wide_figures
+        )
+        if est.narrow_figures < 0:
+            est.narrow_figures = 0
+
+        # Count wide/narrow tables
+        est.wide_tables = len(re.findall(r"\\begin\{table\*\}", content))
+        est.narrow_tables = (
+            len(re.findall(r"\\begin\{table\}", content)) - est.wide_tables
+        )
+        if est.narrow_tables < 0:
+            est.narrow_tables = 0
+
+        # Extract labels
+        est.figure_ids = re.findall(r"\\label\{(fig:[^}]+)\}", content)
+        est.table_ids = re.findall(r"\\label\{(tab:[^}]+)\}", content)
+
+        # Estimate total pages consumed by non-text elements
+        est.total_pages = (
+            est.wide_figures * self._ELEMENT_PAGE_COST["figure*"]
+            + est.narrow_figures * self._ELEMENT_PAGE_COST["figure"]
+            + est.wide_tables * self._ELEMENT_PAGE_COST["table*"]
+            + est.narrow_tables * self._ELEMENT_PAGE_COST["table"]
+        )
+        return est
+
+    def _plan_overflow_strategy(
+        self,
+        overflow_pages: float,
+        generated_sections: Dict[str, str],
+        paper_plan: Optional[PaperPlan],
+        figures: Optional[List[FigureSpec]],
+    ) -> List[StructuralAction]:
+        """
+        Decide which structural actions to take based on overflow severity.
+        - **Description**:
+            - Level 1 (< 0.5 pages): word trimming only (no structural actions)
+            - Level 2 (0.5-1.5 pages): downgrade figure* -> figure, resize images
+            - Level 3 (> 1.5 pages): create appendix, move low-priority figures/tables
+            - IMPORTANT: appendix section is excluded from scanning — it is the
+              destination for moved elements, not a source.
+            - Each figure/table ID is acted upon at most once (deduplication).
+
+        - **Args**:
+            - `overflow_pages` (float): How many pages over the limit
+            - `generated_sections` (Dict[str, str]): Section contents
+            - `paper_plan` (Optional[PaperPlan]): Paper plan (for targets)
+            - `figures` (Optional[List[FigureSpec]]): Figure specs from metadata
+
+        - **Returns**:
+            - List of StructuralAction to execute before word-level revisions
+        """
+        from ..vlm_review_agent.models import SECTION_TRIM_PRIORITY
+
+        actions: List[StructuralAction] = []
+        remaining = overflow_pages
+
+        if remaining <= 0:
+            return actions
+
+        # Step 1: gather space estimates per BODY section only (exclude appendix)
+        space_map: Dict[str, SpaceEstimate] = {}
+        for sec, content in generated_sections.items():
+            if sec == "appendix":
+                continue  # Never scan appendix — it is the move destination
+            space_map[sec] = self._estimate_section_space(sec, content)
+
+        print(
+            f"[OverflowStrategy] overflow={overflow_pages:.1f} pages, "
+            f"Level={'1' if overflow_pages < 0.5 else '2' if overflow_pages <= 1.5 else '3'}"
+        )
+        for sec, est in space_map.items():
+            if est.total_pages > 0:
+                print(
+                    f"  {sec}: {est.wide_figures} figure*, {est.narrow_figures} figure, "
+                    f"{est.wide_tables} table*, {est.narrow_tables} table  "
+                    f"=> ~{est.total_pages:.2f} pages"
+                )
+
+        # Level 1: < 0.5 pages — word trim only (handled outside, return empty)
+        if overflow_pages < 0.5:
+            return actions
+
+        # Track processed IDs to avoid duplicate actions on the same element
+        processed_ids: set = set()
+
+        # =================================================================
+        # Level 2 actions: downgrade wide figures/tables + resize
+        # =================================================================
+        # Sort sections by trim priority (high -> low) for deterministic order
+        sorted_sections = sorted(
+            space_map.keys(),
+            key=lambda s: SECTION_TRIM_PRIORITY.get(s, 5),
+            reverse=True,
+        )
+
+        # 2a. Downgrade figure* -> figure (only sections that actually have wide figures)
+        for sec in sorted_sections:
+            est = space_map.get(sec)
+            if not est or est.wide_figures == 0:
+                continue
+            for fid in est.figure_ids:
+                if fid in processed_ids:
+                    continue
+                savings = 0.2
+                actions.append(StructuralAction(
+                    action_type="downgrade_wide",
+                    target_id=fid,
+                    section=sec,
+                    estimated_savings=savings,
+                ))
+                processed_ids.add(fid)
+                remaining -= savings
+                print(f"  -> downgrade_wide figure {fid} in {sec} (save ~{savings:.1f}p)")
+                if remaining <= 0:
+                    break
+            if remaining <= 0:
+                break
+
+        # 2b. Resize remaining figures (shrink width) — only if not already processed
+        if remaining > 0:
+            for sec in sorted_sections:
+                est = space_map.get(sec)
+                if not est or (est.wide_figures + est.narrow_figures) == 0:
+                    continue
+                for fid in est.figure_ids:
+                    resize_key = f"resize:{fid}"
+                    if resize_key in processed_ids:
+                        continue
+                    savings = 0.05
+                    actions.append(StructuralAction(
+                        action_type="resize_figure",
+                        target_id=fid,
+                        section=sec,
+                        params={"width": "0.8\\linewidth"},
+                        estimated_savings=savings,
+                    ))
+                    processed_ids.add(resize_key)
+                    remaining -= savings
+                    if remaining <= 0:
+                        break
+                if remaining <= 0:
+                    break
+
+        # =================================================================
+        # Level 3 actions: create appendix + move low-priority figures/tables
+        # =================================================================
+        if overflow_pages > 1.5 and remaining > 0:
+            if "appendix" not in generated_sections:
+                actions.append(StructuralAction(
+                    action_type="create_appendix",
+                    estimated_savings=0,
+                ))
+
+            for sec in sorted_sections:
+                est = space_map.get(sec)
+                if not est:
+                    continue
+                # Move figures
+                for fid in est.figure_ids:
+                    move_key = f"move:{fid}"
+                    if move_key in processed_ids:
+                        continue
+                    savings = (
+                        self._ELEMENT_PAGE_COST["figure*"]
+                        if est.wide_figures > 0
+                        else self._ELEMENT_PAGE_COST["figure"]
+                    )
+                    actions.append(StructuralAction(
+                        action_type="move_figure",
+                        target_id=fid,
+                        section=sec,
+                        estimated_savings=savings,
+                    ))
+                    processed_ids.add(move_key)
+                    remaining -= savings
+                    print(f"  -> move_figure {fid} from {sec} to appendix (save ~{savings:.1f}p)")
+                    if remaining <= 0:
+                        break
+                # Move tables
+                if remaining > 0:
+                    for tid in est.table_ids:
+                        move_key = f"move:{tid}"
+                        if move_key in processed_ids:
+                            continue
+                        savings = (
+                            self._ELEMENT_PAGE_COST["table*"]
+                            if est.wide_tables > 0
+                            else self._ELEMENT_PAGE_COST["table"]
+                        )
+                        actions.append(StructuralAction(
+                            action_type="move_table",
+                            target_id=tid,
+                            section=sec,
+                            estimated_savings=savings,
+                        ))
+                        processed_ids.add(move_key)
+                        remaining -= savings
+                        print(f"  -> move_table {tid} from {sec} to appendix (save ~{savings:.1f}p)")
+                        if remaining <= 0:
+                            break
+                if remaining <= 0:
+                    break
+
+        total_savings = sum(a.estimated_savings for a in actions)
+        print(
+            f"[OverflowStrategy] Planned {len(actions)} structural actions, "
+            f"estimated savings ~{total_savings:.1f} pages"
+        )
+        return actions
+
+    # =====================================================================
+    # Structural operation execution methods
+    # =====================================================================
+
+    def _resize_figures_in_section(
+        self,
+        section_content: str,
+        actions: List[StructuralAction],
+    ) -> str:
+        """
+        Apply resize and downgrade-wide actions to a section's LaTeX content.
+        - **Description**:
+            - downgrade_wide: figure* -> figure, end{figure*} -> end{figure}
+            - resize_figure: adjusts includegraphics width parameter
+            - Pure regex operations, no LLM call needed
+
+        - **Args**:
+            - `section_content` (str): Current LaTeX content of the section
+            - `actions` (List[StructuralAction]): Actions targeting this section
+
+        - **Returns**:
+            - Modified section content with figure adjustments applied
+        """
+        modified = section_content
+
+        for act in actions:
+            if act.action_type == "downgrade_wide":
+                # Replace figure* -> figure (all occurrences in this section)
+                modified = modified.replace("\\begin{figure*}", "\\begin{figure}")
+                modified = modified.replace("\\end{figure*}", "\\end{figure}")
+                print(f"  [Structural] Downgraded figure* -> figure for {act.target_id}")
+
+            elif act.action_type == "resize_figure":
+                target_width = act.params.get("width", "0.8\\linewidth")
+                # Use lambda replacements to avoid regex interpreting
+                # backslashes in LaTeX commands like \linewidth
+                modified = re.sub(
+                    r"\\includegraphics\[([^\]]*?)width\s*=\s*\\textwidth",
+                    lambda m: f"\\includegraphics[{m.group(1)}width={target_width}",
+                    modified,
+                )
+                modified = re.sub(
+                    r"\\includegraphics\[([^\]]*?)width\s*=\s*\\linewidth",
+                    lambda m: f"\\includegraphics[{m.group(1)}width={target_width}",
+                    modified,
+                )
+                modified = re.sub(
+                    r"\\includegraphics\[([^\]]*?)width\s*=\s*\\columnwidth",
+                    lambda m: f"\\includegraphics[{m.group(1)}width={target_width}",
+                    modified,
+                )
+                print(f"  [Structural] Resized figures to {target_width} for {act.target_id}")
+
+        return modified
+
+    def _move_figures_to_appendix(
+        self,
+        generated_sections: Dict[str, str],
+        actions: List[StructuralAction],
+    ) -> None:
+        """
+        Move figure/table environments from source sections to the appendix.
+        - **Description**:
+            - Extracts the full \\begin{figure}...\\end{figure} block containing the target label
+            - Replaces it in the source section with a cross-reference note
+            - Appends the extracted block to generated_sections["appendix"]
+            - Operates in-place on generated_sections dict
+
+        - **Args**:
+            - `generated_sections` (Dict[str, str]): All section contents (mutated)
+            - `actions` (List[StructuralAction]): move_figure / move_table actions
+        """
+        # Ensure appendix section exists
+        if "appendix" not in generated_sections:
+            generated_sections["appendix"] = ""
+
+        appendix_parts: List[str] = []
+        if generated_sections["appendix"]:
+            appendix_parts.append(generated_sections["appendix"])
+
+        for act in actions:
+            if act.action_type not in ("move_figure", "move_table"):
+                continue
+
+            sec = act.section
+            content = generated_sections.get(sec, "")
+            if not content:
+                continue
+
+            target_label = act.target_id  # e.g. "fig:arch"
+
+            # Determine environment type
+            if act.action_type == "move_figure":
+                env_names = ["figure\\*", "figure"]
+                ref_text = f"Figure~\\\\ref{{{target_label}}}"
+            else:
+                env_names = ["table\\*", "table"]
+                ref_text = f"Table~\\\\ref{{{target_label}}}"
+
+            extracted = False
+            for env in env_names:
+                # Match the environment that contains this specific label
+                pattern = re.compile(
+                    r"(\\begin\{" + env + r"\}.*?\\label\{" + re.escape(target_label) + r"\}.*?\\end\{" + env + r"\})",
+                    re.DOTALL,
+                )
+                m = pattern.search(content)
+                if m:
+                    block = m.group(1)
+                    # Replace the block with a cross-reference
+                    replacement = f"% [{target_label} moved to Appendix]\n(see {ref_text} in the Appendix)"
+                    content = content[:m.start()] + replacement + content[m.end():]
+                    generated_sections[sec] = content
+                    appendix_parts.append(block)
+                    extracted = True
+                    print(f"  [Structural] Moved {target_label} from {sec} to appendix")
+                    break
+
+            if not extracted:
+                # Try reverse order: label might appear before the begin
+                for env in env_names:
+                    pattern = re.compile(
+                        r"(\\begin\{" + env + r"\}.*?\\end\{" + env + r"\})",
+                        re.DOTALL,
+                    )
+                    for m in pattern.finditer(content):
+                        if target_label in m.group(1):
+                            block = m.group(1)
+                            replacement = f"% [{target_label} moved to Appendix]\n(see {ref_text} in the Appendix)"
+                            content = content[:m.start()] + replacement + content[m.end():]
+                            generated_sections[sec] = content
+                            appendix_parts.append(block)
+                            extracted = True
+                            print(f"  [Structural] Moved {target_label} from {sec} to appendix (alt)")
+                            break
+                    if extracted:
+                        break
+
+            if not extracted:
+                print(f"  [Structural] WARNING: Could not find {target_label} in {sec}")
+
+        generated_sections["appendix"] = "\n\n".join(appendix_parts)
+
+    def _create_appendix_section(
+        self,
+        generated_sections: Dict[str, str],
+        section_order: List[str],
+    ) -> None:
+        """
+        Create an appendix section if it doesn't already exist.
+        - **Description**:
+            - Adds "appendix" key to generated_sections
+            - Inserts "appendix" after "conclusion" in section_order
+
+        - **Args**:
+            - `generated_sections` (Dict[str, str]): Section dict (mutated)
+            - `section_order` (List[str]): Section ordering list (mutated)
+        """
+        if "appendix" not in generated_sections:
+            generated_sections["appendix"] = ""
+            print("[Structural] Created appendix section")
+
+        if "appendix" not in section_order:
+            # Insert after conclusion if it exists, else at the end
+            if "conclusion" in section_order:
+                idx = section_order.index("conclusion") + 1
+                section_order.insert(idx, "appendix")
+            else:
+                section_order.append("appendix")
+            print(f"[Structural] Added appendix to section_order at position {section_order.index('appendix')}")
+
+    def _execute_structural_actions(
+        self,
+        actions: List[StructuralAction],
+        generated_sections: Dict[str, str],
+        section_order: List[str],
+    ) -> None:
+        """
+        Execute all structural actions in order: create appendix, then move, then resize.
+        - **Description**:
+            - Groups actions by type and applies them in the correct order
+            - Mutates generated_sections and section_order in place
+
+        - **Args**:
+            - `actions` (List[StructuralAction]): Planned structural actions
+            - `generated_sections` (Dict[str, str]): Section contents (mutated)
+            - `section_order` (List[str]): Section ordering (mutated)
+        """
+        if not actions:
+            return
+
+        print(f"[Structural] Executing {len(actions)} structural actions...")
+
+        # Phase 1: create appendix if needed
+        create_actions = [a for a in actions if a.action_type == "create_appendix"]
+        if create_actions:
+            self._create_appendix_section(generated_sections, section_order)
+
+        # Phase 2: move figures/tables to appendix
+        move_actions = [a for a in actions if a.action_type in ("move_figure", "move_table")]
+        if move_actions:
+            # Ensure appendix exists before moving anything
+            if "appendix" not in generated_sections:
+                self._create_appendix_section(generated_sections, section_order)
+            self._move_figures_to_appendix(generated_sections, move_actions)
+
+        # Phase 3: resize/downgrade in remaining sections
+        resize_actions = [a for a in actions if a.action_type in ("resize_figure", "downgrade_wide")]
+        if resize_actions:
+            # Group by section
+            by_section: Dict[str, List[StructuralAction]] = {}
+            for a in resize_actions:
+                by_section.setdefault(a.section, []).append(a)
+            for sec, sec_actions in by_section.items():
+                if sec in generated_sections:
+                    generated_sections[sec] = self._resize_figures_in_section(
+                        generated_sections[sec], sec_actions
+                    )
+
+        print("[Structural] All structural actions executed")
+
+    # LaTeX error patterns mapped to fix instructions
+    LATEX_ERROR_FIXES: Dict[str, str] = {
+        "ended by": (
+            "Fix unclosed LaTeX environment. Ensure every \\begin{{...}} has a matching \\end{{...}}. "
+            "Check figure, table, and equation environments."
+        ),
+        "misplaced alignment tab character &": (
+            "Escape all literal '&' characters as '\\&' in regular text. "
+            "Only use bare '&' inside tabular/align environments."
+        ),
+        "unicode character": (
+            "Replace Unicode characters with LaTeX equivalents. "
+            "For example: use \\textendash for –, $-$ or $\\minus$ for −, "
+            "\\% for %, \\& for &."
+        ),
+        "missing $ inserted": (
+            "Fix math mode errors. Wrap mathematical symbols like _, ^, "
+            "\\alpha, \\beta in $...$ when used outside math environments."
+        ),
+        "undefined control sequence": (
+            "Remove or replace undefined LaTeX commands. "
+            "Check for typos in command names or missing package imports."
+        ),
+        "not in outer par mode": (
+            "Move float environments (figure, table) out of restricted contexts. "
+            "Floats cannot appear inside minipage, parbox, or other floats."
+        ),
+        "file not found": (
+            "Remove or comment out \\includegraphics for missing figure files. "
+            "Replace with a placeholder comment if needed."
+        ),
+        "no output pdf file produced": (
+            "Fix critical LaTeX errors that prevent PDF generation. "
+            "Check for unclosed environments, invalid commands, and encoding issues."
+        ),
+    }
+    
+    def _build_typesetter_feedback(
+        self,
+        compile_errors: List[str],
+        generated_sections: Dict[str, str],
+        section_errors: Optional[Dict[str, List[str]]] = None,
+    ) -> Tuple[List[FeedbackResult], List[SectionFeedback]]:
+        """
+        Build feedback from LaTeX compilation errors.
+        - **Description**:
+            - Converts compilation errors into reviewer-compatible feedback
+            - When section_errors is provided (multi-file mode), uses precise
+              error-to-section mapping from the LaTeX log file tracking
+            - Falls back to heuristic content matching when section_errors is not available
+
+        - **Args**:
+            - `compile_errors` (List[str]): Error messages from LaTeX compiler
+            - `generated_sections` (Dict[str, str]): Current section contents
+            - `section_errors` (Dict[str, List[str]], optional): Pre-mapped section -> errors
+
+        - **Returns**:
+            - `feedbacks` (List[FeedbackResult]): Aggregated feedback results
+            - `section_feedbacks` (List[SectionFeedback]): Per-section revision guidance
+        """
+        feedbacks: List[FeedbackResult] = []
+        section_feedbacks: List[SectionFeedback] = []
         
-        return (
-            f"Revise the {section_type} section to {action_text} by approximately {delta} words. "
-            "Preserve factual consistency, citations, and LaTeX formatting. "
-            "Prioritize trimming low-impact details or expanding evidence/details. "
-            f"{guidance_text}"
-        ).strip()
+        if not compile_errors and not section_errors:
+            return feedbacks, section_feedbacks
+        
+        total_errors = len(compile_errors) if compile_errors else sum(
+            len(v) for v in (section_errors or {}).values()
+        )
+        print(f"[Typesetter] Building feedback from {total_errors} compile errors")
+        
+        # Build a combined feedback result
+        feedbacks.append(FeedbackResult(
+            checker_name="typesetter",
+            passed=False,
+            severity=Severity.ERROR,
+            message=f"LaTeX compilation failed with {total_errors} error(s): {'; '.join(compile_errors[:3]) if compile_errors else 'see section_errors'}",
+            details={
+                "source": "typesetter",
+                "compile_errors": compile_errors or [],
+                "section_errors": section_errors or {},
+            },
+        ))
+        
+        # =====================================================================
+        # Multi-file mode: precise section_errors mapping available
+        # =====================================================================
+        if section_errors:
+            for sec_type, sec_errs in section_errors.items():
+                if sec_type not in generated_sections:
+                    continue
+                if not sec_errs:
+                    continue
+                
+                revision_parts = [
+                    "Fix the following LaTeX compilation errors in this section:\n"
+                ]
+                for err in sec_errs:
+                    err_lower = err.lower()
+                    matched_fix = False
+                    for pattern, fix in self.LATEX_ERROR_FIXES.items():
+                        if pattern in err_lower:
+                            revision_parts.append(f"- {err}: {fix}")
+                            matched_fix = True
+                            break
+                    if not matched_fix:
+                        revision_parts.append(f"- {err}: Review and correct this LaTeX error.")
+                revision_parts.append(
+                    "\nOutput ONLY valid LaTeX. Do NOT use unescaped special characters "
+                    "(&, %, $, #, _, {, }) in regular text."
+                )
+                
+                section_feedbacks.append(SectionFeedback(
+                    section_type=sec_type,
+                    current_word_count=len(generated_sections.get(sec_type, "").split()),
+                    target_word_count=0,
+                    action="fix_latex",
+                    delta_words=0,
+                    revision_prompt="\n".join(revision_parts),
+                ))
+                print(f"[Typesetter] Targeted fix (multi-file): section={sec_type} errors={sec_errs[:3]}")
+            
+            # Handle any errors not attributed to a specific section
+            attributed_errors = set()
+            for errs in section_errors.values():
+                attributed_errors.update(errs)
+            unattributed = [e for e in (compile_errors or []) if e not in attributed_errors]
+            if unattributed and not section_feedbacks:
+                # If no section feedbacks were created from section_errors,
+                # fall through to the heuristic/broadcast path below
+                compile_errors = unattributed
+            elif section_feedbacks:
+                return feedbacks, section_feedbacks
+        
+        # =====================================================================
+        # Fallback: heuristic matching or broadcast
+        # =====================================================================
+        if not compile_errors:
+            return feedbacks, section_feedbacks
+        
+        # Collect fix instructions for all errors
+        fix_instructions: List[str] = []
+        for error in compile_errors:
+            error_lower = error.lower()
+            for pattern, fix in self.LATEX_ERROR_FIXES.items():
+                if pattern in error_lower:
+                    fix_instructions.append(f"Error: {error}\nFix: {fix}")
+                    break
+            else:
+                fix_instructions.append(f"Error: {error}\nFix: Review and correct this LaTeX error.")
+        
+        # Try to locate errors to specific sections by scanning content
+        section_error_map: Dict[str, List[str]] = {}
+        for error in compile_errors:
+            error_lower = error.lower()
+            matched_section = None
+            
+            if "figure" in error_lower or "includegraphics" in error_lower:
+                for section_type, content in generated_sections.items():
+                    if "\\begin{figure" in content or "\\includegraphics" in content:
+                        matched_section = section_type
+                        break
+            elif "tabular" in error_lower or "alignment tab" in error_lower:
+                for section_type, content in generated_sections.items():
+                    if "\\begin{tabular" in content or "\\begin{table" in content or "&" in content:
+                        matched_section = section_type
+                        break
+            
+            if matched_section:
+                if matched_section not in section_error_map:
+                    section_error_map[matched_section] = []
+                section_error_map[matched_section].append(error)
+        
+        if section_error_map:
+            for section_type, sec_errs in section_error_map.items():
+                revision_parts = [
+                    "Fix the following LaTeX compilation errors in this section:\n"
+                ]
+                for err in sec_errs:
+                    err_lower = err.lower()
+                    for pattern, fix in self.LATEX_ERROR_FIXES.items():
+                        if pattern in err_lower:
+                            revision_parts.append(f"- {err}: {fix}")
+                            break
+                    else:
+                        revision_parts.append(f"- {err}: Review and correct.")
+                revision_parts.append(
+                    "\nOutput ONLY valid LaTeX. Do NOT use unescaped special characters "
+                    "(&, %, $, #, _, {, }) in regular text."
+                )
+                
+                section_feedbacks.append(SectionFeedback(
+                    section_type=section_type,
+                    current_word_count=len(generated_sections.get(section_type, "").split()),
+                    target_word_count=0,
+                    action="fix_latex",
+                    delta_words=0,
+                    revision_prompt="\n".join(revision_parts),
+                ))
+                print(f"[Typesetter] Targeted fix (heuristic): section={section_type} errors={sec_errs}")
+        else:
+            # Cannot locate to specific section - broadcast to all sections
+            all_fix_prompt = (
+                "Fix the following LaTeX compilation errors in this section:\n"
+                + "\n".join(f"- {inst}" for inst in fix_instructions)
+                + "\n\nOutput ONLY valid LaTeX. Ensure all environments are properly closed. "
+                "Escape special characters (&, %, $, #, _, {, }) in regular text."
+            )
+            for section_type in generated_sections:
+                section_feedbacks.append(SectionFeedback(
+                    section_type=section_type,
+                    current_word_count=len(generated_sections.get(section_type, "").split()),
+                    target_word_count=0,
+                    action="fix_latex",
+                    delta_words=0,
+                    revision_prompt=all_fix_prompt,
+                ))
+            print(f"[Typesetter] Broadcast fix to all {len(generated_sections)} sections")
+        
+        return feedbacks, section_feedbacks
     
     def _merge_section_feedbacks(
         self,
@@ -1776,7 +2705,14 @@ class MetaDataAgent(BaseAgent):
                 merged[fb.section_type] = fb
                 continue
             
-            if existing.action != fb.action and prefer_vlm:
+            # fix_latex always takes priority — compilation must succeed first
+            if fb.action == "fix_latex" and existing.action != "fix_latex":
+                merged[fb.section_type] = fb
+            elif existing.action == "fix_latex":
+                # Keep existing fix_latex; append new prompt if also fix_latex
+                if fb.action == "fix_latex":
+                    existing.revision_prompt += "\n\n" + fb.revision_prompt
+            elif existing.action != fb.action and prefer_vlm:
                 merged[fb.section_type] = fb
             elif existing.action == fb.action and abs(fb.delta_words) > abs(existing.delta_words):
                 merged[fb.section_type] = fb
@@ -1853,6 +2789,11 @@ class MetaDataAgent(BaseAgent):
             revision_prompt = sf.revision_prompt
             if not revision_prompt:
                 continue
+            
+            print(
+                "[ReviewLoop] Applying revision: "
+                f"section={sf.section_type} action={sf.action} delta_words={sf.delta_words}"
+            )
             
             revised_content = await self._revise_section(
                 section_type=sf.section_type,
@@ -1965,6 +2906,10 @@ class MetaDataAgent(BaseAgent):
         for iteration in range(max_review_iterations):
             review_iterations = iteration + 1
             print(f"[MetaDataAgent] Review iteration {review_iterations}/{max_review_iterations}")
+            print(
+                "[MetaDataAgent] Review context: "
+                f"target_pages={target_pages or 8} enable_review={enable_review} enable_vlm_review={enable_vlm_review}"
+            )
             
             word_counts = {
                 sr.section_type: sr.word_count
@@ -1974,6 +2919,14 @@ class MetaDataAgent(BaseAgent):
             
             review_result = ReviewResult(iteration=iteration)
             if enable_review:
+                # Build section_targets from plan so Reviewer uses
+                # the same targets as the Planner (unified ratios).
+                section_targets = None
+                if paper_plan and paper_plan.sections:
+                    section_targets = {
+                        s.section_type: s.target_words
+                        for s in paper_plan.sections
+                    }
                 reviewer_result, target_word_count = await self._call_reviewer(
                     sections=generated_sections,
                     word_counts=word_counts,
@@ -1981,11 +2934,38 @@ class MetaDataAgent(BaseAgent):
                     style_guide=metadata.style_guide,
                     template_path=template_path,
                     iteration=iteration,
+                    section_targets=section_targets,
                 )
                 if reviewer_result is None:
                     print("[MetaDataAgent] Reviewer not available, skipping content review")
                 else:
                     review_result = ReviewResult(**reviewer_result)
+                    print(
+                        "[Reviewer] Result: "
+                        f"passed={review_result.passed} "
+                        f"sections_to_revise={list(review_result.requires_revision.keys())}"
+                    )
+                    
+                    # Conflict resolution: if the previous VLM iteration detected
+                    # page overflow, suppress any Reviewer "expand" feedback.
+                    # Page limits are a hard constraint; word count targets are soft.
+                    if last_vlm_result and last_vlm_result.get("needs_trim"):
+                        suppressed = [
+                            sf.section_type
+                            for sf in review_result.section_feedbacks
+                            if sf.action == "expand"
+                        ]
+                        if suppressed:
+                            review_result.section_feedbacks = [
+                                sf for sf in review_result.section_feedbacks
+                                if sf.action != "expand"
+                            ]
+                            for sec in suppressed:
+                                review_result.requires_revision.pop(sec, None)
+                            print(
+                                f"[ReviewLoop] Suppressed Reviewer 'expand' for "
+                                f"{suppressed} (VLM overflow active)"
+                            )
             
             reviewer_revised_sections = await self._apply_revisions(
                 review_result=review_result,
@@ -1994,6 +2974,8 @@ class MetaDataAgent(BaseAgent):
                 valid_citation_keys=self._extract_valid_citation_keys(parsed_refs),
                 metadata=metadata,
             )
+            if reviewer_revised_sections:
+                print(f"[ReviewLoop] Reviewer revised: {sorted(reviewer_revised_sections)}")
             self._resolve_section_feedbacks(
                 section_feedbacks=review_result.section_feedbacks,
                 revised_sections=reviewer_revised_sections,
@@ -2004,31 +2986,58 @@ class MetaDataAgent(BaseAgent):
                 for sr in sections_results
                 if sr.status == "ok"
             }
+            print(f"[ReviewLoop] Word counts: {word_counts}")
             
             # Compile PDF and run VLM review if enabled
+            compile_succeeded = False
             if compile_pdf and template_path and paper_dir:
+                iteration_dir = paper_dir / f"iteration_{review_iterations:02d}"
+                iteration_dir.mkdir(parents=True, exist_ok=True)
+                print(f"[ReviewLoop] PDF output dir: {iteration_dir}")
                 figure_base_path = os.getcwd()
                 figure_paths = self._collect_figure_paths(metadata.figures, base_path=figure_base_path)
-                pdf_result_path, _ = await self._compile_pdf(
+                pdf_result_path, _, compile_errors, section_errors = await self._compile_pdf(
                     generated_sections=generated_sections,
                     template_path=template_path,
                     references=parsed_refs,
-                    output_dir=paper_dir,
+                    output_dir=iteration_dir,
                     paper_title=metadata.title,
                     figures_source_dir=figures_source_dir,
                     figure_paths=figure_paths,
                     converted_tables=converted_tables,
                     paper_plan=paper_plan,
                     figures=metadata.figures,
+                    metadata_tables=metadata.tables,
                 )
                 if pdf_result_path:
                     pdf_path = pdf_result_path
+                    compile_succeeded = True
                 else:
-                    errors.append("PDF compilation failed")
-                    break
+                    # Compilation failed -> treat as review feedback, not a hard exit
+                    print(f"[ReviewLoop] PDF compilation failed, treating as Typesetter review feedback")
+                    ts_feedbacks, ts_section_feedbacks = self._build_typesetter_feedback(
+                        compile_errors=compile_errors,
+                        section_errors=section_errors,
+                        generated_sections=generated_sections,
+                    )
+                    for fb in ts_feedbacks:
+                        review_result.add_feedback(fb)
+                    
+                    # Merge typesetter section feedbacks
+                    merged_section_feedbacks = self._merge_section_feedbacks(
+                        review_result.section_feedbacks,
+                        ts_section_feedbacks,
+                        prefer_vlm=False,  # Typesetter fixes take priority via action="fix_latex"
+                    )
+                    review_result.section_feedbacks = merged_section_feedbacks
+                    for sf in ts_section_feedbacks:
+                        review_result.add_section_revision(sf.section_type, "Typesetter LaTeX fix")
+                    
+                    review_result.passed = False
+                    # Skip VLM review this iteration (no PDF to review)
                 
-                if enable_vlm_review and pdf_path:
-                    print(f"[MetaDataAgent] VLM Review...")
+                if compile_succeeded and enable_vlm_review and pdf_path:
+                    print(f"[MetaDataAgent] VLM Review: pdf_path={pdf_path}")
                     last_vlm_result = await self._call_vlm_review(
                         pdf_path=pdf_path,
                         page_limit=target_pages or 8,
@@ -2039,7 +3048,56 @@ class MetaDataAgent(BaseAgent):
                         },
                     )
                     if last_vlm_result:
-                        vlm_feedbacks, vlm_section_feedbacks = self._build_vlm_feedback(last_vlm_result)
+                        print(
+                            "[VLMReview] Result: "
+                            f"passed={last_vlm_result.get('passed', False)} "
+                            f"overflow_pages={last_vlm_result.get('overflow_pages', 0)} "
+                            f"needs_trim={last_vlm_result.get('needs_trim', False)} "
+                            f"needs_expand={last_vlm_result.get('needs_expand', False)} "
+                            f"sections={list((last_vlm_result.get('section_recommendations') or {}).keys())}"
+                        )
+                        
+                        # ==========================================================
+                        # Smart page-limit control: plan & execute structural actions
+                        # BEFORE building VLM feedback so context is in prompts
+                        # ==========================================================
+                        planned_structural_actions: List[StructuralAction] = []
+                        if last_vlm_result.get("needs_trim"):
+                            overflow = last_vlm_result.get("overflow_pages", 0)
+                            if overflow > 0:
+                                section_order = list(generated_sections.keys())
+                                if paper_plan and paper_plan.sections:
+                                    section_order = [s.section_type for s in paper_plan.sections]
+                                
+                                planned_structural_actions = self._plan_overflow_strategy(
+                                    overflow_pages=overflow,
+                                    generated_sections=generated_sections,
+                                    paper_plan=paper_plan,
+                                    figures=metadata.figures,
+                                )
+                                if planned_structural_actions:
+                                    self._execute_structural_actions(
+                                        planned_structural_actions,
+                                        generated_sections,
+                                        section_order,
+                                    )
+                                    # Update sections_results after structural changes
+                                    for sr in sections_results:
+                                        if sr.section_type in generated_sections:
+                                            sr.latex_content = generated_sections[sr.section_type]
+                                            sr.word_count = len(generated_sections[sr.section_type].split())
+                                    print(
+                                        f"[ReviewLoop] Structural actions applied: "
+                                        f"{len(planned_structural_actions)} actions, "
+                                        f"total estimated savings ~"
+                                        f"{sum(a.estimated_savings for a in planned_structural_actions):.1f} pages"
+                                    )
+                        
+                        # Build VLM feedback with structural context baked in
+                        vlm_feedbacks, vlm_section_feedbacks = self._build_vlm_feedback(
+                            last_vlm_result,
+                            structural_actions=planned_structural_actions or None,
+                        )
                         for fb in vlm_feedbacks:
                             review_result.add_feedback(fb)
                         
@@ -2066,30 +3124,39 @@ class MetaDataAgent(BaseAgent):
             elif enable_vlm_review:
                 errors.append("VLM review skipped: PDF not compiled (missing template or output path)")
             
-            vlm_revised_sections = await self._apply_revisions(
+            # Apply revisions from VLM feedback and/or Typesetter LaTeX-fix feedback
+            post_compile_revised = await self._apply_revisions(
                 review_result=review_result,
                 generated_sections=generated_sections,
                 sections_results=sections_results,
                 valid_citation_keys=self._extract_valid_citation_keys(parsed_refs),
                 metadata=metadata,
             )
+            if post_compile_revised:
+                sources = "VLM/Typesetter" if not compile_succeeded else "VLM"
+                print(f"[ReviewLoop] {sources} revised: {sorted(post_compile_revised)}")
             self._resolve_section_feedbacks(
                 section_feedbacks=review_result.section_feedbacks,
-                revised_sections=vlm_revised_sections,
+                revised_sections=post_compile_revised,
                 review_result=review_result,
             )
             
             current_fingerprint = self._get_sections_fingerprint(generated_sections)
             if current_fingerprint == last_fingerprint:
                 if review_result.passed and (not last_vlm_result or last_vlm_result.get("passed", True)):
-                    print("[MetaDataAgent] Review passed with no further changes")
+                    print("[MetaDataAgent] Review passed with no further changes (fingerprint stable)")
+                elif not compile_succeeded:
+                    errors.append("LaTeX compilation failed and revisions did not change content")
+                    print("[MetaDataAgent] Exiting: compilation failed with no effective revisions (fingerprint stable)")
                 else:
                     if last_vlm_result and not last_vlm_result.get("passed", True):
                         errors.append(last_vlm_result.get("summary", "VLM review failed"))
+                        print("[MetaDataAgent] Exiting due to VLM failure with no changes")
                 break
             
             last_fingerprint = current_fingerprint
-            if not reviewer_revised_sections and not vlm_revised_sections and review_result.passed and (not last_vlm_result or last_vlm_result.get("passed", True)):
+            if not reviewer_revised_sections and not post_compile_revised and review_result.passed and (not last_vlm_result or last_vlm_result.get("passed", True)):
+                print("[MetaDataAgent] Exiting: no revisions needed and review passed")
                 break
         
         return generated_sections, sections_results, review_iterations, target_word_count, pdf_path, errors
@@ -2102,26 +3169,33 @@ class MetaDataAgent(BaseAgent):
         style_guide: Optional[str],
         template_path: Optional[str],
         iteration: int,
+        section_targets: Optional[Dict[str, int]] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
         """
-        Call Reviewer Agent to check the paper
-        
-        Returns:
-            Tuple of (review_result_dict, target_word_count) or (None, None) on failure
+        Call Reviewer Agent to check the paper.
+        - **Description**:
+            - Passes plan-derived section_targets so the Reviewer uses
+              the same word budget as the Planner (unified ratios).
+
+        - **Returns**:
+            - Tuple of (review_result_dict, target_word_count) or (None, None) on failure
         """
         try:
+            payload = {
+                "sections": sections,
+                "word_counts": word_counts,
+                "target_pages": target_pages,
+                "style_guide": style_guide,
+                "template_path": template_path,
+                "metadata": {},
+                "iteration": iteration,
+            }
+            if section_targets:
+                payload["section_targets"] = section_targets
             async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.post(
                     "http://localhost:8000/agent/reviewer/review",
-                    json={
-                        "sections": sections,
-                        "word_counts": word_counts,
-                        "target_pages": target_pages,
-                        "style_guide": style_guide,
-                        "template_path": template_path,
-                        "metadata": {},
-                        "iteration": iteration,
-                    }
+                    json=payload,
                 )
                 
                 if response.status_code != 200:
@@ -2155,28 +3229,45 @@ class MetaDataAgent(BaseAgent):
         metadata: PaperMetaData,
     ) -> Optional[str]:
         """
-        Revise a section based on feedback
-        
-        Args:
-            section_type: Type of section to revise
-            current_content: Current section content
-            revision_prompt: Prompt with revision instructions
-            metadata: Paper metadata for context
-            
-        Returns:
-            Revised content or None on failure
+        Revise a section based on feedback.
+        - **Description**:
+            - Sends the revision instructions along with the current content to the LLM
+            - The LLM outputs only the revised LaTeX, no explanations
+
+        - **Args**:
+            - `section_type` (str): Type of section to revise
+            - `current_content` (str): Current section LaTeX content
+            - `revision_prompt` (str): Instructions for the revision
+            - `metadata` (PaperMetaData): Paper metadata for context
+
+        - **Returns**:
+            - Revised content string, or None on failure
         """
         try:
-            system_prompt = """You are an expert academic writer revising a paper section.
-Follow the revision instructions carefully to improve the content.
-Maintain academic writing quality and the original structure.
-Output ONLY the revised LaTeX content, no explanations."""
+            system_prompt = (
+                "You are an expert academic writer revising a paper section.\n"
+                "Follow the revision instructions carefully to improve the content.\n"
+                "Maintain academic writing quality.\n"
+                "Output ONLY the revised LaTeX content, no explanations or preamble."
+            )
+
+            # Build user message: instructions + current content
+            # If revision_prompt already contains the content (e.g. from ReviewerAgent),
+            # avoid duplicating it by checking for the marker text.
+            if "Current content" in revision_prompt or current_content in revision_prompt:
+                user_message = revision_prompt
+            else:
+                user_message = (
+                    f"{revision_prompt}\n\n"
+                    f"Current content of the {section_type} section to revise:\n"
+                    f"{current_content}"
+                )
 
             response = await self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": revision_prompt},
+                    {"role": "user", "content": user_message},
                 ],
                 temperature=0.7,
             )

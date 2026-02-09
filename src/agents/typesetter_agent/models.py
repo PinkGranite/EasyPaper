@@ -46,6 +46,8 @@ class CompilationResult(BaseModel):
     Result of LaTeX compilation
     - **Description**:
         - Contains compilation status and output paths
+        - When multi-file mode is used, section_files maps section types to file paths
+          and section_errors maps section types to their specific compilation errors
     """
     success: bool
     pdf_path: Optional[str] = None
@@ -54,6 +56,8 @@ class CompilationResult(BaseModel):
     errors: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
     attempts: int = 0
+    section_files: Dict[str, str] = Field(default_factory=dict)  # section_type -> file path
+    section_errors: Dict[str, List[str]] = Field(default_factory=dict)  # section_type -> errors
 
 
 class TypesetterPayload(BaseModel):
@@ -61,12 +65,18 @@ class TypesetterPayload(BaseModel):
     Payload for Typesetter Agent request
     - **Description**:
         - Contains LaTeX content and resources to compile
+        - Supports two content modes (mutually exclusive):
+          1. latex_content (str): Single concatenated LaTeX body (legacy)
+          2. sections (Dict[str, str]): Per-section content for multi-file output
     """
     request_id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()))
     user_id: Optional[str] = None
     payload: Dict[str, Any]
     # Expected payload fields:
-    # - latex_content: str
+    # - latex_content: str              (legacy single-string mode)
+    # - sections: Dict[str, str]        (multi-file mode: section_type -> content)
+    # - section_order: List[str]        (multi-file mode: order of body sections)
+    # - section_titles: Dict[str, str]  (multi-file mode: section_type -> display title)
     # - template_path: str
     # - figure_ids: List[str]
     # - citation_ids: List[str]

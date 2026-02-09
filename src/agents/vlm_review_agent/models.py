@@ -68,6 +68,7 @@ class PageAnalysis(BaseModel):
     layout_issues: List[LayoutIssue] = Field(default_factory=list)
     is_last_content_page: bool = False  # Last page with main content (before references)
     is_references_page: bool = False    # Contains bibliography
+    is_appendix_page: bool = False      # Contains appendix content
     raw_vlm_response: Optional[str] = None  # Raw VLM response for debugging
 
 

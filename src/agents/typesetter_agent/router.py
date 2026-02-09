@@ -40,6 +40,9 @@ def create_typesetter_router(agent_instance):
         try:
             # Extract parameters from payload
             latex_content = payload.payload.get("latex_content", "")
+            sections = payload.payload.get("sections")  # Multi-file mode
+            section_order = payload.payload.get("section_order")
+            section_titles = payload.payload.get("section_titles")
             template_path = payload.payload.get("template_path")
             template_config_data = payload.payload.get("template_config")
             figure_ids = payload.payload.get("figure_ids", [])
@@ -51,10 +54,10 @@ def create_typesetter_router(agent_instance):
             figure_paths = payload.payload.get("figure_paths", {})
             converted_tables = payload.payload.get("converted_tables", {})
 
-            if not latex_content:
+            if not latex_content and not sections:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="latex_content must be provided"
+                    detail="Either latex_content or sections must be provided"
                 )
 
             # Parse template_config if provided
@@ -68,6 +71,9 @@ def create_typesetter_router(agent_instance):
             # Run the agent
             agent_result = await agent_instance.run(
                 latex_content=latex_content,
+                sections=sections,
+                section_order=section_order,
+                section_titles=section_titles,
                 template_path=template_path,
                 template_config=template_config,
                 figure_ids=figure_ids,

@@ -50,3 +50,4 @@ outputs/
 scripts/
 test*
 __*
+.cursor/
