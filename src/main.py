@@ -26,8 +26,13 @@ async def lifespan(app: FastAPI):
         print(f"   Skills system: {len(skill_registry)} skills loaded from {skills_config.skills_dir}")
     app.state.skill_registry = skill_registry
 
-    # Initialize agents (pass skill_registry for ReviewerAgent / MetaDataAgent)
-    app.state.agents = initialize_agents(config.agents, skill_registry=skill_registry)
+    # Initialize agents (pass skill_registry for ReviewerAgent / MetaDataAgent,
+    # and global tools config for ReAct-enabled agents)
+    app.state.agents = initialize_agents(
+        config.agents,
+        skill_registry=skill_registry,
+        global_tools_config=config.tools,
+    )
     # Register agent routers
     register_agent_routers(app, app.state.agents)
 

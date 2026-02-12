@@ -19,6 +19,28 @@ class WriterConfig(BaseModel):
     )
 
 
+class PaperSearchConfig(BaseModel):
+    """Configuration for the paper search tool."""
+    semantic_scholar_api_key: Optional[str] = None
+    default_max_results: int = 5
+    timeout: int = 10
+
+
+class ToolsConfig(BaseModel):
+    """Configuration for ReAct tool usage."""
+    enabled: bool = True
+    available_tools: List[str] = Field(
+        default_factory=lambda: [
+            "validate_citations",
+            "count_words",
+            "check_key_points",
+            "search_papers",
+        ]
+    )
+    max_react_iterations: int = 3
+    paper_search: Optional[PaperSearchConfig] = None
+
+
 class MetadataConfig(BaseModel):
     """Metadata agent-specific configuration options."""
     enable_mini_review: bool = True
@@ -54,6 +76,7 @@ class AgentConfig(BaseModel):
     writer_config: Optional[WriterConfig] = None
     metadata_config: Optional[MetadataConfig] = None
     vlm_review_config: Optional[VLMReviewConfig] = None
+    tools_config: Optional[ToolsConfig] = None
 
 
 class SkillsConfig(BaseModel):
@@ -67,3 +90,4 @@ class SkillsConfig(BaseModel):
 class AppConfig(BaseModel):
     agents: List[AgentConfig]
     skills: Optional[SkillsConfig] = None
+    tools: Optional[ToolsConfig] = None

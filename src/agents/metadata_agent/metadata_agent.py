@@ -2,13 +2,24 @@
 MetaData Agent - Simple Mode Paper Generation
 - **Description**:
     - Generates complete papers from simplified MetaData input
-    - Five-phase generation:
+    - Multi-phase generation with persistent ReferencePool:
         0. Planning - creates detailed paper plan
-        1. Introduction (Leader) - sets tone and extracts contributions
-        2. Body Sections (parallel) - Method, Experiment, Results, Related Work
+        1. Introduction (Leader) - sets tone, extracts contributions
+        2. Body Sections - Method, Experiment, Results, Related Work
         3. Synthesis Sections - Abstract and Conclusion from prior sections
         3.5. Review Loop - iterative feedback and revision
         4. PDF Compilation - via Typesetter Agent
+    - Two-phase content generation pattern:
+        - Phase A (Judgment + Search): LLM judges whether the section needs
+          additional references; if yes, PaperSearchTool is called system-side
+          and results are merged into the ReferencePool before writing.
+        - Phase B (Pure Writing): LLM generates content with all available
+          refs (core + discovered) in the prompt, no tools attached.
+    - Fixed-sequence review:
+        - Mini-review executes citation validation, word count, and key point
+          checks in deterministic order (Type 2 tools).
+    - ReferencePool accumulates references across all phases:
+        user's core refs + discovered refs -> final .bib
     - Independent API, no frontend dependency
 """
 import asyncio
@@ -21,12 +32,12 @@ from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 
 import httpx
-from openai import AsyncOpenAI
 from pydantic import BaseModel
 from fastapi import APIRouter
 
-from ..base import BaseAgent
-from ...config.schema import ModelConfig
+from ..react_base import ReActAgent
+from ...config.schema import ModelConfig, ToolsConfig
+from ..shared.reference_pool import ReferencePool
 from .models import (
     PaperMetaData,
     PaperGenerationRequest,
@@ -60,22 +71,88 @@ from ..reviewer_agent.models import ReviewResult, FeedbackResult, Severity, Sect
 from .models import FigureSpec, TableSpec, StructuralAction, SpaceEstimate
 
 
-class MetaDataAgent(BaseAgent):
+# System prompt for pure content generation (no tools attached)
+GENERATION_SYSTEM_PROMPT = """\
+You are an expert academic writer specializing in research paper composition.
+Use present tense for methods, no contractions (it is, do not, cannot),
+no possessives on method names (the performance of X, not X's performance).
+Place key information at sentence end. Output pure LaTeX only.
+
+CITATION RULES:
+- Use ONLY the citation keys listed in the provided references.
+- NEVER invent or hallucinate citation keys.
+- If a claim needs a reference but none of the provided keys fit, omit the \\cite command.
+
+OUTPUT FORMAT:
+Return ONLY the LaTeX content for the section. Do not include explanations outside the LaTeX."""
+
+
+# System prompt for pre-generation search judgment
+SEARCH_JUDGMENT_PROMPT = """\
+You are an academic research assistant. Your task is to analyze whether the existing \
+references are sufficient for writing a specific section of a research paper, or whether \
+additional references should be searched.
+
+Given the following section context, analyze whether additional references are needed.
+
+SECTION: {section_type} ({section_title})
+PAPER TITLE: {paper_title}
+KEY POINTS TO COVER:
+{key_points}
+
+EXISTING REFERENCES ({n_refs} papers):
+{ref_summaries}
+
+RULES:
+- If existing references adequately cover the section's claims, set need_search to false.
+- If there are gaps (e.g., missing baselines, no empirical evidence for a claim, \
+a sub-topic with zero refs), set need_search to true.
+- Provide 1-3 focused search queries using specific keywords, not broad topics.
+  Good: "R&D tax credit firm productivity panel data"
+  Bad: "innovation economics"
+- Each query should target a specific gap you identified.
+
+Respond with ONLY a JSON object, no other text:
+{{"need_search": true/false, "reason": "...", "queries": ["...", "..."]}}\
+"""
+
+
+class MetaDataAgent(ReActAgent):
     """
     MetaData Agent for simple-mode paper generation
-    
+
     - **Description**:
-        - Accepts 5 natural language fields + BibTeX references
-        - Generates complete paper through three-phase process
-        - Independent API, can be called directly via curl/Postman
+        - Inherits from ReActAgent for access to react_loop and setup_tools.
+        - Accepts 5 natural language fields + BibTeX references.
+        - Manages a persistent ReferencePool throughout paper generation:
+            - User's core references (~5 papers) initialize the pool.
+            - During content generation, LLM may call search_papers (ReAct)
+              to discover additional references.
+            - Discovered papers undergo two-layer validation (LLM judgment +
+              system cross-reference) before being added to the pool.
+            - The pool's valid_citation_keys grows across phases.
+        - Dual-mode tool invocation:
+            - Type 1 (ReAct): _generate_introduction / _generate_body_section
+              use react_loop with search_papers for autonomous reference search.
+            - Type 2 (Fixed Sequence): _mini_review_section runs citation,
+              word count, and key point checks in fixed deterministic order.
+        - Independent API, can be called directly via curl/Postman.
     """
-    
-    def __init__(self, config: ModelConfig):
-        self.client = AsyncOpenAI(
-            api_key=config.api_key,
-            base_url=config.base_url,
-        )
-        self.model_name = config.model_name
+
+    def __init__(self, config: ModelConfig, tools_config: Optional[ToolsConfig] = None):
+        # Use default tools config if not provided
+        if tools_config is None:
+            tools_config = ToolsConfig(
+                enabled=True,
+                available_tools=[
+                    "validate_citations",
+                    "count_words",
+                    "check_key_points",
+                    "search_papers",
+                ],
+                max_react_iterations=3,
+            )
+        super().__init__(config, tools_config)
         self.results_dir = Path(__file__).parent.parent.parent.parent / "results"
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self._router = self._create_router()
@@ -199,12 +276,13 @@ class MetaDataAgent(BaseAgent):
         review_iterations = 0
         target_word_count = None
         
-        # Parse references first
-        parsed_refs = self._parse_references(metadata.references)
+        # Initialize persistent reference pool from user's core references
+        ref_pool = ReferencePool(metadata.references)
+        print(f"[MetaDataAgent] Reference pool initialized: {ref_pool.summary()}")
+        print(f"[MetaDataAgent] Core citation keys: {ref_pool.valid_citation_keys}")
         
-        # Extract valid citation keys for validation
-        valid_citation_keys = self._extract_valid_citation_keys(parsed_refs)
-        print(f"[MetaDataAgent] Valid citation keys: {valid_citation_keys}")
+        # Keep parsed_refs for backward-compatible methods that still need it
+        parsed_refs = ref_pool.get_all_refs()
         
         # Validate figure/table file paths before proceeding
         validation_errors = self._validate_file_paths(metadata)
@@ -292,18 +370,19 @@ class MetaDataAgent(BaseAgent):
             print(f"[MetaDataAgent] Phase 1: Generating Introduction...")
             intro_plan = paper_plan.get_section("introduction") if paper_plan else None
             intro_result = await self._generate_introduction(
-                metadata, parsed_refs, section_plan=intro_plan,
+                metadata, ref_pool, section_plan=intro_plan,
                 figures=metadata.figures, tables=metadata.tables,
             )
             sections_results.append(intro_result)
+            print(f"[MetaDataAgent] After introduction: {ref_pool.summary()}")
             
             if intro_result.status == "ok":
-                # Mini-review: validate citations and check quality
-                review_result = self._mini_review_section(
+                # Mini-review: validate citations and check quality (fixed sequence)
+                review_result = await self._mini_review_section(
                     section_type="introduction",
                     content=intro_result.latex_content,
                     section_plan=intro_plan,
-                    valid_citation_keys=valid_citation_keys,
+                    valid_citation_keys=ref_pool.valid_citation_keys,
                 )
                 # Use fixed content (with invalid citations removed)
                 intro_result.latex_content = review_result["fixed_content"]
@@ -336,55 +415,49 @@ class MetaDataAgent(BaseAgent):
                 body_section_types = ["related_work", "method", "experiment", "result"]
             print(f"[MetaDataAgent] Body sections from plan: {body_section_types}")
             
-            # Generate body sections (can be parallelized)
-            body_tasks = []
+            # Generate body sections sequentially (ref_pool accumulates across sections)
             for section_type in body_section_types:
                 section_plan = paper_plan.get_section(section_type) if paper_plan else None
                 # Filter figures/tables for this section
                 section_figures = [f for f in metadata.figures if f.section == section_type or not f.section]
                 section_tables = [t for t in metadata.tables if t.section == section_type or not t.section]
-                task = self._generate_body_section(
-                    section_type=section_type,
-                    metadata=metadata,
-                    intro_context=generated_sections.get("introduction", ""),
-                    contributions=contributions,
-                    parsed_refs=parsed_refs,
-                    section_plan=section_plan,
-                    figures=section_figures,
-                    tables=section_tables,
-                    converted_tables=converted_tables,
-                )
-                body_tasks.append(task)
-            
-            body_results = await asyncio.gather(*body_tasks, return_exceptions=True)
-            
-            for idx, (section_type, result) in enumerate(zip(body_section_types, body_results)):
-                if isinstance(result, Exception):
-                    error_result = SectionResult(
+                
+                try:
+                    result = await self._generate_body_section(
+                        section_type=section_type,
+                        metadata=metadata,
+                        intro_context=generated_sections.get("introduction", ""),
+                        contributions=contributions,
+                        ref_pool=ref_pool,
+                        section_plan=section_plan,
+                        figures=section_figures,
+                        tables=section_tables,
+                        converted_tables=converted_tables,
+                    )
+                except Exception as e:
+                    result = SectionResult(
                         section_type=section_type,
                         status="error",
-                        error=str(result),
+                        error=str(e),
                     )
-                    sections_results.append(error_result)
-                    errors.append(f"{section_type} generation failed: {result}")
+                
+                sections_results.append(result)
+                if result.status == "ok":
+                    # Mini-review: validate citations and check quality (fixed sequence)
+                    review_result = await self._mini_review_section(
+                        section_type=section_type,
+                        content=result.latex_content,
+                        section_plan=section_plan,
+                        valid_citation_keys=ref_pool.valid_citation_keys,
+                    )
+                    # Use fixed content (with invalid citations removed)
+                    result.latex_content = review_result["fixed_content"]
+                    result.word_count = review_result["fixed_word_count"]
+                    
+                    generated_sections[section_type] = result.latex_content
+                    print(f"[MetaDataAgent] After {section_type}: {ref_pool.summary()}")
                 else:
-                    sections_results.append(result)
-                    if result.status == "ok":
-                        # Mini-review: validate citations and check quality
-                        section_plan = paper_plan.get_section(section_type) if paper_plan else None
-                        review_result = self._mini_review_section(
-                            section_type=section_type,
-                            content=result.latex_content,
-                            section_plan=section_plan,
-                            valid_citation_keys=valid_citation_keys,
-                        )
-                        # Use fixed content (with invalid citations removed)
-                        result.latex_content = review_result["fixed_content"]
-                        result.word_count = review_result["fixed_word_count"]
-                        
-                        generated_sections[section_type] = result.latex_content
-                    else:
-                        errors.append(f"{section_type} generation failed: {result.error}")
+                    errors.append(f"{section_type} generation failed: {result.error}")
             
             # =================================================================
             # Phase 3: Synthesis Sections (Abstract + Conclusion)
@@ -404,11 +477,11 @@ class MetaDataAgent(BaseAgent):
             if abstract_result.status == "ok":
                 # Mini-review for abstract (mostly citation check)
                 abstract_plan = paper_plan.get_section("abstract") if paper_plan else None
-                review_result = self._mini_review_section(
+                review_result = await self._mini_review_section(
                     section_type="abstract",
                     content=abstract_result.latex_content,
                     section_plan=abstract_plan,
-                    valid_citation_keys=valid_citation_keys,
+                    valid_citation_keys=ref_pool.valid_citation_keys,
                 )
                 abstract_result.latex_content = review_result["fixed_content"]
                 abstract_result.word_count = review_result["fixed_word_count"]
@@ -430,11 +503,11 @@ class MetaDataAgent(BaseAgent):
             if conclusion_result.status == "ok":
                 # Mini-review for conclusion
                 conclusion_plan = paper_plan.get_section("conclusion") if paper_plan else None
-                review_result = self._mini_review_section(
+                review_result = await self._mini_review_section(
                     section_type="conclusion",
                     content=conclusion_result.latex_content,
                     section_plan=conclusion_plan,
-                    valid_citation_keys=valid_citation_keys,
+                    valid_citation_keys=ref_pool.valid_citation_keys,
                 )
                 conclusion_result.latex_content = review_result["fixed_content"]
                 conclusion_result.word_count = review_result["fixed_word_count"]
@@ -457,7 +530,7 @@ class MetaDataAgent(BaseAgent):
                 generated_sections=generated_sections,
                 sections_results=sections_results,
                 metadata=metadata,
-                parsed_refs=parsed_refs,
+                parsed_refs=ref_pool.get_all_refs(),
                 paper_plan=paper_plan,
                 template_path=template_path,
                 figures_source_dir=figures_source_dir,
@@ -479,8 +552,8 @@ class MetaDataAgent(BaseAgent):
             latex_content = self._assemble_paper(
                 title=metadata.title,
                 sections=generated_sections,
-                references=parsed_refs,
-                valid_citation_keys=valid_citation_keys,
+                references=ref_pool.get_all_refs(),
+                valid_citation_keys=ref_pool.valid_citation_keys,
             )
             
             # Calculate total word count
@@ -495,8 +568,8 @@ class MetaDataAgent(BaseAgent):
                 tex_path = paper_dir / "main.tex"
                 tex_path.write_text(latex_content, encoding="utf-8")
                 
-                # Save references.bib
-                bib_content = self._generate_bib_file(parsed_refs)
+                # Save references.bib (uses ref_pool for all accumulated refs)
+                bib_content = ref_pool.to_bibtex()
                 bib_path = paper_dir / "references.bib"
                 bib_path.write_text(bib_content, encoding="utf-8")
                 
@@ -545,10 +618,10 @@ class MetaDataAgent(BaseAgent):
     ) -> SectionResult:
         """Generate a single section (for debugging or incremental generation)"""
         metadata = request.metadata
-        parsed_refs = self._parse_references(metadata.references)
+        ref_pool = ReferencePool(metadata.references)
         
         if request.section_type == "introduction":
-            return await self._generate_introduction(metadata, parsed_refs)
+            return await self._generate_introduction(metadata, ref_pool)
         elif request.section_type in SYNTHESIS_SECTIONS:
             prior = request.prior_sections or {}
             contributions = extract_contributions_from_intro(prior.get("introduction", ""))
@@ -568,7 +641,7 @@ class MetaDataAgent(BaseAgent):
                 metadata=metadata,
                 intro_context=request.intro_context or "",
                 contributions=contributions,
-                parsed_refs=parsed_refs,
+                ref_pool=ref_pool,
             )
     
     # =========================================================================
@@ -578,47 +651,91 @@ class MetaDataAgent(BaseAgent):
     async def _generate_introduction(
         self,
         metadata: PaperMetaData,
-        parsed_refs: List[Dict[str, Any]],
+        ref_pool: ReferencePool,
         section_plan: Optional[SectionPlan] = None,
         figures: Optional[List[FigureSpec]] = None,
         tables: Optional[List[TableSpec]] = None,
     ) -> SectionResult:
-        """Generate Introduction section (Leader)"""
+        """
+        Generate Introduction section using two-phase pattern.
+
+        - **Description**:
+            - Phase A (Judgment): LLM analyses whether existing references
+              cover the section needs and suggests search queries if not.
+            - Phase A (Search): If needed, PaperSearchTool is called directly
+              (system-side) and results are merged into ref_pool.
+            - Phase B (Writing): Pure LLM call with no tools. All available
+              refs (core + newly discovered) are included in the prompt.
+
+        - **Args**:
+            - `metadata` (PaperMetaData): Paper metadata.
+            - `ref_pool` (ReferencePool): Persistent reference pool.
+            - `section_plan` (SectionPlan, optional): Plan for this section.
+            - `figures` (List[FigureSpec], optional): Figures for this section.
+            - `tables` (List[TableSpec], optional): Tables for this section.
+
+        - **Returns**:
+            - `SectionResult`: Generation result.
+        """
         try:
-            # Build prompt with plan guidance if available
+            # ----------------------------------------------------------
+            # Phase A: Judge whether additional references are needed
+            # ----------------------------------------------------------
+            key_points = []
+            if section_plan and section_plan.key_points:
+                key_points = section_plan.key_points
+
+            judgment = await self._judge_search_need(
+                section_type="introduction",
+                section_title=section_plan.section_title if section_plan else "Introduction",
+                paper_title=metadata.title,
+                key_points=key_points,
+                ref_pool=ref_pool,
+            )
+
+            if judgment.get("need_search") and judgment.get("queries"):
+                await self._execute_pre_searches(
+                    queries=judgment["queries"],
+                    ref_pool=ref_pool,
+                )
+
+            # ----------------------------------------------------------
+            # Phase B: Pure writing (no tools)
+            # ----------------------------------------------------------
+            # Build prompt AFTER search so it includes any new refs
             prompt = compile_introduction_prompt(
                 paper_title=metadata.title,
                 idea_hypothesis=metadata.idea_hypothesis,
                 method_summary=metadata.method,
                 data_summary=metadata.data,
                 experiments_summary=metadata.experiments,
-                references=parsed_refs,
+                references=ref_pool.get_all_refs(),
                 style_guide=metadata.style_guide,
                 section_plan=section_plan,
                 figures=figures,
                 tables=tables,
                 active_skills=self._get_active_skills("introduction", metadata.style_guide),
             )
-            
+
             # Adjust max_tokens based on target words
             max_tokens = 2000
             if section_plan and section_plan.target_words:
-                # Approximate: 1 token ≈ 0.75 words
                 max_tokens = max(1500, int(section_plan.target_words * 1.5))
-            
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": "You are an expert academic writer. Use present tense for methods, no contractions (it is, do not, cannot), no possessives on method names (the performance of X, not X's performance). Place key information at sentence end. Output pure LaTeX only."},
-                    {"role": "user", "content": prompt},
-                ],
+
+            messages = [
+                {"role": "system", "content": GENERATION_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ]
+
+            # Plain LLM call — no tools attached, pure writing
+            content, _ = await self._plain_llm_call(
+                messages=messages,
                 temperature=0.7,
                 max_tokens=max_tokens,
             )
-            
-            content = response.choices[0].message.content.strip()
+
             word_count = len(content.split())
-            
+
             return SectionResult(
                 section_type="introduction",
                 section_title=section_plan.section_title if section_plan else "Introduction",
@@ -643,21 +760,74 @@ class MetaDataAgent(BaseAgent):
         metadata: PaperMetaData,
         intro_context: str,
         contributions: List[str],
-        parsed_refs: List[Dict[str, Any]],
+        ref_pool: ReferencePool,
         section_plan: Optional[SectionPlan] = None,
         figures: Optional[List[FigureSpec]] = None,
         tables: Optional[List[TableSpec]] = None,
         converted_tables: Optional[Dict[str, str]] = None,
     ) -> SectionResult:
-        """Generate a body section (Method, Experiment, Results, Related Work)"""
+        """
+        Generate a body section using two-phase pattern.
+
+        - **Description**:
+            - Phase A (Judgment): LLM analyses whether existing references
+              cover the section needs and suggests search queries if not.
+            - Phase A (Search): If needed, PaperSearchTool is called directly
+              (system-side) and results are merged into ref_pool.
+            - Phase B (Writing): Pure LLM call with no tools. All available
+              refs (core + newly discovered) are included in the prompt.
+
+        - **Args**:
+            - `section_type` (str): Type of section (method, experiment, etc.).
+            - `metadata` (PaperMetaData): Paper metadata.
+            - `intro_context` (str): Introduction content for context.
+            - `contributions` (List[str]): Paper contributions.
+            - `ref_pool` (ReferencePool): Persistent reference pool.
+            - `section_plan` (SectionPlan, optional): Plan for this section.
+            - `figures` (List[FigureSpec], optional): Figures for this section.
+            - `tables` (List[TableSpec], optional): Tables for this section.
+            - `converted_tables` (Dict[str, str], optional): Converted table LaTeX.
+
+        - **Returns**:
+            - `SectionResult`: Generation result.
+        """
         try:
+            # ----------------------------------------------------------
+            # Phase A: Judge whether additional references are needed
+            # ----------------------------------------------------------
+            key_points = []
+            if section_plan and section_plan.key_points:
+                key_points = section_plan.key_points
+
+            section_title_str = (
+                section_plan.section_title
+                if section_plan and section_plan.section_title
+                else section_type.replace("_", " ").title()
+            )
+
+            judgment = await self._judge_search_need(
+                section_type=section_type,
+                section_title=section_title_str,
+                paper_title=metadata.title,
+                key_points=key_points,
+                ref_pool=ref_pool,
+            )
+
+            if judgment.get("need_search") and judgment.get("queries"):
+                await self._execute_pre_searches(
+                    queries=judgment["queries"],
+                    ref_pool=ref_pool,
+                )
+
+            # ----------------------------------------------------------
+            # Phase B: Pure writing (no tools)
+            # ----------------------------------------------------------
             # Get relevant content from metadata based on section type
-            # Use plan's content_sources if available, otherwise fall back to defaults
             if section_plan and section_plan.content_sources:
                 sources = section_plan.content_sources
             else:
                 sources = BODY_SECTION_SOURCES.get(section_type, [])
-            
+
             content_parts = []
             for source in sources:
                 if source == "references":
@@ -665,15 +835,16 @@ class MetaDataAgent(BaseAgent):
                 value = getattr(metadata, source, "")
                 if value:
                     content_parts.append(f"### {source.title()}\n{value}")
-            
+
             metadata_content = "\n\n".join(content_parts) if content_parts else metadata.method
-            
+
+            # Build prompt AFTER search so it includes any new refs
             prompt = compile_body_section_prompt(
                 section_type=section_type,
                 metadata_content=metadata_content,
                 intro_context=intro_context,
                 contributions=contributions,
-                references=parsed_refs,
+                references=ref_pool.get_all_refs(),
                 style_guide=metadata.style_guide,
                 section_plan=section_plan,
                 figures=figures,
@@ -681,25 +852,26 @@ class MetaDataAgent(BaseAgent):
                 converted_tables=converted_tables,
                 active_skills=self._get_active_skills(section_type, metadata.style_guide),
             )
-            
+
             # Adjust max_tokens based on target words
             max_tokens = 2500
             if section_plan and section_plan.target_words:
                 max_tokens = max(1500, int(section_plan.target_words * 1.5))
-            
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": "You are an expert academic writer. Use present tense for methods, no contractions (it is, do not, cannot), no possessives on method names (the performance of X, not X's performance). Place key information at sentence end. Output pure LaTeX only."},
-                    {"role": "user", "content": prompt},
-                ],
+
+            messages = [
+                {"role": "system", "content": GENERATION_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ]
+
+            # Plain LLM call — no tools attached, pure writing
+            content, _ = await self._plain_llm_call(
+                messages=messages,
                 temperature=0.7,
                 max_tokens=max_tokens,
             )
-            
-            content = response.choices[0].message.content.strip()
+
             word_count = len(content.split())
-            
+
             # Use plan's title if available
             if section_plan and section_plan.section_title:
                 section_title = section_plan.section_title
@@ -712,7 +884,7 @@ class MetaDataAgent(BaseAgent):
                     "discussion": "Discussion",
                 }
                 section_title = titles.get(section_type, section_type.title())
-            
+
             return SectionResult(
                 section_type=section_type,
                 section_title=section_title,
@@ -1319,7 +1491,7 @@ class MetaDataAgent(BaseAgent):
 
         return generated_sections
 
-    def _mini_review_section(
+    async def _mini_review_section(
         self,
         section_type: str,
         content: str,
@@ -1444,6 +1616,244 @@ class MetaDataAgent(BaseAgent):
             "passed": len(issues) == 0,
         }
     
+    # =========================================================================
+    # Pre-Generation Search Judgment (Phase A)
+    # =========================================================================
+
+    async def _judge_search_need(
+        self,
+        section_type: str,
+        section_title: str,
+        paper_title: str,
+        key_points: List[str],
+        ref_pool: ReferencePool,
+    ) -> Dict[str, Any]:
+        """
+        Ask the LLM whether additional references are needed for a section.
+
+        - **Description**:
+            - Phase A of the two-phase generation pattern.
+            - Sends a lightweight prompt asking the LLM to analyse the gap
+              between the section's requirements and the existing references.
+            - The LLM returns a structured JSON response with need_search,
+              reason, and queries fields.
+            - Does NOT use Function Calling — the LLM directly outputs JSON.
+
+        - **Args**:
+            - `section_type` (str): E.g. "introduction", "method".
+            - `section_title` (str): Human-readable section title.
+            - `paper_title` (str): Title of the paper being generated.
+            - `key_points` (List[str]): Key points to cover in this section.
+            - `ref_pool` (ReferencePool): Current reference pool.
+
+        - **Returns**:
+            - `dict`: {"need_search": bool, "reason": str, "queries": [str]}
+              On any error, returns {"need_search": False, ...}.
+        """
+        # Build reference summaries for the prompt
+        ref_summaries_parts = []
+        for ref in ref_pool.get_all_refs():
+            ref_id = ref.get("ref_id", "unknown")
+            title = ref.get("title", "Untitled")
+            year = ref.get("year", "?")
+            ref_summaries_parts.append(f"  - [{ref_id}] {title} ({year})")
+        ref_summaries = "\n".join(ref_summaries_parts) if ref_summaries_parts else "  (none)"
+
+        key_points_str = "\n".join(f"  - {kp}" for kp in key_points) if key_points else "  (not specified)"
+
+        prompt = SEARCH_JUDGMENT_PROMPT.format(
+            section_type=section_type,
+            section_title=section_title,
+            paper_title=paper_title,
+            key_points=key_points_str,
+            n_refs=len(ref_pool.get_all_refs()),
+            ref_summaries=ref_summaries,
+        )
+
+        print(f"[SearchJudge] Judging search need for {section_type} ({section_title})...")
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": "You are an academic research assistant. Respond with JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=500,
+            )
+            raw = response.choices[0].message.content or ""
+            # Strip markdown code fences if present
+            raw = raw.strip()
+            if raw.startswith("```"):
+                # Remove opening fence (e.g. ```json)
+                raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+            raw = raw.strip()
+
+            result = json.loads(raw)
+
+            need = result.get("need_search", False)
+            reason = result.get("reason", "")
+            queries = result.get("queries", [])
+
+            # Sanitize
+            if not isinstance(queries, list):
+                queries = []
+            queries = [q for q in queries if isinstance(q, str) and len(q.strip()) > 0]
+
+            print(f"[SearchJudge] need_search={need}, reason={reason}")
+            if queries:
+                print(f"[SearchJudge] Suggested queries: {queries}")
+
+            return {"need_search": bool(need), "reason": reason, "queries": queries}
+
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"[SearchJudge] Failed to parse LLM response: {e}")
+            print(f"[SearchJudge] Raw response: {raw[:300]}")
+            return {"need_search": False, "reason": f"parse error: {e}", "queries": []}
+        except Exception as e:
+            print(f"[SearchJudge] LLM call failed: {e}")
+            return {"need_search": False, "reason": f"error: {e}", "queries": []}
+
+    async def _execute_pre_searches(
+        self,
+        queries: List[str],
+        ref_pool: ReferencePool,
+    ) -> int:
+        """
+        Execute paper searches and merge valid results into the reference pool.
+
+        - **Description**:
+            - Phase A continuation: after the LLM provides search queries,
+              this method directly calls PaperSearchTool.execute() for each
+              query (without going through the ReAct loop).
+            - Found papers are validated and added to the ref_pool.
+            - Returns the count of newly added references.
+
+        - **Args**:
+            - `queries` (List[str]): Search queries from the judgment step.
+            - `ref_pool` (ReferencePool): Persistent reference pool to update.
+
+        - **Returns**:
+            - `int`: Number of new references added to the pool.
+        """
+        from ..shared.tools.paper_search import PaperSearchTool
+
+        paper_search_cfg = self.tools_config.paper_search if self.tools_config else None
+        tool = PaperSearchTool(
+            semantic_scholar_api_key=(
+                paper_search_cfg.semantic_scholar_api_key if paper_search_cfg else None
+            ),
+            default_max_results=paper_search_cfg.default_max_results if paper_search_cfg else 5,
+            timeout=paper_search_cfg.timeout if paper_search_cfg else 10,
+        )
+
+        added_count = 0
+        for i, query in enumerate(queries):
+            # Add delay between queries to avoid rate limiting
+            if i > 0:
+                print("[PreSearch] Waiting 1.5s between queries to avoid rate limits...")
+                await asyncio.sleep(1.5)
+
+            print(f"[PreSearch] Executing search ({i+1}/{len(queries)}): '{query}'")
+            try:
+                result = await tool.execute(query=query)
+                if not result.success:
+                    print(f"[PreSearch] Search failed: {result.message}")
+                    continue
+
+                papers = result.data.get("papers", []) if result.data else []
+                print(f"[PreSearch] Found {len(papers)} papers for '{query}'")
+
+                for paper in papers:
+                    bibtex = paper.get("bibtex", "")
+                    cite_key = paper.get("bibtex_key", "") or paper.get("ref_id", "")
+                    if not bibtex or not cite_key:
+                        continue
+                    if ref_pool.has_key(cite_key):
+                        continue
+                    added = ref_pool.add_discovered(cite_key, bibtex, source="pre_search")
+                    if added:
+                        added_count += 1
+                        title = paper.get("title", "?")
+                        print(f"[PreSearch] Added to ref_pool: [{cite_key}] {title}")
+
+            except Exception as e:
+                print(f"[PreSearch] Error searching '{query}': {e}")
+
+        print(f"[PreSearch] Total new references added: {added_count} "
+              f"(pool: {ref_pool.summary()})")
+        return added_count
+
+    def _validate_and_merge_new_references(
+        self,
+        content: str,
+        msg_history: List[Dict[str, Any]],
+        ref_pool: ReferencePool,
+    ) -> str:
+        """
+        Two-layer validation of references discovered via search_papers.
+
+        - **Description**:
+            - Layer 1 (LLM judgment): The LLM already decided which papers
+              to cite during the ReAct loop. We extract those decisions.
+            - Layer 2 (System cross-reference): We verify that every \\cite{}
+              key in the generated content either:
+              (a) already exists in ref_pool (core or previously discovered), or
+              (b) matches a BibTeX entry returned by search_papers — in which
+                  case we add it to ref_pool as a discovered reference.
+            - Keys that match neither (hallucinated) are removed from the content.
+
+        - **Args**:
+            - `content` (str): Generated LaTeX content.
+            - `msg_history` (List[dict]): Full message history from react_loop.
+            - `ref_pool` (ReferencePool): Persistent reference pool to update.
+
+        - **Returns**:
+            - `str`: Content with hallucinated citations removed.
+        """
+        # Extract BibTeX entries from search_papers tool results in message history
+        search_results = ReferencePool.extract_search_results_from_history(msg_history)
+        if search_results:
+            print(f"[ValidateRefs] Found {len(search_results)} papers from search results")
+
+        # Extract all \cite{} keys from the generated content
+        cited_keys = ReferencePool.extract_cite_keys(content)
+        if not cited_keys:
+            return content
+
+        print(f"[ValidateRefs] Content cites {len(cited_keys)} keys: {cited_keys}")
+
+        # Check each cited key
+        hallucinated_keys = []
+        for key in cited_keys:
+            if ref_pool.has_key(key):
+                # Already in pool (core or previously discovered)
+                continue
+
+            if key in search_results:
+                # Found in search results — add to pool
+                added = ref_pool.add_discovered(key, search_results[key], source="search")
+                if added:
+                    print(f"[ValidateRefs] Added discovered ref: {key}")
+                else:
+                    print(f"[ValidateRefs] Duplicate discovered ref (skipped): {key}")
+            else:
+                # Not in pool and not from search — hallucinated
+                hallucinated_keys.append(key)
+                print(f"[ValidateRefs] Hallucinated key removed: {key}")
+
+        # Remove hallucinated citations from content
+        for key in hallucinated_keys:
+            content = ReferencePool.remove_citation(content, key)
+
+        if hallucinated_keys:
+            print(f"[ValidateRefs] Removed {len(hallucinated_keys)} hallucinated citations")
+
+        return content
+
     def _generate_bib_file(self, references: List[Dict[str, Any]]) -> str:
         """Generate .bib file content from parsed references"""
         bib_entries = []

@@ -4,8 +4,12 @@ Writer Agent
     - Generates pure LaTeX content fragments for paper sections
     - Focuses on academic writing quality and proper citation usage
     - Supports iterative review and refinement with tool-based validation
+    - Dual-mode tool invocation:
+        - Type 1 (ReAct): generate_content can use react_loop with search_papers
+          for autonomous reference discovery during writing
+        - Type 2 (Fixed Sequence): mini_review executes CitationValidatorTool,
+          WordCountTool, and KeyPointCoverageTool in fixed deterministic order
 """
-from openai import AsyncOpenAI
 from langchain.messages import AnyMessage
 from typing_extensions import TypedDict, Annotated, Optional
 from langgraph.graph import StateGraph, START, END
@@ -13,8 +17,8 @@ import operator
 import re
 from typing import List, Dict, Any, Set
 from fastapi import APIRouter
-from ...config.schema import ModelConfig
-from ..base import BaseAgent
+from ...config.schema import ModelConfig, ToolsConfig
+from ..react_base import ReActAgent
 from .router import create_writer_router
 from .models import GeneratedContent, ReviewResult
 from ..shared.tools import (
@@ -142,24 +146,35 @@ class WriterAgentState(TypedDict):
     invalid_citations_removed: Optional[List[str]]
 
 
-class WriterAgent(BaseAgent):
+class WriterAgent(ReActAgent):
     """
     Writer Agent for generating LaTeX content with iterative review.
-    
+
     - **Description**:
-        - Generates academic LaTeX content based on compiled prompts
-        - Performs mini-review after generation to validate citations and word count
-        - Iteratively revises content based on review feedback
-        - Extracts citations and figure references from generated content
+        - Inherits from ReActAgent for access to react_loop and setup_tools.
+        - Generates academic LaTeX content based on compiled prompts.
+        - Dual-mode tool invocation:
+            - Type 1 (ReAct): generate_content can optionally use react_loop
+              with search_papers for autonomous reference discovery.
+            - Type 2 (Fixed Sequence): mini_review executes citation validation,
+              word count, and key point coverage tools in fixed order.
+        - Iteratively revises content based on review feedback.
+        - Extracts citations and figure references from generated content.
     """
-    
-    def __init__(self, config: ModelConfig):
-        self.client = AsyncOpenAI(
-            api_key=config.api_key,
-            base_url=config.base_url,
-        )
-        self.model_name = config.model_name
-        self.tool_registry = ToolRegistry()
+
+    def __init__(self, config: ModelConfig, tools_config: Optional[ToolsConfig] = None):
+        if tools_config is None:
+            tools_config = ToolsConfig(
+                enabled=True,
+                available_tools=[
+                    "validate_citations",
+                    "count_words",
+                    "check_key_points",
+                    "search_papers",
+                ],
+                max_react_iterations=3,
+            )
+        super().__init__(config, tools_config)
         self.agent = self.init_agent()
 
     def init_agent(self):

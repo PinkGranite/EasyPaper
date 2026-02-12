@@ -58,6 +58,20 @@ agents:
       api_key: YOUR_API_KEY
       base_url: https://api.moonshot.cn/v1
 
+# Tools configuration for ReAct-enabled agents (MetaDataAgent, WriterAgent)
+# tools:
+#   enabled: true
+#   available_tools:
+#     - validate_citations
+#     - count_words
+#     - check_key_points
+#     - search_papers
+#   max_react_iterations: 3
+#   paper_search:
+#     semantic_scholar_api_key: null  # Optional: set for higher rate limits
+#     default_max_results: 5
+#     timeout: 10
+
   - name: vlm_review
     model:
       # Must be a vision-capable model

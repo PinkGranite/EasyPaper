@@ -5,7 +5,9 @@ Supports Semantic Scholar API (primary) and arXiv API (supplementary)
 for searching academic papers and exporting BibTeX entries.
 """
 
+import asyncio
 import re
+import time as _time
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional
 
@@ -27,9 +29,20 @@ class SemanticScholarClient:
     BASE_URL = "https://api.semanticscholar.org/graph/v1"
     FIELDS = "paperId,title,authors,year,abstract,venue,citationCount,externalIds,publicationTypes,journal"
 
+    # Maximum number of retries on 429 (rate limit)
+    MAX_RETRIES = 3
+    # Base wait time in seconds (exponential backoff: 2s, 4s, 8s)
+    RETRY_BASE_WAIT = 2.0
+
     def __init__(self, api_key: Optional[str] = None, timeout: int = 10):
         self.api_key = api_key
         self.timeout = timeout
+        self._rate_limited = False  # Set to True when 429 is hit
+
+    @property
+    def is_rate_limited(self) -> bool:
+        """Whether the last request was rate-limited (429)."""
+        return self._rate_limited
 
     async def search(
         self,
@@ -38,7 +51,12 @@ class SemanticScholarClient:
         year_range: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Search for papers on Semantic Scholar.
+        Search for papers on Semantic Scholar with retry on 429.
+
+        - **Description**:
+            - On HTTP 429, retries up to MAX_RETRIES times with exponential
+              backoff (2s, 4s, 8s). Sets is_rate_limited flag so callers
+              can fall back to arXiv.
 
         - **Args**:
             - `query` (str): Search query string.
@@ -48,6 +66,7 @@ class SemanticScholarClient:
         - **Returns**:
             - `List[dict]`: List of paper dicts with standardized fields.
         """
+        self._rate_limited = False
         headers = {}
         if self.api_key:
             headers["x-api-key"] = self.api_key
@@ -60,32 +79,53 @@ class SemanticScholarClient:
         if year_range:
             params["year"] = year_range
 
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
-                response = await client.get(
-                    f"{self.BASE_URL}/paper/search",
-                    params=params,
-                    headers=headers,
-                )
-                response.raise_for_status()
-                data = response.json()
-        except httpx.TimeoutException:
-            print("[SemanticScholar] Request timed out")
-            return []
-        except httpx.HTTPStatusError as e:
-            print(f"[SemanticScholar] HTTP error: {e.response.status_code}")
-            return []
-        except Exception as e:
-            print(f"[SemanticScholar] Error: {e}")
-            return []
+        last_error = None
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+                    response = await client.get(
+                        f"{self.BASE_URL}/paper/search",
+                        params=params,
+                        headers=headers,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
 
-        papers = []
-        for item in data.get("data", []):
-            paper = self._normalize_paper(item)
-            if paper:
-                papers.append(paper)
+                # Success
+                papers = []
+                for item in data.get("data", []):
+                    paper = self._normalize_paper(item)
+                    if paper:
+                        papers.append(paper)
+                return papers
 
-        return papers
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                if status == 429 and attempt < self.MAX_RETRIES:
+                    wait = self.RETRY_BASE_WAIT * (2 ** (attempt - 1))
+                    print(f"[SemanticScholar] 429 rate limited, retry {attempt}/{self.MAX_RETRIES} "
+                          f"in {wait:.0f}s...")
+                    await asyncio.sleep(wait)
+                    last_error = e
+                    continue
+                else:
+                    if status == 429:
+                        self._rate_limited = True
+                        print(f"[SemanticScholar] 429 rate limited, all {self.MAX_RETRIES} retries exhausted")
+                    else:
+                        print(f"[SemanticScholar] HTTP error: {status}")
+                    return []
+            except httpx.TimeoutException:
+                print("[SemanticScholar] Request timed out")
+                return []
+            except Exception as e:
+                print(f"[SemanticScholar] Error: {e}")
+                return []
+
+        # Should not reach here, but just in case
+        print(f"[SemanticScholar] All retries failed: {last_error}")
+        self._rate_limited = True
+        return []
 
     def _normalize_paper(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Normalize a Semantic Scholar paper result to standard format."""
@@ -243,8 +283,7 @@ class ArxivClient:
             print(f"[arXiv] HTTP error: {e.response.status_code}")
             if e.response.status_code == 429:
                 # Trigger circuit-breaker via PaperSearchTool class variable
-                import time
-                PaperSearchTool._arxiv_cooldown_until = time.time() + 600
+                PaperSearchTool._arxiv_cooldown_until = _time.time() + 600
                 print("[arXiv] Rate limited (429), cooldown set for 10 minutes")
             return []
         except Exception as e:
@@ -491,9 +530,8 @@ class PaperSearchTool(WriterTool):
         - **Returns**:
             - `bool`: True if arXiv can be called, False if in cooldown.
         """
-        import time
-        if time.time() < PaperSearchTool._arxiv_cooldown_until:
-            remaining = int(PaperSearchTool._arxiv_cooldown_until - time.time())
+        if _time.time() < PaperSearchTool._arxiv_cooldown_until:
+            remaining = int(PaperSearchTool._arxiv_cooldown_until - _time.time())
             print(f"[Tool:search_papers] arXiv in cooldown ({remaining}s remaining), skipping")
             return False
         return True
@@ -505,8 +543,7 @@ class PaperSearchTool(WriterTool):
         - **Args**:
             - `seconds` (int): Cooldown duration. Default 600s (10 minutes).
         """
-        import time
-        PaperSearchTool._arxiv_cooldown_until = time.time() + seconds
+        PaperSearchTool._arxiv_cooldown_until = _time.time() + seconds
         print(f"[Tool:search_papers] arXiv cooldown set for {seconds}s")
 
     async def _search_arxiv_safe(
@@ -547,7 +584,12 @@ class PaperSearchTool(WriterTool):
         **kwargs,
     ) -> ToolResult:
         """
-        Search for academic papers.
+        Search for academic papers with automatic arXiv fallback.
+
+        - **Description**:
+            - If source is "semantic_scholar" and the request is rate-limited
+              (429 after retries), automatically falls back to arXiv.
+            - If source is "auto", runs both in parallel.
 
         - **Args**:
             - `query` (str): Search query.
@@ -561,8 +603,6 @@ class PaperSearchTool(WriterTool):
               - `bibtex`: Combined BibTeX string for all found papers.
               - `total_found`: Number of papers found.
         """
-        import asyncio
-
         max_res = max_results or self._default_max_results
         print(f"[Tool:search_papers] Searching '{query}' (max={max_res}, "
               f"source={source}, years={year_range or 'any'})...")
@@ -611,6 +651,19 @@ class PaperSearchTool(WriterTool):
                     all_papers.append(p)
             print(f"[Tool:search_papers] Semantic Scholar: {len(ss_papers)} results")
 
+            # Fallback: if Semantic Scholar was rate-limited, try arXiv
+            if not ss_papers and self._ss_client.is_rate_limited:
+                print("[Tool:search_papers] Semantic Scholar rate-limited, falling back to arXiv...")
+                arxiv_papers = await self._search_arxiv_safe(
+                    query=query, max_results=max_res, year_range=year_range,
+                )
+                for p in arxiv_papers:
+                    title_lower = p["title"].lower()
+                    if title_lower not in seen_titles:
+                        seen_titles.add(title_lower)
+                        all_papers.append(p)
+                print(f"[Tool:search_papers] arXiv fallback: {len(arxiv_papers)} results")
+
         elif source == "arxiv":
             arxiv_papers = await self._search_arxiv_safe(
                 query=query, max_results=max_res, year_range=year_range,
@@ -644,7 +697,7 @@ class PaperSearchTool(WriterTool):
         bibtex_entries = [p["bibtex"] for p in all_papers if p.get("bibtex")]
         combined_bibtex = "\n\n".join(bibtex_entries)
 
-        # Build summary for each paper (for LLM consumption)
+        # Build summary for each paper (for LLM consumption and ref_pool merging)
         paper_summaries = []
         for p in all_papers:
             summary = {
@@ -657,6 +710,7 @@ class PaperSearchTool(WriterTool):
                 "abstract": (p.get("abstract", "")[:300] + "...")
                             if p.get("abstract") and len(p.get("abstract", "")) > 300
                             else p.get("abstract", ""),
+                "bibtex": p.get("bibtex", ""),  # Include for ref_pool merging
             }
             paper_summaries.append(summary)
 
