@@ -47,7 +47,6 @@ results/
 outputs/
 
 # Other
-scripts/
 test*
 __*
 .cursor/

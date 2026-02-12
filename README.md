@@ -50,19 +50,13 @@ curl http://localhost:8000/healthz
 ```
 curl -X POST http://localhost:8000/metadata/generate \
   -H "Content-Type: application/json" \
-  -d @examples/transkg_metadata.json
+  -d @economist_example/metadata.json
 ```
 
 ### CLI
 
 ```
-python scripts/generate_paper.py --input examples/transkg_metadata.json
-```
-
-### Assembly Demo
-
-```
-python scripts/assemble_paper_demo.py --config example_jsons/paper_chain_config.json
+python scripts/generate_paper.py --input economist_example/metadata.json
 ```
 
 ## Config
@@ -87,6 +81,5 @@ Key fields:
 - `src/` — FastAPI app, agent implementations, shared utilities
 - `configs/` — YAML configs for agents and models
 - `scripts/` — CLI utilities and demos
-- `examples/`, `example_jsons/` — sample inputs
+- `economist_example` — sample inputs
 - `results/` — generated outputs
-- `tests/` — test suite

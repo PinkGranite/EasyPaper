@@ -1,0 +1,73 @@
+{
+  "title": "The Impact of Innovation Incentives on Productivity, Income and Employment: Evidence from R&D Subsidies",
+  
+  "idea_hypothesis": "Increasing innovation.policy_encourage_innovation and innovation.innovation_research_share will increase firms' effective R&D effort, leading to higher productivity and aggregate income and modest employment improvements compared with a baseline of lower encouragement.",
+  
+  "method": "We conduct a simulation experiment to study the effects of innovation incentive policies on productivity, income, and employment. The experiment employs an Agent-Based Economic Simulation model, comparing a control group and a treatment group. In the control group, policy_encourage_innovation=false, while in the treatment group, policy_encourage_innovation=true, with other parameters held constant (innovation_research_share=0.1). The simulation scale consists of 5 households and 24 firms, running for 4 iterations. We track key macroeconomic indicators including employment rate, unemployment rate, Gini coefficient, average income, savings rate, and firm revenue.",
+  
+  "data": "We use a simulation platform with the following parameters: system scale of 5 households and 24 firms, running for 4 iterations. Control group settings: innovation.enable_innovation_module=true, innovation.policy_encourage_innovation=false, innovation.innovation_research_share=0.1. Treatment group settings: innovation.enable_innovation_module=true, innovation.policy_encourage_innovation=true, innovation.innovation_research_share=0.1. Other parameters remain consistent, including tax policy (income_tax_rate=0.225) and labor market settings (enable_dynamic_job_posting=true).",
+  
+  "experiments": "Key results (treatment vs control):\n\nEmployment rate: 0.80 vs 1.00 (−20.0%)\nUnemployment rate: 0.20 vs 0.00 (+0.20)\nGini coefficient: 0.4997 vs 0.4414 (+13.2% → more unequal)\nAvg monthly income: 5717.98 vs 6708.06 (−14.8%)\nSavings rate: 0.5552 vs 0.5534 (+0.3%, ≈ no change)\nAvg firm revenue: 8,402,948 vs 8,405,994 (−0.04%)\n\nInterpretation (short-run, small-scale run: 5 households, 4 iterations):\n\nSetting policy_encourage_innovation=true with the same research share (0.1) led to lower income and employment and higher inequality in this brief horizon, with minimal change in firm revenue. This may reflect short-run reallocation costs, insufficient time for innovation to translate into productivity, or parameter mapping where encouragement doesn't immediately boost output. The negative employment effect suggests potential labor market frictions or skill mismatches during the transition period. The increased inequality (Gini coefficient +13.2%) indicates that innovation incentives may initially benefit certain households or firms more than others, potentially due to heterogeneous capabilities in R&D absorption.",
+  
+  "references": [
+    "@article{atkeson2019aggregate,title={Aggregate implications of innovation policy},author={Atkeson Andrew and Burstein, Ariel},journal={Journal of Political Economy}, volume={127},number={6},pages={2625--2683},year={2019},publisher={The University of Chicago Press Chicago, IL}}",
+    "@article{yue2023tax,title={How do tax reductions motivate technological innovation?},author={Yue, Ziyang and Yang, Gangqiang and Wang, Haisen},journal={Humanities and Social Sciences Communications}, volume={10},number={1},pages={1--18},year={2023},publisher={Palgrave}}",
+    "@article{arora2021knowledge,title={Knowledge spillovers and corporate investment in scientific research},author={Arora, Ashish and Belenzon, Sharon and Sheer, Lia},journal={American Economic Review}, volume={111},number={3},pages={871--898},year={2021},publisher={American Economic Association 2014 Broadway, Suite 305, Nashville, TN 37203}}"
+  ],
+  
+  "figures": [
+    {
+      "id": "fig:labor_market_control",
+      "file_path": "examples/economist/figures/labor_market_control.png",
+      "caption": "Labor market metrics: Control group (policy_encourage_innovation=false)",
+      "description": "Monthly labor market metrics for the control group showing employment and unemployment rates over 4 iterations. Final employment rate: 1.00, unemployment rate: 0.00."
+    },
+    {
+      "id": "fig:labor_market_treatment",
+      "file_path": "examples/economist/figures/labor_market_treatment.png",
+      "caption": "Labor market metrics: Treatment group (policy_encourage_innovation=true)",
+      "description": "Monthly labor market metrics for the treatment group. Shows employment rate declining to 0.80 and unemployment rate increasing to 0.20, representing a -20% change compared to control."
+    },
+    {
+      "id": "fig:gini_wage",
+      "file_path": "examples/economist/figures/gini_coefficient_trends.png",
+      "caption": "Gini coefficient and wage trends over time",
+      "description": "Wealth inequality (Gini coefficient) and wage trends across iterations in the treatment group. Shows higher Gini coefficient (0.4997 vs 0.4414 in control), indicating +13.2% increase in inequality when innovation encouragement is enabled."
+    },
+    {
+      "id": "fig:household_income",
+      "file_path": "examples/economist/figures/household_financial_changes.png",
+      "caption": "Monthly household financial changes",
+      "description": "Monthly household income and expenditure trends in the treatment group. Shows lower average monthly income (5717.98 vs 6708.06 in control), representing a -14.8% decline."
+    },
+    {
+      "id": "fig:wealth_gap",
+      "file_path": "examples/economist/figures/wealth_gap_analysis.png",
+      "caption": "Household wealth gap analysis",
+      "description": "Distribution of household wealth across the simulation period in the treatment group. Illustrates the increased inequality with wider wealth gaps between households, consistent with the higher Gini coefficient."
+    },
+    {
+      "id": "fig:overall_indicators",
+      "file_path": "examples/economist/figures/overall_monthly_indicators.png",
+      "caption": "Overall monthly economic indicators",
+      "description": "Comprehensive view of key economic indicators in the treatment group including employment, income, expenditure, and savings rates across 4 iterations."
+    }
+  ],
+  
+  "tables": [
+    {
+      "id": "tab:main_results",
+      "caption": "Key economic indicators: Treatment vs Control",
+      "content": "Metric | Control | Treatment | Change\nEmployment rate | 1.00 | 0.80 | -20.0%\nUnemployment rate | 0.00 | 0.20 | +0.20\nGini coefficient | 0.4414 | 0.4997 | +13.2%\nAvg monthly income | 6708.06 | 5717.98 | -14.8%\nSavings rate | 0.5534 | 0.5552 | +0.3%\nAvg firm revenue | 8,405,994 | 8,402,948 | -0.04%",
+      "description": "Comparison of key macroeconomic and firm-level indicators between control (policy_encourage_innovation=false) and treatment (policy_encourage_innovation=true) groups. Results show negative short-run effects on employment, income, and inequality, with minimal impact on firm revenue."
+    }
+  ],
+  
+  "template_path": "examples/economist/colm.zip",
+  "style_guide": "COLM",
+  "target_pages": 6,
+  
+  "enable_vlm_review": true,
+
+  "max_review_iterations": 5
+}
