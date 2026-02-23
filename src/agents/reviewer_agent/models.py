@@ -40,6 +40,20 @@ class FeedbackResult(BaseModel):
     suggested_action: Optional[str] = None
 
 
+class ParagraphFeedback(BaseModel):
+    """
+    Feedback for a specific paragraph within a section.
+    - **Description**:
+        - Provides granular, paragraph-indexed review feedback
+        - Enables targeted revision instructions
+    """
+    paragraph_index: int = 0
+    paragraph_preview: str = ""
+    issues: List[str] = Field(default_factory=list)
+    severity: Severity = Severity.INFO
+    suggestion: str = ""
+
+
 class SectionFeedback(BaseModel):
     """
     Feedback specific to a section
@@ -48,6 +62,7 @@ class SectionFeedback(BaseModel):
         - action values: 'expand', 'reduce', 'ok', 'fix_latex',
           'resize_figures', 'move_to_appendix'
         - structural_actions carries structured operation descriptors
+        - paragraph_feedbacks provides fine-grained per-paragraph feedback
     """
     section_type: str
     current_word_count: int
@@ -56,11 +71,7 @@ class SectionFeedback(BaseModel):
     delta_words: int  # positive = add, negative = remove
     revision_prompt: str = ""
     structural_actions: List[str] = Field(default_factory=list)
-    # structural_actions examples:
-    #   "figure*->figure:fig:arch"   — downgrade wide figure to single-column
-    #   "resize:fig:arch:0.8"        — resize figure width to 0.8\linewidth
-    #   "move_figure:fig:detail"     — move figure to appendix
-    #   "move_table:tab:results"     — move table to appendix
+    paragraph_feedbacks: List[ParagraphFeedback] = Field(default_factory=list)
 
 
 class ReviewContext(BaseModel):
@@ -87,6 +98,7 @@ class ReviewContext(BaseModel):
     template_path: Optional[str] = None
     style_guide: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    memory_context: Optional[Dict[str, Any]] = None  # Session memory snapshot
     
     def total_word_count(self) -> int:
         """Calculate total word count across all sections"""
@@ -146,3 +158,4 @@ class ReviewRequest(BaseModel):
     style_guide: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     iteration: int = 0
+    memory_context: Optional[Dict[str, Any]] = None  # Session memory snapshot

@@ -28,7 +28,7 @@ import re
 import os
 import uuid
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 from pathlib import Path
 
 import httpx
@@ -67,6 +67,7 @@ from ..planner_agent.models import (
     calculate_total_words,
 )
 from ..shared.table_converter import convert_tables
+from ..shared.session_memory import SessionMemory, ReviewRecord
 from ..reviewer_agent.models import ReviewResult, FeedbackResult, Severity, SectionFeedback
 from .models import FigureSpec, TableSpec, StructuralAction, SpaceEstimate
 
@@ -134,8 +135,8 @@ class MetaDataAgent(ReActAgent):
         - Dual-mode tool invocation:
             - Type 1 (ReAct): _generate_introduction / _generate_body_section
               use react_loop with search_papers for autonomous reference search.
-            - Type 2 (Fixed Sequence): _mini_review_section runs citation,
-              word count, and key point checks in fixed deterministic order.
+            - Type 2 (Delegated): WriterAgent handles iterative mini-review
+              (citation validation, word count, key point coverage) internally.
         - Independent API, can be called directly via curl/Postman.
     """
 
@@ -158,6 +159,27 @@ class MetaDataAgent(ReActAgent):
         self._router = self._create_router()
         # Skill registry — injected post-construction by agents/__init__.py
         self._skill_registry = None
+        # Peer agent references — injected post-construction via set_peers()
+        self._writer = None
+        self._reviewer = None
+        self._planner = None
+        self._vlm_reviewer = None
+
+    def set_peers(self, agents: Dict[str, "BaseAgent"]) -> None:
+        """
+        Inject references to peer agents for direct method calls.
+        - **Description**:
+            - Called after all agents are initialized in initialize_agents().
+            - Enables MetaDataAgent to call WriterAgent, ReviewerAgent, etc.
+              directly instead of via HTTP.
+
+        - **Args**:
+            - `agents` (Dict[str, BaseAgent]): The full agent dictionary.
+        """
+        self._writer = agents.get("writer")
+        self._reviewer = agents.get("reviewer")
+        self._planner = agents.get("planner")
+        self._vlm_reviewer = agents.get("vlm_review")
     
     @property
     def name(self) -> str:
@@ -276,8 +298,26 @@ class MetaDataAgent(ReActAgent):
         review_iterations = 0
         target_word_count = None
         
-        # Initialize persistent reference pool from user's core references
-        ref_pool = ReferencePool(metadata.references)
+        # Initialize Session Memory for cross-agent coordination
+        memory = SessionMemory()
+        memory.log("metadata", "init", "session_started",
+                    narrative=f"Started paper generation session for '{metadata.title}' targeting {target_pages} pages.",
+                    title=metadata.title, target_pages=target_pages)
+        
+        # Initialize persistent reference pool from user's core references.
+        # Plain-text refs are resolved via search before falling back to heuristic.
+        search_cfg_for_pool = {}
+        if self.tools_config and self.tools_config.paper_search:
+            ps = self.tools_config.paper_search
+            search_cfg_for_pool = {
+                "semantic_scholar_api_key": ps.semantic_scholar_api_key,
+                "default_max_results": 1,
+                "timeout": ps.timeout,
+            }
+        ref_pool = await ReferencePool.create(
+            metadata.references,
+            paper_search_config=search_cfg_for_pool,
+        )
         print(f"[MetaDataAgent] Reference pool initialized: {ref_pool.summary()}")
         print(f"[MetaDataAgent] Core citation keys: {ref_pool.valid_citation_keys}")
         
@@ -295,7 +335,13 @@ class MetaDataAgent(ReActAgent):
                 paper_title=metadata.title,
                 errors=validation_errors,
             )
-        
+
+        # Convert non-LaTeX figure formats (e.g. TIFF, BMP, WEBP) to PDF/PNG
+        if metadata.figures:
+            n_converted = self._convert_figures_for_latex(metadata)
+            if n_converted:
+                print(f"[MetaDataAgent] Converted {n_converted} figure(s) to LaTeX-compatible format")
+
         # Create output directory
         if save_output:
             if output_dir:
@@ -320,7 +366,12 @@ class MetaDataAgent(ReActAgent):
                     style_guide=metadata.style_guide,
                 )
                 if paper_plan:
-                    print(f"[MetaDataAgent] Plan created: {len(paper_plan.sections)} sections, {paper_plan.total_target_words} words")
+                    memory.plan = paper_plan
+                    memory.log("planner", "phase0", "plan_created",
+                               narrative=f"Planner created a {len(paper_plan.sections)}-section paper plan with ~{paper_plan.get_total_estimated_words()} estimated words.",
+                               sections=len(paper_plan.sections),
+                               estimated_words=paper_plan.get_total_estimated_words())
+                    print(f"[MetaDataAgent] Plan created: {len(paper_plan.sections)} sections, ~{paper_plan.get_total_estimated_words()} words (est.)")
                     
                     # Apply auto-detected wide flags from plan to metadata figures/tables
                     if paper_plan.wide_figures:
@@ -342,6 +393,47 @@ class MetaDataAgent(ReActAgent):
                             paper_plan.model_dump_json(indent=2),
                             encoding="utf-8",
                         )
+
+                    # Reference discovery: Planner searches for relevant papers
+                    print("[MetaDataAgent] Phase 0b: Discovering references...")
+                    search_cfg = {}
+                    if self.tools_config and self.tools_config.paper_search:
+                        ps = self.tools_config.paper_search
+                        search_cfg = {
+                            "semantic_scholar_api_key": ps.semantic_scholar_api_key,
+                            "default_max_results": ps.default_max_results,
+                            "timeout": ps.timeout,
+                        }
+                    discovered = await self._planner.discover_references(
+                        plan=paper_plan,
+                        existing_ref_keys=list(ref_pool.valid_citation_keys),
+                        paper_search_config=search_cfg,
+                    )
+                    disc_count = 0
+                    for sec_type, papers in discovered.items():
+                        for paper in papers:
+                            added = ref_pool.add_discovered(
+                                paper["ref_id"], paper["bibtex"], source="planner_discovery",
+                            )
+                            if added:
+                                disc_count += 1
+                    if disc_count:
+                        print(f"[MetaDataAgent] Discovered {disc_count} new references (pool: {ref_pool.summary()})")
+                        memory.log("planner", "phase0b", "references_discovered",
+                                   narrative=f"Planner discovered {disc_count} additional references via academic search to support the paper plan.",
+                                   count=disc_count)
+
+                    # Phase 0c: Assign references to sections
+                    print("[MetaDataAgent] Phase 0c: Assigning references to sections...")
+                    self._planner.assign_references(
+                        plan=paper_plan,
+                        discovered=discovered,
+                        core_ref_keys=list(ref_pool.valid_citation_keys
+                                           - {p["ref_id"] for papers in discovered.values() for p in papers}),
+                    )
+                    for sp in paper_plan.sections:
+                        if sp.assigned_refs:
+                            print(f"  [{sp.section_type}] {len(sp.assigned_refs)} refs assigned")
                 else:
                     print(f"[MetaDataAgent] Planning skipped or failed, using defaults")
             
@@ -372,23 +464,16 @@ class MetaDataAgent(ReActAgent):
             intro_result = await self._generate_introduction(
                 metadata, ref_pool, section_plan=intro_plan,
                 figures=metadata.figures, tables=metadata.tables,
+                memory=memory,
             )
             sections_results.append(intro_result)
             print(f"[MetaDataAgent] After introduction: {ref_pool.summary()}")
             
             if intro_result.status == "ok":
-                # Mini-review: validate citations and check quality (fixed sequence)
-                review_result = await self._mini_review_section(
-                    section_type="introduction",
-                    content=intro_result.latex_content,
-                    section_plan=intro_plan,
-                    valid_citation_keys=ref_pool.valid_citation_keys,
-                )
-                # Use fixed content (with invalid citations removed)
-                intro_result.latex_content = review_result["fixed_content"]
-                intro_result.word_count = review_result["fixed_word_count"]
-                
                 generated_sections["introduction"] = intro_result.latex_content
+                memory.log("metadata", "phase1", "introduction_generated",
+                           narrative=f"Writer completed the introduction section ({intro_result.word_count} words).",
+                           word_count=intro_result.word_count)
                 # Extract contributions for consistency
                 contributions = extract_contributions_from_intro(intro_result.latex_content)
                 if not contributions:
@@ -399,10 +484,28 @@ class MetaDataAgent(ReActAgent):
             else:
                 errors.append(f"Introduction generation failed: {intro_result.error}")
                 contributions = []
+                if memory is not None:
+                    memory.log(
+                        "metadata",
+                        "phase1",
+                        "introduction_failed",
+                        narrative=f"Introduction failed and generation stopped: {intro_result.error}",
+                        status="error",
+                        error=intro_result.error,
+                    )
+                return PaperGenerationResult(
+                    status="error",
+                    paper_title=metadata.title,
+                    sections=sections_results,
+                    errors=errors,
+                )
             
             # Use contributions from plan if available
             if paper_plan and paper_plan.contributions:
                 contributions = paper_plan.contributions
+            
+            # Store contributions in memory for cross-agent coordination
+            memory.contributions = contributions
             
             # =================================================================
             # Phase 2: Body Sections (can be parallel)
@@ -433,6 +536,7 @@ class MetaDataAgent(ReActAgent):
                         figures=section_figures,
                         tables=section_tables,
                         converted_tables=converted_tables,
+                        memory=memory,
                     )
                 except Exception as e:
                     result = SectionResult(
@@ -443,18 +547,10 @@ class MetaDataAgent(ReActAgent):
                 
                 sections_results.append(result)
                 if result.status == "ok":
-                    # Mini-review: validate citations and check quality (fixed sequence)
-                    review_result = await self._mini_review_section(
-                        section_type=section_type,
-                        content=result.latex_content,
-                        section_plan=section_plan,
-                        valid_citation_keys=ref_pool.valid_citation_keys,
-                    )
-                    # Use fixed content (with invalid citations removed)
-                    result.latex_content = review_result["fixed_content"]
-                    result.word_count = review_result["fixed_word_count"]
-                    
                     generated_sections[section_type] = result.latex_content
+                    memory.log("metadata", "phase2", f"{section_type}_generated",
+                               narrative=f"Writer completed the {section_type} section ({result.word_count} words).",
+                               word_count=result.word_count)
                     print(f"[MetaDataAgent] After {section_type}: {ref_pool.summary()}")
                 else:
                     errors.append(f"{section_type} generation failed: {result.error}")
@@ -472,21 +568,14 @@ class MetaDataAgent(ReActAgent):
                 contributions=contributions,
                 style_guide=metadata.style_guide,
                 section_plan=paper_plan.get_section("abstract") if paper_plan else None,
+                memory=memory,
             )
             sections_results.insert(0, abstract_result)  # Abstract goes first
             if abstract_result.status == "ok":
-                # Mini-review for abstract (mostly citation check)
-                abstract_plan = paper_plan.get_section("abstract") if paper_plan else None
-                review_result = await self._mini_review_section(
-                    section_type="abstract",
-                    content=abstract_result.latex_content,
-                    section_plan=abstract_plan,
-                    valid_citation_keys=ref_pool.valid_citation_keys,
-                )
-                abstract_result.latex_content = review_result["fixed_content"]
-                abstract_result.word_count = review_result["fixed_word_count"]
-                
                 generated_sections["abstract"] = abstract_result.latex_content
+                memory.log("metadata", "phase3", "abstract_generated",
+                           narrative=f"Writer completed the abstract ({abstract_result.word_count} words).",
+                           word_count=abstract_result.word_count)
             else:
                 errors.append(f"Abstract generation failed: {abstract_result.error}")
             
@@ -498,24 +587,22 @@ class MetaDataAgent(ReActAgent):
                 contributions=contributions,
                 style_guide=metadata.style_guide,
                 section_plan=paper_plan.get_section("conclusion") if paper_plan else None,
+                memory=memory,
             )
             sections_results.append(conclusion_result)
             if conclusion_result.status == "ok":
-                # Mini-review for conclusion
-                conclusion_plan = paper_plan.get_section("conclusion") if paper_plan else None
-                review_result = await self._mini_review_section(
-                    section_type="conclusion",
-                    content=conclusion_result.latex_content,
-                    section_plan=conclusion_plan,
-                    valid_citation_keys=ref_pool.valid_citation_keys,
-                )
-                conclusion_result.latex_content = review_result["fixed_content"]
-                conclusion_result.word_count = review_result["fixed_word_count"]
-                
                 generated_sections["conclusion"] = conclusion_result.latex_content
+                memory.log("metadata", "phase3", "conclusion_generated",
+                           narrative=f"Writer completed the conclusion ({conclusion_result.word_count} words).",
+                           word_count=conclusion_result.word_count)
             else:
                 errors.append(f"Conclusion generation failed: {conclusion_result.error}")
             
+            # =================================================================
+            # Reference Usage Validation
+            # =================================================================
+            self._validate_ref_usage(generated_sections, ref_pool)
+
             # =================================================================
             # Unified Review Orchestration (Reviewer + VLM)
             # =================================================================
@@ -541,6 +628,7 @@ class MetaDataAgent(ReActAgent):
                 enable_vlm_review=enable_vlm_review,
                 target_pages=target_pages,
                 paper_dir=paper_dir,
+                memory=memory,
             )
             if orchestration_errors:
                 errors.extend(orchestration_errors)
@@ -579,6 +667,12 @@ class MetaDataAgent(ReActAgent):
                     json.dumps(metadata.model_dump(), indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
+                
+                # Persist session memory (review history + agent logs)
+                memory.log("metadata", "final", "paper_assembled",
+                           narrative=f"Paper assembled successfully with {total_words} total words.",
+                           total_words=total_words, status="assembled")
+                memory.persist_all(paper_dir)
                 
                 print(f"[MetaDataAgent] Output saved to: {output_path}")
             
@@ -655,54 +749,33 @@ class MetaDataAgent(ReActAgent):
         section_plan: Optional[SectionPlan] = None,
         figures: Optional[List[FigureSpec]] = None,
         tables: Optional[List[TableSpec]] = None,
+        memory: Optional[SessionMemory] = None,
     ) -> SectionResult:
         """
-        Generate Introduction section using two-phase pattern.
+        Generate Introduction section — delegates to WriterAgent.
 
         - **Description**:
-            - Phase A (Judgment): LLM analyses whether existing references
-              cover the section needs and suggests search queries if not.
-            - Phase A (Search): If needed, PaperSearchTool is called directly
-              (system-side) and results are merged into ref_pool.
-            - Phase B (Writing): Pure LLM call with no tools. All available
-              refs (core + newly discovered) are included in the prompt.
+            - Prompt compilation, then WriterAgent.run() with
+              ReAct AskTool + iterative mini-review.
+            - Reference discovery is done centrally in Planner (Phase 0b).
 
         - **Args**:
             - `metadata` (PaperMetaData): Paper metadata.
             - `ref_pool` (ReferencePool): Persistent reference pool.
             - `section_plan` (SectionPlan, optional): Plan for this section.
-            - `figures` (List[FigureSpec], optional): Figures for this section.
-            - `tables` (List[TableSpec], optional): Tables for this section.
+            - `figures` (List[FigureSpec], optional): Figures.
+            - `tables` (List[TableSpec], optional): Tables.
+            - `memory` (SessionMemory, optional): Shared session memory.
 
         - **Returns**:
             - `SectionResult`: Generation result.
         """
         try:
-            # ----------------------------------------------------------
-            # Phase A: Judge whether additional references are needed
-            # ----------------------------------------------------------
-            key_points = []
-            if section_plan and section_plan.key_points:
-                key_points = section_plan.key_points
+            key_points: List[str] = []
+            if section_plan:
+                key_points = section_plan.get_key_points()
 
-            judgment = await self._judge_search_need(
-                section_type="introduction",
-                section_title=section_plan.section_title if section_plan else "Introduction",
-                paper_title=metadata.title,
-                key_points=key_points,
-                ref_pool=ref_pool,
-            )
-
-            if judgment.get("need_search") and judgment.get("queries"):
-                await self._execute_pre_searches(
-                    queries=judgment["queries"],
-                    ref_pool=ref_pool,
-                )
-
-            # ----------------------------------------------------------
-            # Phase B: Pure writing (no tools)
-            # ----------------------------------------------------------
-            # Build prompt AFTER search so it includes any new refs
+            # Compile prompt then delegate to WriterAgent
             prompt = compile_introduction_prompt(
                 paper_title=metadata.title,
                 idea_hypothesis=metadata.idea_hypothesis,
@@ -717,23 +790,29 @@ class MetaDataAgent(ReActAgent):
                 active_skills=self._get_active_skills("introduction", metadata.style_guide),
             )
 
-            # Adjust max_tokens based on target words
-            max_tokens = 2000
-            if section_plan and section_plan.target_words:
-                max_tokens = max(1500, int(section_plan.target_words * 1.5))
-
-            messages = [
-                {"role": "system", "content": GENERATION_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ]
-
-            # Plain LLM call — no tools attached, pure writing
-            content, _ = await self._plain_llm_call(
-                messages=messages,
-                temperature=0.7,
-                max_tokens=max_tokens,
+            # Use section-assigned refs if available, else fall back to full pool
+            section_keys = (
+                section_plan.assigned_refs
+                if section_plan and section_plan.assigned_refs
+                else list(ref_pool.valid_citation_keys)
             )
-
+            result = await self._writer.run(
+                system_prompt=GENERATION_SYSTEM_PROMPT,
+                user_prompt=prompt,
+                section_type="introduction",
+                valid_citation_keys=section_keys,
+                key_points=key_points or None,
+                memory=memory,
+                peers={"planner": self._planner, "reviewer": self._reviewer},
+            )
+            content = result.get("generated_content", "")
+            if not content.strip():
+                return SectionResult(
+                    section_type="introduction",
+                    section_title=section_plan.section_title if section_plan else "Introduction",
+                    status="error",
+                    error="Writer returned empty introduction content",
+                )
             word_count = len(content.split())
 
             return SectionResult(
@@ -765,6 +844,7 @@ class MetaDataAgent(ReActAgent):
         figures: Optional[List[FigureSpec]] = None,
         tables: Optional[List[TableSpec]] = None,
         converted_tables: Optional[Dict[str, str]] = None,
+        memory: Optional[SessionMemory] = None,
     ) -> SectionResult:
         """
         Generate a body section using two-phase pattern.
@@ -792,36 +872,15 @@ class MetaDataAgent(ReActAgent):
             - `SectionResult`: Generation result.
         """
         try:
-            # ----------------------------------------------------------
-            # Phase A: Judge whether additional references are needed
-            # ----------------------------------------------------------
             key_points = []
-            if section_plan and section_plan.key_points:
-                key_points = section_plan.key_points
+            if section_plan:
+                key_points = section_plan.get_key_points()
 
             section_title_str = (
                 section_plan.section_title
                 if section_plan and section_plan.section_title
                 else section_type.replace("_", " ").title()
             )
-
-            judgment = await self._judge_search_need(
-                section_type=section_type,
-                section_title=section_title_str,
-                paper_title=metadata.title,
-                key_points=key_points,
-                ref_pool=ref_pool,
-            )
-
-            if judgment.get("need_search") and judgment.get("queries"):
-                await self._execute_pre_searches(
-                    queries=judgment["queries"],
-                    ref_pool=ref_pool,
-                )
-
-            # ----------------------------------------------------------
-            # Phase B: Pure writing (no tools)
-            # ----------------------------------------------------------
             # Get relevant content from metadata based on section type
             if section_plan and section_plan.content_sources:
                 sources = section_plan.content_sources
@@ -838,6 +897,9 @@ class MetaDataAgent(ReActAgent):
 
             metadata_content = "\n\n".join(content_parts) if content_parts else metadata.method
 
+            # Build memory context for cross-section awareness
+            memory_context = memory.get_writing_context(section_type) if memory else ""
+
             # Build prompt AFTER search so it includes any new refs
             prompt = compile_body_section_prompt(
                 section_type=section_type,
@@ -851,25 +913,24 @@ class MetaDataAgent(ReActAgent):
                 tables=tables,
                 converted_tables=converted_tables,
                 active_skills=self._get_active_skills(section_type, metadata.style_guide),
+                memory_context=memory_context,
             )
 
-            # Adjust max_tokens based on target words
-            max_tokens = 2500
-            if section_plan and section_plan.target_words:
-                max_tokens = max(1500, int(section_plan.target_words * 1.5))
-
-            messages = [
-                {"role": "system", "content": GENERATION_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ]
-
-            # Plain LLM call — no tools attached, pure writing
-            content, _ = await self._plain_llm_call(
-                messages=messages,
-                temperature=0.7,
-                max_tokens=max_tokens,
+            section_keys = (
+                section_plan.assigned_refs
+                if section_plan and section_plan.assigned_refs
+                else list(ref_pool.valid_citation_keys)
             )
-
+            result = await self._writer.run(
+                system_prompt=GENERATION_SYSTEM_PROMPT,
+                user_prompt=prompt,
+                section_type=section_type,
+                valid_citation_keys=section_keys,
+                key_points=key_points or None,
+                memory=memory,
+                peers={"planner": self._planner, "reviewer": self._reviewer},
+            )
+            content = result.get("generated_content", "")
             word_count = len(content.split())
 
             # Use plan's title if available
@@ -911,36 +972,45 @@ class MetaDataAgent(ReActAgent):
         contributions: List[str],
         style_guide: Optional[str] = None,
         section_plan: Optional[SectionPlan] = None,
+        memory: Optional[SessionMemory] = None,
     ) -> SectionResult:
-        """Generate synthesis section (Abstract or Conclusion)"""
+        """Generate synthesis section (Abstract or Conclusion) via WriterAgent."""
         try:
+            memory_context = memory.get_cross_section_summary() if memory else ""
+
             prompt = compile_synthesis_prompt(
                 section_type=section_type,
                 paper_title=paper_title,
                 prior_sections=prior_sections,
                 key_contributions=contributions,
                 style_guide=style_guide,
-                section_plan=section_plan,  # Pass plan for guidance
+                section_plan=section_plan,
                 active_skills=self._get_active_skills(section_type, style_guide),
+                memory_context=memory_context,
             )
-            
-            # Adjust max_tokens based on target words
-            if section_plan and section_plan.target_words:
-                max_tokens = max(400, int(section_plan.target_words * 1.5))
-            else:
-                max_tokens = 1500 if section_type == "conclusion" else 500
-            
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": "You are an expert academic writer. Use present tense for methods, no contractions (it is, do not, cannot), no possessives on method names (the performance of X, not X's performance). Place key information at sentence end. Output pure LaTeX only."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.6,
-                max_tokens=max_tokens,
+
+            synthesis_system = (
+                "You are an expert academic writer. Use present tense for methods, "
+                "no contractions (it is, do not, cannot), no possessives on method "
+                "names (the performance of X, not X's performance). "
+                "Place key information at sentence end. Output pure LaTeX only."
             )
-            
-            content = response.choices[0].message.content.strip()
+
+            result = await self._writer.run(
+                system_prompt=synthesis_system,
+                user_prompt=prompt,
+                section_type=section_type,
+                enable_review=False,
+                memory=memory,
+                peers={"planner": self._planner, "reviewer": self._reviewer},
+            )
+            content = result.get("generated_content", "")
+
+            # Strip citations from abstract and conclusion
+            if section_type in ("abstract", "conclusion"):
+                content = re.sub(r'~?\\cite\{[^}]*\}', '', content)
+                content = re.sub(r'  +', ' ', content)
+
             word_count = len(content.split())
             
             # Use plan's title if available
@@ -996,6 +1066,119 @@ class MetaDataAgent(ReActAgent):
         
         return parsed
     
+    @staticmethod
+    def _validate_ref_usage(
+        generated_sections: Dict[str, str],
+        ref_pool: "ReferencePool",
+    ) -> Dict[str, Any]:
+        """
+        Check that every reference in the pool is cited at least once.
+        Logs warnings for uncited references and returns structured coverage.
+        """
+        all_content = "\n".join(generated_sections.values())
+        cited_keys = ReferencePool.extract_cite_keys(all_content)
+        pool_keys = ref_pool.valid_citation_keys
+        uncited = pool_keys - cited_keys
+        if uncited:
+            print(f"[MetaDataAgent] WARNING: {len(uncited)} uncited reference(s): "
+                  + ", ".join(sorted(uncited)[:10])
+                  + ("..." if len(uncited) > 10 else ""))
+        else:
+            print(f"[MetaDataAgent] All {len(pool_keys)} pooled references are cited.")
+        return {
+            "cited_keys": sorted(cited_keys),
+            "pool_keys": sorted(pool_keys),
+            "uncited_keys": sorted(uncited),
+            "coverage": (len(cited_keys & pool_keys) / len(pool_keys)) if pool_keys else 1.0,
+        }
+
+    async def _enforce_reference_coverage(
+        self,
+        generated_sections: Dict[str, str],
+        sections_results: List[SectionResult],
+        paper_plan: Optional[PaperPlan],
+        metadata: PaperMetaData,
+        valid_ref_keys: Set[str],
+        memory: Optional[SessionMemory] = None,
+        max_sections_to_revise: int = 2,
+    ) -> Set[str]:
+        """
+        Reference coverage fix pass.
+        - **Description**:
+            - Finds uncited pooled references.
+            - Routes each missing key to one section that has it in assigned_refs.
+            - Applies targeted revision prompts to integrate those citations.
+        """
+        if not paper_plan:
+            return set()
+
+        all_content = "\n".join(generated_sections.values())
+        cited_keys = ReferencePool.extract_cite_keys(all_content)
+        uncited_keys = set(valid_ref_keys) - set(cited_keys)
+        if not uncited_keys:
+            return set()
+
+        # Map section -> missing keys it can cite.
+        missing_by_section: Dict[str, List[str]] = {}
+        for sp in paper_plan.sections:
+            st = sp.section_type
+            if st in ("abstract", "conclusion"):
+                continue
+            if st not in generated_sections:
+                continue
+            assigned = set(getattr(sp, "assigned_refs", []) or [])
+            missing = sorted(list(assigned & uncited_keys))
+            if missing:
+                missing_by_section[st] = missing
+
+        if not missing_by_section:
+            return set()
+
+        revised_sections: Set[str] = set()
+        # Prioritize sections that can absorb the most missing refs.
+        targets = sorted(
+            missing_by_section.items(),
+            key=lambda kv: len(kv[1]),
+            reverse=True,
+        )[:max_sections_to_revise]
+
+        for section_type, missing_keys in targets:
+            prompt = (
+                f"Reference coverage fix for section '{section_type}'.\n"
+                f"Integrate the following citation keys naturally into relevant claims: "
+                f"{', '.join(missing_keys[:6])}.\n"
+                "Rules:\n"
+                "- Preserve technical meaning and paragraph structure.\n"
+                "- Use ONLY these keys via \\cite{key}.\n"
+                "- Do not add citations in abstract or conclusion.\n"
+                "- Do not fabricate facts; attach citations to existing statements where appropriate."
+            )
+            revised = await self._revise_section(
+                section_type=section_type,
+                current_content=generated_sections[section_type],
+                revision_prompt=prompt,
+                metadata=metadata,
+                memory=memory,
+            )
+            if revised and revised.strip():
+                generated_sections[section_type] = revised
+                # Sync word_count in section results
+                for sr in sections_results:
+                    if sr.section_type == section_type and sr.status == "ok":
+                        sr.latex_content = revised
+                        sr.word_count = len(revised.split())
+                        break
+                revised_sections.add(section_type)
+
+        if revised_sections:
+            post_cited = ReferencePool.extract_cite_keys("\n".join(generated_sections.values()))
+            post_coverage = (len(set(valid_ref_keys) & set(post_cited)) / len(valid_ref_keys)) if valid_ref_keys else 1.0
+            print(
+                "[MetaDataAgent] Ref coverage pass revised="
+                f"{sorted(revised_sections)} coverage={post_coverage:.0%}"
+            )
+        return revised_sections
+
     def _validate_file_paths(self, metadata: PaperMetaData) -> List[str]:
         """
         Validate that all provided file paths exist before generation.
@@ -1043,7 +1226,66 @@ class MetaDataAgent(ReActAgent):
                 errors.append(f"Table {tbl.id} has no file_path or content")
         
         return errors
-    
+
+    @staticmethod
+    def _convert_figures_for_latex(metadata: "PaperMetaData") -> int:
+        """
+        Convert figure files to LaTeX-compatible formats (PDF preferred, then PNG).
+        Mutates FigureSpec.file_path in-place if conversion is performed.
+
+        - **Returns**:
+            - `int`: Number of figures converted.
+        """
+        from PIL import Image as PILImage
+
+        LATEX_OK = {".pdf", ".png", ".jpg", ".jpeg", ".eps"}
+        converted = 0
+        base_path = os.getcwd()
+
+        for fig in metadata.figures:
+            if fig.auto_generate or not fig.file_path:
+                continue
+            resolved = (
+                fig.file_path if os.path.isabs(fig.file_path)
+                else os.path.join(base_path, fig.file_path)
+            )
+            resolved = os.path.normpath(resolved)
+            if not os.path.exists(resolved):
+                continue
+            ext = os.path.splitext(resolved)[1].lower()
+            if ext in LATEX_OK:
+                continue
+
+            # Convert to PDF (preferred); fall back to PNG if PDF conversion fails
+            pdf_path = os.path.splitext(resolved)[0] + ".pdf"
+            try:
+                img = PILImage.open(resolved)
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                img.save(pdf_path, "PDF")
+                # Update FigureSpec so downstream sees the new path
+                if os.path.isabs(fig.file_path):
+                    fig.file_path = pdf_path
+                else:
+                    fig.file_path = os.path.relpath(pdf_path, base_path)
+                converted += 1
+                print(f"[MetaDataAgent] Converted figure {fig.id}: {ext} -> .pdf")
+            except Exception as exc:
+                png_path = os.path.splitext(resolved)[0] + ".png"
+                try:
+                    img = PILImage.open(resolved)
+                    img.save(png_path, "PNG")
+                    if os.path.isabs(fig.file_path):
+                        fig.file_path = png_path
+                    else:
+                        fig.file_path = os.path.relpath(png_path, base_path)
+                    converted += 1
+                    print(f"[MetaDataAgent] Converted figure {fig.id}: {ext} -> .png")
+                except Exception as png_exc:
+                    print(f"[MetaDataAgent] WARNING: Cannot convert {fig.id} "
+                          f"({ext}): pdf={exc}, png={png_exc}")
+        return converted
+
     def _collect_figure_paths(
         self, 
         figures: List[FigureSpec], 
@@ -1326,7 +1568,7 @@ class MetaDataAgent(ReActAgent):
         
         for section in paper_plan.sections:
             section_type = section.section_type
-            figures_to_define = getattr(section, 'figures_to_define', []) or []
+            figures_to_define = section.get_figure_ids_to_define()
             
             if not figures_to_define or section_type not in generated_sections:
                 continue
@@ -1425,7 +1667,7 @@ class MetaDataAgent(ReActAgent):
 
         for section in paper_plan.sections:
             section_type = section.section_type
-            tables_to_define = getattr(section, 'tables_to_define', []) or []
+            tables_to_define = section.get_table_ids_to_define()
 
             if not tables_to_define or section_type not in generated_sections:
                 continue
@@ -1491,131 +1733,6 @@ class MetaDataAgent(ReActAgent):
 
         return generated_sections
 
-    async def _mini_review_section(
-        self,
-        section_type: str,
-        content: str,
-        section_plan: Optional[SectionPlan],
-        valid_citation_keys: set,
-    ) -> Dict[str, Any]:
-        """
-        Perform mini-review on a generated section.
-        
-        Checks:
-        - Word count vs target
-        - Citation validity
-        - Key points coverage (basic check)
-        
-        Args:
-            section_type: Type of section
-            content: Generated LaTeX content
-            section_plan: Plan for this section (if available)
-            valid_citation_keys: Set of valid citation keys
-            
-        Returns:
-            Dict with review results and fixed content
-        """
-        print(f"[MiniReview] Starting review for '{section_type}'...")
-        
-        issues = []
-        warnings = []
-        
-        # 1. Word count check
-        print(f"[MiniReview:count_words] Checking word count...")
-        word_count = len(content.split())
-        target_words = section_plan.target_words if section_plan else None
-        
-        if target_words:
-            min_words = int(target_words * 0.7)
-            max_words = int(target_words * 1.3)
-            
-            if word_count < min_words:
-                issues.append(f"Word count too low: {word_count} < {min_words} (target: {target_words})")
-                print(f"[MiniReview:count_words] UNDER: {word_count} < {min_words} (target: {target_words})")
-            elif word_count > max_words:
-                warnings.append(f"Word count high: {word_count} > {max_words} (target: {target_words})")
-                print(f"[MiniReview:count_words] OVER: {word_count} > {max_words} (target: {target_words})")
-            else:
-                print(f"[MiniReview:count_words] OK: {word_count} words (target: {target_words})")
-        else:
-            print(f"[MiniReview:count_words] Result: {word_count} words (no target)")
-        
-        # 2. Citation validation and fix
-        print(f"[MiniReview:validate_citations] Checking citations against {len(valid_citation_keys)} valid keys...")
-        fixed_content, invalid_citations, valid_citations = self._validate_and_fix_citations(
-            content, valid_citation_keys, remove_invalid=True
-        )
-        
-        if invalid_citations:
-            issues.append(f"Removed {len(invalid_citations)} invalid citations: {invalid_citations[:5]}{'...' if len(invalid_citations) > 5 else ''}")
-            print(f"[MiniReview:validate_citations] REMOVED: {invalid_citations}")
-        else:
-            print(f"[MiniReview:validate_citations] OK: {len(valid_citations)} valid citations")
-        
-        # 3. Key points coverage (basic keyword check)
-        if section_plan and section_plan.key_points:
-            print(f"[MiniReview:check_key_points] Checking {len(section_plan.key_points)} key points...")
-            content_lower = content.lower()
-            covered_points = 0
-            for point in section_plan.key_points:
-                # Extract key words from the point
-                key_words = [w for w in point.lower().split() if len(w) > 4][:3]
-                if any(kw in content_lower for kw in key_words):
-                    covered_points += 1
-            
-            coverage_ratio = covered_points / len(section_plan.key_points) if section_plan.key_points else 1.0
-            if coverage_ratio < 0.5:
-                warnings.append(f"Low key point coverage: {covered_points}/{len(section_plan.key_points)}")
-                print(f"[MiniReview:check_key_points] LOW: {covered_points}/{len(section_plan.key_points)} ({coverage_ratio:.0%})")
-            else:
-                print(f"[MiniReview:check_key_points] OK: {covered_points}/{len(section_plan.key_points)} ({coverage_ratio:.0%})")
-        
-        # 4. Figure/Table reference check
-        if section_plan:
-            if section_plan.figures_to_use:
-                print(f"[MiniReview:check_figures] Checking {len(section_plan.figures_to_use)} expected figures...")
-                missing_figs = []
-                for fig_id in section_plan.figures_to_use:
-                    if fig_id not in content and f'ref{{{fig_id}}}' not in content:
-                        warnings.append(f"Missing expected figure reference: {fig_id}")
-                        missing_figs.append(fig_id)
-                if missing_figs:
-                    print(f"[MiniReview:check_figures] MISSING: {missing_figs}")
-                else:
-                    print(f"[MiniReview:check_figures] OK: all figures referenced")
-            
-            if section_plan.tables_to_use:
-                print(f"[MiniReview:check_tables] Checking {len(section_plan.tables_to_use)} expected tables...")
-                missing_tbls = []
-                for tbl_id in section_plan.tables_to_use:
-                    if tbl_id not in content and f'ref{{{tbl_id}}}' not in content:
-                        warnings.append(f"Missing expected table reference: {tbl_id}")
-                        missing_tbls.append(tbl_id)
-                if missing_tbls:
-                    print(f"[MiniReview:check_tables] MISSING: {missing_tbls}")
-                else:
-                    print(f"[MiniReview:check_tables] OK: all tables referenced")
-        
-        # Log summary
-        passed = len(issues) == 0
-        print(f"[MiniReview] {section_type} - {'PASSED' if passed else 'FAILED'} (issues: {len(issues)}, warnings: {len(warnings)})")
-        if issues:
-            print(f"[MiniReview] {section_type} - Issues: {issues}")
-        if warnings:
-            print(f"[MiniReview] {section_type} - Warnings: {warnings}")
-        
-        return {
-            "section_type": section_type,
-            "original_word_count": word_count,
-            "fixed_content": fixed_content,
-            "fixed_word_count": len(fixed_content.split()),
-            "issues": issues,
-            "warnings": warnings,
-            "invalid_citations_removed": invalid_citations,
-            "valid_citations_used": valid_citations,
-            "passed": len(issues) == 0,
-        }
-    
     # =========================================================================
     # Pre-Generation Search Judgment (Phase A)
     # =========================================================================
@@ -1937,6 +2054,8 @@ class MetaDataAgent(ReActAgent):
             - On failure: (None, None, [error1, ...], {"section_type": [errors]})
         """
         print(f"[MetaDataAgent] Phase 4: Compiling PDF with template: {template_path}")
+        if not (paper_title or "").strip():
+            return None, None, ["missing_or_empty_paper_title"], {}
         
         try:
             # Dynamic: read section order and titles from the plan
@@ -2016,6 +2135,7 @@ class MetaDataAgent(ReActAgent):
                             "template_path": template_path,
                             "template_config": {
                                 "paper_title": paper_title,
+                                "paper_authors": "EasyPaper",
                             },
                             "references": typesetter_refs,
                             "output_dir": str(output_dir),
@@ -2047,7 +2167,15 @@ class MetaDataAgent(ReActAgent):
                             print(f"[MetaDataAgent] Section errors (on success): {section_errors}")
                     else:
                         print(f"[MetaDataAgent] PDF compilation failed: compilation result has no pdf_path")
-                    
+
+                    # Guard: ensure final main.tex contains required structure.
+                    if latex_path:
+                        main_tex_path = Path(latex_path) / "main.tex"
+                        structure_errors = self._validate_main_tex_structure(main_tex_path)
+                        if structure_errors:
+                            print(f"[MetaDataAgent] main.tex structure validation failed: {structure_errors}")
+                            return None, None, structure_errors, section_errors
+
                     return pdf_path, latex_path, [], section_errors
                 else:
                     # Compilation failed - extract errors from result
@@ -2071,6 +2199,49 @@ class MetaDataAgent(ReActAgent):
         except Exception as e:
             print(f"[MetaDataAgent] PDF compilation error: {e}")
             return None, None, [str(e)], {}
+
+    @staticmethod
+    def _validate_main_tex_structure(main_tex_path: Path) -> List[str]:
+        """
+        Validate that compiled main.tex contains non-empty title/abstract/conclusion.
+        - **Returns**:
+            - `List[str]`: Validation errors; empty list means pass.
+        """
+        if not main_tex_path.exists():
+            return [f"main.tex not found: {main_tex_path}"]
+        try:
+            text = main_tex_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            return [f"cannot read main.tex: {e}"]
+
+        errors: List[str] = []
+
+        # Title
+        title_match = re.search(r'\\title(?:\[[^\]]*\])?\{([^}]*)\}', text, flags=re.DOTALL)
+        if not title_match or not title_match.group(1).strip():
+            errors.append("missing_or_empty_title")
+
+        # Abstract content: supports \abstract{...} and \begin{abstract}...\end{abstract}
+        abstract_cmd = re.search(r'\\abstract\{([^}]*)\}', text, flags=re.DOTALL)
+        abstract_env = re.search(r'\\begin\{abstract\}(.*?)\\end\{abstract\}', text, flags=re.DOTALL)
+        abstract_text = ""
+        if abstract_cmd:
+            abstract_text = abstract_cmd.group(1)
+        elif abstract_env:
+            abstract_text = abstract_env.group(1)
+        if not abstract_text.strip():
+            errors.append("missing_or_empty_abstract")
+
+        # Conclusion section content
+        conclusion_match = re.search(
+            r'\\section\*?\{Conclusion\}(.*?)(\\section\*?\{|\\bibliography\{|\\printbibliography|\\end\{document\})',
+            text,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        if not conclusion_match or not conclusion_match.group(1).strip():
+            errors.append("missing_or_empty_conclusion")
+
+        return errors
     
     # =========================================================================
     # Phase 5: VLM Review
@@ -2082,44 +2253,43 @@ class MetaDataAgent(ReActAgent):
         page_limit: int = 8,
         template_type: str = "ICML",
         sections_info: Optional[Dict[str, Any]] = None,
+        memory: Optional[SessionMemory] = None,
     ) -> Optional[Dict[str, Any]]:
         """
-        Call VLM Review Agent to check PDF for overflow/underfill/layout issues
-        
-        Args:
-            pdf_path: Path to compiled PDF
-            page_limit: Maximum allowed pages
-            template_type: Template type for context
-            sections_info: Optional section word counts for recommendations
-            
-        Returns:
-            VLM review result dict or None on failure
+        Call VLM Review Agent directly (no HTTP) to check the PDF.
+        - **Description**:
+            - Builds a VLMReviewRequest and calls self._vlm_reviewer.review().
+            - Memory context is injected automatically inside review().
+
+        - **Args**:
+            - `pdf_path` (str): Path to compiled PDF
+            - `page_limit` (int): Maximum allowed pages
+            - `template_type` (str): Template type for context
+            - `sections_info` (Dict, optional): Section word counts
+            - `memory` (SessionMemory, optional): Shared session memory
+
+        - **Returns**:
+            - VLM review result dict or None on failure
         """
-        try:
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                response = await client.post(
-                    "http://localhost:8000/agent/vlm_review/review",
-                    json={
-                        "pdf_path": pdf_path,
-                        "page_limit": page_limit,
-                        "template_type": template_type,
-                        "check_overflow": True,
-                        "check_underfill": True,
-                        "check_layout": False,  # Disable layout checks for now
-                        "sections_info": sections_info or {},
-                    }
-                )
-                
-                if response.status_code != 200:
-                    print(f"[MetaDataAgent] VLM Review error: {response.status_code}")
-                    return None
-                
-                result = response.json()
-                return result
-                
-        except httpx.ConnectError:
+        if self._vlm_reviewer is None:
             print("[MetaDataAgent] VLM Review Agent not available, skipping")
             return None
+        try:
+            from ..vlm_review_agent.models import VLMReviewRequest
+
+            request = VLMReviewRequest(
+                pdf_path=pdf_path,
+                page_limit=page_limit,
+                template_type=template_type,
+                check_overflow=True,
+                check_underfill=True,
+                check_layout=False,
+                sections_info=sections_info or {},
+            )
+
+            result = await self._vlm_reviewer.review(request, memory=memory)
+            return result.model_dump()
+
         except Exception as e:
             print(f"[MetaDataAgent] VLM Review error: {e}")
             return None
@@ -2155,6 +2325,7 @@ class MetaDataAgent(ReActAgent):
                     "description": fig.description,
                     "section": fig.section,
                     "wide": fig.wide,
+                    "file_path": getattr(fig, "file_path", None) or "",
                 })
             
             # Prepare table info for planner
@@ -2166,42 +2337,27 @@ class MetaDataAgent(ReActAgent):
                     "description": tbl.description,
                     "section": tbl.section,
                     "wide": tbl.wide,
+                    "file_path": getattr(tbl, "file_path", None) or "",
                 })
             
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(
-                    "http://localhost:8000/agent/planner/plan",
-                    json={
-                        "title": metadata.title,
-                        "idea_hypothesis": metadata.idea_hypothesis,
-                        "method": metadata.method,
-                        "data": metadata.data,
-                        "experiments": metadata.experiments,
-                        "references": metadata.references,
-                        "figures": figures_info,
-                        "tables": tables_info,
-                        "target_pages": target_pages,
-                        "style_guide": style_guide,
-                    }
-                )
-                
-                if response.status_code != 200:
-                    print(f"[MetaDataAgent] Planner error: {response.status_code}")
-                    return None
-                
-                result = response.json()
-                
-                if result.get("status") == "ok" and result.get("plan"):
-                    plan_data = result["plan"]
-                    return PaperPlan(**plan_data)
-                else:
-                    error_msg = result.get("error", "Unknown error")
-                    print(f"[MetaDataAgent] Planning failed: {error_msg}")
-                    return None
-                
-        except httpx.ConnectError:
-            print("[MetaDataAgent] Planner Agent not available, using default structure")
-            return None
+            from ..planner_agent.models import PlanRequest, FigureInfo, TableInfo
+
+            plan_request = PlanRequest(
+                title=metadata.title,
+                idea_hypothesis=metadata.idea_hypothesis,
+                method=metadata.method,
+                data=metadata.data,
+                experiments=metadata.experiments,
+                references=metadata.references,
+                figures=[FigureInfo(**fi) for fi in figures_info],
+                tables=[TableInfo(**ti) for ti in tables_info],
+                target_pages=target_pages,
+                style_guide=style_guide,
+            )
+
+            paper_plan = await self._planner.create_plan(plan_request)
+            return paper_plan
+
         except Exception as e:
             print(f"[MetaDataAgent] Planning error: {e}")
             return None
@@ -3192,12 +3348,14 @@ class MetaDataAgent(ReActAgent):
         sections_results: List[SectionResult],
         valid_citation_keys: set,
         metadata: PaperMetaData,
+        memory: Optional[SessionMemory] = None,
     ) -> set:
         """
         Apply revisions based on a unified review result.
         - **Description**:
             - Uses review_result.section_feedbacks to revise sections
             - Updates generated_sections and sections_results in place
+            - Injects revision history from memory to prevent regression
         
         - **Args**:
             - `review_result` (ReviewResult): Unified review result
@@ -3205,6 +3363,7 @@ class MetaDataAgent(ReActAgent):
             - `sections_results` (List[SectionResult]): Section results to update
             - `valid_citation_keys` (set): Valid citation keys
             - `metadata` (PaperMetaData): Original metadata for context
+            - `memory` (SessionMemory, optional): Session memory for revision context
         
         - **Returns**:
             - `revised_sections` (set): Section types that were revised
@@ -3233,6 +3392,7 @@ class MetaDataAgent(ReActAgent):
                 current_content=generated_sections[sf.section_type],
                 revision_prompt=revision_prompt,
                 metadata=metadata,
+                memory=memory,
             )
             
             if revised_content:
@@ -3295,6 +3455,7 @@ class MetaDataAgent(ReActAgent):
         enable_vlm_review: bool,
         target_pages: Optional[int],
         paper_dir: Optional[Path],
+        memory: Optional[SessionMemory] = None,
     ) -> Tuple[Dict[str, str], List[SectionResult], int, Optional[int], Optional[str], List[str]]:
         """
         Run unified review orchestration across reviewer and VLM.
@@ -3352,13 +3513,39 @@ class MetaDataAgent(ReActAgent):
             }
             
             review_result = ReviewResult(iteration=iteration)
+
+            # Reference coverage pass: proactively integrate uncited assigned refs.
+            ref_revised_sections: Set[str] = set()
+            if paper_plan:
+                ref_revised_sections = await self._enforce_reference_coverage(
+                    generated_sections=generated_sections,
+                    sections_results=sections_results,
+                    paper_plan=paper_plan,
+                    metadata=metadata,
+                    valid_ref_keys=self._extract_valid_citation_keys(parsed_refs),
+                    memory=memory,
+                    max_sections_to_revise=2,
+                )
+                if ref_revised_sections:
+                    if memory:
+                        memory.log(
+                            "metadata",
+                            f"review_iter_{review_iterations}",
+                            "reference_coverage_revised",
+                            narrative=(
+                                "Applied targeted revisions to improve citation coverage "
+                                f"in sections: {', '.join(sorted(ref_revised_sections))}."
+                            ),
+                            revised_sections=sorted(ref_revised_sections),
+                        )
+
             if enable_review:
                 # Build section_targets from plan so Reviewer uses
                 # the same targets as the Planner (unified ratios).
                 section_targets = None
                 if paper_plan and paper_plan.sections:
                     section_targets = {
-                        s.section_type: s.target_words
+                        s.section_type: s.get_estimated_words()
                         for s in paper_plan.sections
                     }
                 reviewer_result, target_word_count = await self._call_reviewer(
@@ -3369,6 +3556,7 @@ class MetaDataAgent(ReActAgent):
                     template_path=template_path,
                     iteration=iteration,
                     section_targets=section_targets,
+                    memory=memory,
                 )
                 if reviewer_result is None:
                     print("[MetaDataAgent] Reviewer not available, skipping content review")
@@ -3407,6 +3595,7 @@ class MetaDataAgent(ReActAgent):
                 sections_results=sections_results,
                 valid_citation_keys=self._extract_valid_citation_keys(parsed_refs),
                 metadata=metadata,
+                memory=memory,
             )
             if reviewer_revised_sections:
                 print(f"[ReviewLoop] Reviewer revised: {sorted(reviewer_revised_sections)}")
@@ -3481,6 +3670,7 @@ class MetaDataAgent(ReActAgent):
                             sr.section_type: {"word_count": sr.word_count}
                             for sr in sections_results if sr.word_count
                         },
+                        memory=memory,
                     )
                     if last_vlm_result:
                         print(
@@ -3548,8 +3738,10 @@ class MetaDataAgent(ReActAgent):
                                 sf.current_word_count = word_counts.get(sf.section_type, 0)
                             if paper_plan:
                                 section_plan = paper_plan.get_section(sf.section_type)
-                                if section_plan and section_plan.target_words:
-                                    sf.target_word_count = section_plan.target_words
+                                if section_plan:
+                                    est = section_plan.get_estimated_words()
+                                    if est > 0:
+                                        sf.target_word_count = est
                         
                         for sf in merged_section_feedbacks:
                             if sf.action != "ok":
@@ -3566,6 +3758,7 @@ class MetaDataAgent(ReActAgent):
                 sections_results=sections_results,
                 valid_citation_keys=self._extract_valid_citation_keys(parsed_refs),
                 metadata=metadata,
+                memory=memory,
             )
             if post_compile_revised:
                 sources = "VLM/Typesetter" if not compile_succeeded else "VLM"
@@ -3576,6 +3769,57 @@ class MetaDataAgent(ReActAgent):
                 review_result=review_result,
             )
             
+            # Record review iteration in session memory
+            if memory is not None:
+                # Build section feedback summary for the record
+                section_fb_dict = {}
+                for sf in review_result.section_feedbacks:
+                    section_fb_dict[sf.section_type] = {
+                        "action": sf.action,
+                        "delta_words": sf.delta_words,
+                        "paragraph_feedbacks": [
+                            pf.model_dump() if hasattr(pf, "model_dump") else pf
+                            for pf in (sf.paragraph_feedbacks if hasattr(sf, "paragraph_feedbacks") else [])
+                        ],
+                    }
+                actions_taken = sorted(
+                    reviewer_revised_sections | post_compile_revised
+                )
+                word_snapshot = {
+                    sr.section_type: sr.word_count
+                    for sr in sections_results if sr.status == "ok"
+                }
+                record = ReviewRecord(
+                    iteration=review_iterations,
+                    reviewer="unified",
+                    passed=review_result.passed,
+                    feedback_summary="; ".join(
+                        f.message for f in review_result.feedbacks if not f.passed
+                    )[:500],
+                    section_feedbacks=section_fb_dict,
+                    actions_taken=[f"revised:{s}" for s in actions_taken],
+                    result_snapshot=word_snapshot,
+                )
+                memory.add_review(record)
+                review_narr = f"Review iteration {review_iterations}: "
+                if review_result.passed:
+                    review_narr += "All checks passed."
+                else:
+                    failed_msgs = [f.message for f in review_result.feedbacks if not f.passed]
+                    review_narr += f"Found {len(failed_msgs)} issue(s). "
+                    if failed_msgs:
+                        review_narr += failed_msgs[0][:150]
+                if actions_taken:
+                    review_narr += f" Revised sections: {', '.join(actions_taken)}."
+                memory.log("metadata", f"review_iter_{review_iterations}",
+                           "review_completed",
+                           narrative=review_narr,
+                           passed=review_result.passed,
+                           revised=actions_taken)
+                # Update memory sections with latest content
+                for stype, content in generated_sections.items():
+                    memory.update_section(stype, content)
+
             current_fingerprint = self._get_sections_fingerprint(generated_sections)
             if current_fingerprint == last_fingerprint:
                 if review_result.passed and (not last_vlm_result or last_vlm_result.get("passed", True)):
@@ -3640,53 +3884,48 @@ class MetaDataAgent(ReActAgent):
         template_path: Optional[str],
         iteration: int,
         section_targets: Optional[Dict[str, int]] = None,
+        memory: Optional[SessionMemory] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
         """
-        Call Reviewer Agent to check the paper.
+        Call Reviewer Agent directly (no HTTP) to check the paper.
         - **Description**:
-            - Passes plan-derived section_targets so the Reviewer uses
-              the same word budget as the Planner (unified ratios).
+            - Builds a ReviewContext and calls self._reviewer.review() directly.
+            - Passes memory so checkers can read prior issues natively.
 
         - **Returns**:
             - Tuple of (review_result_dict, target_word_count) or (None, None) on failure
         """
         try:
-            payload = {
-                "sections": sections,
-                "word_counts": word_counts,
-                "target_pages": target_pages,
-                "style_guide": style_guide,
-                "template_path": template_path,
-                "metadata": {},
-                "iteration": iteration,
-            }
+            from ..reviewer_agent.models import ReviewContext as RC
+
+            review_ctx = RC(
+                sections=sections,
+                word_counts=word_counts,
+                target_pages=target_pages or 8,
+                style_guide=style_guide,
+                template_path=template_path,
+                metadata={},
+            )
             if section_targets:
-                payload["section_targets"] = section_targets
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                response = await client.post(
-                    "http://localhost:8000/agent/reviewer/review",
-                    json=payload,
-                )
-                
-                if response.status_code != 200:
-                    print(f"[MetaDataAgent] Reviewer error: {response.status_code}")
-                    return None, None
-                
-                result = response.json()
-                
-                # Extract target word count from feedback details
-                target_word_count = None
-                for fb in result.get("feedbacks", []):
-                    details = fb.get("details", {})
-                    if "target_words" in details:
-                        target_word_count = details["target_words"]
-                        break
-                
-                return result, target_word_count
-                
-        except httpx.ConnectError:
-            print("[MetaDataAgent] Reviewer Agent not available")
-            return None, None
+                review_ctx.section_targets = section_targets
+
+            review_result = await self._reviewer.review(
+                context=review_ctx,
+                iteration=iteration,
+                memory=memory,
+            )
+
+            result = review_result.model_dump()
+
+            target_word_count = None
+            for fb in result.get("feedbacks", []):
+                details = fb.get("details", {})
+                if "target_words" in details:
+                    target_word_count = details["target_words"]
+                    break
+
+            return result, target_word_count
+
         except Exception as e:
             print(f"[MetaDataAgent] Review error: {e}")
             return None, None
@@ -3697,18 +3936,21 @@ class MetaDataAgent(ReActAgent):
         current_content: str,
         revision_prompt: str,
         metadata: PaperMetaData,
+        memory: Optional[SessionMemory] = None,
     ) -> Optional[str]:
         """
-        Revise a section based on feedback.
+        Revise a section based on feedback — delegates to WriterAgent.
         - **Description**:
-            - Sends the revision instructions along with the current content to the LLM
-            - The LLM outputs only the revised LaTeX, no explanations
+            - Packs the revision instructions + current content as a user_prompt
+              and delegates to WriterAgent, which can consult memory/planner/reviewer
+              via AskTool during the ReAct loop.
 
         - **Args**:
             - `section_type` (str): Type of section to revise
             - `current_content` (str): Current section LaTeX content
             - `revision_prompt` (str): Instructions for the revision
             - `metadata` (PaperMetaData): Paper metadata for context
+            - `memory` (SessionMemory, optional): Session memory
 
         - **Returns**:
             - Revised content string, or None on failure
@@ -3721,9 +3963,11 @@ class MetaDataAgent(ReActAgent):
                 "Output ONLY the revised LaTeX content, no explanations or preamble."
             )
 
-            # Build user message: instructions + current content
-            # If revision_prompt already contains the content (e.g. from ReviewerAgent),
-            # avoid duplicating it by checking for the marker text.
+            # Build user message with revision context from memory
+            revision_ctx = ""
+            if memory:
+                revision_ctx = memory.get_revision_context(section_type)
+
             if "Current content" in revision_prompt or current_content in revision_prompt:
                 user_message = revision_prompt
             else:
@@ -3733,28 +3977,20 @@ class MetaDataAgent(ReActAgent):
                     f"{current_content}"
                 )
 
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=0.7,
+            if revision_ctx:
+                user_message = f"{revision_ctx}\n\n{user_message}"
+
+            result = await self._writer.run(
+                system_prompt=system_prompt,
+                user_prompt=user_message,
+                section_type=section_type,
+                enable_review=False,
+                memory=memory,
+                peers={"planner": self._planner, "reviewer": self._reviewer},
             )
-            
-            revised_content = response.choices[0].message.content.strip()
-            
-            # Clean up any markdown code blocks
-            if revised_content.startswith("```"):
-                lines = revised_content.split("\n")
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].strip() == "```":
-                    lines = lines[:-1]
-                revised_content = "\n".join(lines)
-            
-            return revised_content
-            
+            revised = result.get("generated_content", "")
+            return revised if revised else None
+
         except Exception as e:
             print(f"[MetaDataAgent] Revision error for {section_type}: {e}")
             return None

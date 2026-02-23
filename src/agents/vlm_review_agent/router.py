@@ -161,12 +161,18 @@ def create_vlm_review_router(agent: "VLMReviewAgent") -> APIRouter:
         Returns:
             Agent status and configuration
         """
-        return {
+        info = {
             "status": "ok",
             "agent": "vlm_review",
-            "vlm_provider": agent.vlm_provider_name,
-            "vlm_model": agent.vlm_model,
             "render_dpi": agent.render_dpi,
+            "shared_vlm_service": agent._vlm_service is not None,
         }
+        if agent._vlm_service is not None:
+            info["vlm_provider"] = agent._vlm_service._provider_name
+            info["vlm_model"] = agent._vlm_service._model or "default"
+        else:
+            info["vlm_provider"] = agent.vlm_provider_name
+            info["vlm_model"] = agent.vlm_model
+        return info
     
     return router

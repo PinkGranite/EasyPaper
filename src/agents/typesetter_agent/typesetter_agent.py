@@ -165,6 +165,30 @@ class TypesetterAgent(BaseAgent):
         
         return None
 
+    @staticmethod
+    def _flatten_support_files(work_dir: str) -> None:
+        """
+        Copy .bst, .cls, .sty files from subdirectories to work_dir root.
+        - **Description**:
+            - Template zips often nest support files in subdirectories
+              (e.g. ``bst/``, ``styles/``). BibTeX and pdflatex only search
+              the current directory by default, so these must be at the root.
+
+        - **Args**:
+            - `work_dir` (str): The compilation working directory.
+        """
+        extensions = ('.bst', '.cls', '.sty')
+        for root, _dirs, files in os.walk(work_dir):
+            if root == work_dir:
+                continue
+            for fname in files:
+                if fname.endswith(extensions):
+                    src = os.path.join(root, fname)
+                    dst = os.path.join(work_dir, fname)
+                    if not os.path.exists(dst):
+                        shutil.copy2(src, dst)
+                        logger.info("typesetter.flattened_support_file %s", fname)
+
     async def setup_workspace(self, state: TypesetterAgentState) -> Dict[str, Any]:
         """
         Set up temporary workspace for compilation
@@ -201,6 +225,9 @@ class TypesetterAgent(BaseAgent):
                 main_tex_path = self._find_main_tex(work_dir)
                 if main_tex_path:
                     logger.info("typesetter.detected_main_tex file=%s", os.path.basename(main_tex_path))
+                    # Flatten .bst/.cls/.sty files to the work_dir root so
+                    # pdflatex/bibtex can find them regardless of zip structure
+                    self._flatten_support_files(work_dir)
                 else:
                     logger.warning("typesetter.no_main_tex_found")
         
@@ -639,25 +666,12 @@ class TypesetterAgent(BaseAgent):
 
         section_file_map: Dict[str, str] = {}
 
-        # Write abstract separately (no \section{} command)
-        if "abstract" in sections and sections["abstract"].strip():
-            abstract_content = sections["abstract"].strip()
-            # Strip any existing \begin{abstract}/\end{abstract} tags
-            abstract_content = re.sub(r'^\\begin\{abstract\}\s*', '', abstract_content)
-            abstract_content = re.sub(r'\s*\\end\{abstract\}$', '', abstract_content)
-            abstract_content = self._apply_citation_style(abstract_content, citation_style)
-            # Escape unescaped % characters
-            abstract_content = re.sub(r'(?<!\\)%', r'\\%', abstract_content)
-
-            abstract_path = os.path.join(sections_dir, "abstract.tex")
-            with open(abstract_path, "w", encoding="utf-8") as f:
-                f.write(abstract_content + "\n")
-            section_file_map["abstract"] = "sections/abstract"
-            logger.info("typesetter.write_section file=sections/abstract.tex chars=%d", len(abstract_content))
-
         # Write body sections in order
         for section_type in order:
             if section_type not in sections or not sections[section_type].strip():
+                continue
+            if section_type in ("abstract", "conclusion"):
+                # Abstract and conclusion are inlined into main.tex directly.
                 continue
 
             content = sections[section_type].strip()
@@ -685,7 +699,7 @@ class TypesetterAgent(BaseAgent):
 
         # Write any remaining sections not in the order list (excluding abstract)
         for section_type, content in sections.items():
-            if section_type == "abstract" or section_type in section_file_map:
+            if section_type in ("abstract", "conclusion") or section_type in section_file_map:
                 continue
             if not content.strip():
                 continue
@@ -814,9 +828,9 @@ class TypesetterAgent(BaseAgent):
         # Step 1: Replace title if provided
         if template_config.paper_title:
             title = template_config.paper_title
-            # Handle standard \title{...} - use lambda to avoid escape issues
+            # Handle \title{...} and \title[short]{full} (Nature/Springer optional arg)
             result = re.sub(
-                r'\\title\{[^}]*\}',
+                r'\\title(?:\[[^\]]*\])?\{[^}]*\}',
                 lambda m: f'\\title{{{title}}}',
                 result
             )
@@ -854,89 +868,88 @@ class TypesetterAgent(BaseAgent):
                 result
             )
         
-        # Step 2: Replace author — clear to empty unless explicitly set
-        authors = template_config.paper_authors or ""
-        result = re.sub(
-            r'\\author\{[^}]*\}',
-            lambda m: f'\\author{{{authors}}}',
-            result
-        )
+        # Step 2: Replace author
+        authors = template_config.paper_authors or "EasyPaper"
+        # Remove all \author variants: \author{...}, \author*[...]{...}, etc.
+        # Handle nested braces from \fnm{}, \sur{} inside author args
+        result = self._replace_all_authors(result, authors)
         
-        # Step 2b: Clear affiliation/institute if present in template
-        # (these are template-specific; clear them unless user provides values)
-        if not template_config.paper_authors:
-            result = re.sub(r'\\affiliation\{[^}]*\}', r'\\affiliation{}', result)
-            result = re.sub(r'\\institute\{[^}]*\}', r'\\institute{}', result)
+        # Step 2b: Clear affiliation/institute/email/equalcont if present
+        result = re.sub(r'\\affil\*?\[[^\]]*\]\{[^}]*\}', '', result)
+        result = re.sub(r'\\affiliation\{[^}]*\}', '', result)
+        result = re.sub(r'\\institute\{[^}]*\}', '', result)
+        result = re.sub(r'\\equalcont\{[^}]*\}', '', result)
+        result = re.sub(r'\\email\{[^}]*\}', '', result)
+        # Remove orphaned \orgname/\orgaddress lines (Nature/Springer affiliation blocks)
+        result = re.sub(r'^[,\s]*\\org(?:name|address|div)\{[^}]*(?:\{[^}]*\}[^}]*)*\}[^\n]*$',
+                        '', result, flags=re.MULTILINE)
+        # Clean up blank lines left behind
+        result = re.sub(r'\n{3,}', '\n\n', result)
         
         # Step 3: Find and replace abstract
         abstract_content = sections.get("abstract", "")
         if abstract_content:
             # Escape unescaped % characters (they start LaTeX comments)
-            # Only escape % that is not already escaped (not preceded by \)
             abstract_content = re.sub(r'(?<!\\)%', r'\\%', abstract_content)
             
-            # Check for existing abstract environment
-            if '\\begin{abstract}' in result:
-                # Replace content between \begin{abstract} and \end{abstract}
-                # Use lambda to avoid backslash escape issues in replacement string
+            has_env = '\\begin{abstract}' in result
+            # Detect \abstract{...} command form (Nature/Springer templates)
+            has_cmd = bool(re.search(r'(?<!\\begin\{)\\abstract\{', result))
+            
+            if has_cmd:
+                # Replace \abstract{...} command content (may span multiple lines)
+                result = self._replace_abstract_command(result, abstract_content)
+            
+            if has_env:
                 result = re.sub(
                     r'\\begin\{abstract\}.*?\\end\{abstract\}',
                     lambda m: f'\\begin{{abstract}}\n{abstract_content}\n\\end{{abstract}}',
                     result,
                     flags=re.DOTALL
                 )
-            else:
-                # No abstract environment, try to add after \maketitle
+                if has_cmd:
+                    # Both forms exist — remove the \abstract{} command to avoid duplication
+                    result = self._remove_abstract_command(result)
+            
+            if not has_env and not has_cmd:
                 if '\\maketitle' in result:
                     result = result.replace(
                         '\\maketitle',
                         f'\\maketitle\n\n\\begin{{abstract}}\n{abstract_content}\n\\end{{abstract}}'
                     )
         
-        # Step 4: Replace content between abstract and end of document
+        # Step 4: Replace ALL template body content with generated content
         body_content = sections.get("body", "")
         if body_content:
-            # Escape unescaped % characters (they start LaTeX comments)
-            # Only escape % that is not already escaped (not preceded by \)
             body_content = re.sub(r'(?<!\\)%', r'\\%', body_content)
-            
-            # Remove any section comment markers that might confuse things
             body_content = re.sub(r'\\% === Section: \w+ ===\n?', '', body_content)
             
-            # Replace ALL content between \end{abstract} and \end{document}
-            # This removes the template's example content BUT preserves bibliography commands
+            # Extract bibliography commands from the template before replacement
+            bib_commands = self._extract_bib_commands(result)
+            
             if '\\end{abstract}' in result and '\\end{document}' in result:
-                # First, extract existing bibliography commands from the template
-                bib_commands = ""
-                bib_style_match = re.search(r'\\bibliographystyle\{[^}]+\}', result)
-                bib_file_match = re.search(r'\\bibliography\{[^}]+\}', result)
-                printbib_match = re.search(r'\\printbibliography', result)
-                
-                if bib_style_match:
-                    bib_commands += bib_style_match.group(0) + "\n"
-                if bib_file_match:
-                    # Replace original bib file with our references.bib
-                    bib_commands += "\\bibliography{references}\n"
-                elif printbib_match:
-                    bib_commands += "\\printbibliography\n"
-                
-                # Use regex to replace everything between \end{abstract} and \end{document}
-                # Then re-add the bibliography commands
                 result = re.sub(
                     r'(\\end\{abstract\}).*?(\\end\{document\})',
                     lambda m: f'{m.group(1)}\n\n{body_content}\n\n{bib_commands}\n{m.group(2)}',
                     result,
                     flags=re.DOTALL
                 )
-            elif '\\maketitle' in result:
-                # Insert after \maketitle (and any abstract we added)
-                if '\\begin{abstract}' not in result:
-                    result = result.replace(
-                        '\\maketitle',
-                        f'\\maketitle\n\n{body_content}'
-                    )
+            elif '\\maketitle' in result and '\\end{document}' in result:
+                # Fallback for templates without \end{abstract} (e.g. Nature \abstract{...})
+                # Find the anchor: after \abstract{...} if present, else after \maketitle
+                abstract_cmd_match = re.search(r'\\abstract\{', result)
+                if abstract_cmd_match:
+                    # Find end of \abstract{...} using brace matching
+                    anchor_end = self._find_brace_end(result, abstract_cmd_match.start() + len('\\abstract'))
+                else:
+                    anchor_end = result.index('\\maketitle') + len('\\maketitle')
+                
+                end_doc_match = re.search(r'\\end\{document\}', result)
+                if end_doc_match:
+                    result = (result[:anchor_end]
+                              + f'\n\n{body_content}\n\n{bib_commands}\n'
+                              + result[end_doc_match.start():])
             else:
-                # Insert after \begin{document}, adding \maketitle if missing
                 if '\\maketitle' not in result:
                     result = result.replace(
                         '\\begin{document}',
@@ -965,6 +978,209 @@ class TypesetterAgent(BaseAgent):
             )
         
         return result
+
+    @staticmethod
+    def _validate_compiled_tex_structure(compiled_tex: str) -> List[str]:
+        """
+        Validate compiled main.tex has non-empty title and abstract.
+        - **Description**:
+            - Checks title command content.
+            - Checks abstract command/environment content.
+
+        - **Args**:
+            - `compiled_tex` (str): Fully injected LaTeX content.
+
+        - **Returns**:
+            - `List[str]`: Validation errors; empty list means pass.
+        """
+        errors: List[str] = []
+
+        title_match = re.search(r'\\title(?:\[[^\]]*\])?\{([^}]*)\}', compiled_tex, flags=re.DOTALL)
+        if not title_match or not title_match.group(1).strip():
+            errors.append("missing_or_empty_title")
+
+        abstract_cmd = re.search(r'\\abstract\{([^}]*)\}', compiled_tex, flags=re.DOTALL)
+        abstract_env = re.search(
+            r'\\begin\{abstract\}(.*?)\\end\{abstract\}',
+            compiled_tex,
+            flags=re.DOTALL,
+        )
+        abstract_text = ""
+        if abstract_cmd:
+            abstract_text = abstract_cmd.group(1)
+        elif abstract_env:
+            abstract_text = abstract_env.group(1)
+        if not abstract_text.strip():
+            errors.append("missing_or_empty_abstract")
+
+        return errors
+
+    @staticmethod
+    def _replace_all_authors(text: str, new_author: str) -> str:
+        """
+        Remove all \\author commands and replace with a single clean one.
+        - **Description**:
+            - Handles simple \\author{...}, \\author*[...]{...\\fnm{}\\sur{}},
+              and multi-line author blocks with nested braces.
+            - Inserts one clean \\author{new_author} at the position of the
+              first original \\author command.
+
+        - **Args**:
+            - `text` (str): LaTeX source
+            - `new_author` (str): Replacement author string
+
+        - **Returns**:
+            - `str`: Text with all author commands replaced
+        """
+        first_pos = None
+        # Find all \author variants with brace-matching for nested content
+        i = 0
+        regions_to_remove = []
+        while i < len(text):
+            # Look for \author (optionally followed by * and/or [...])
+            match = re.search(r'\\author\*?', text[i:])
+            if not match:
+                break
+            start = i + match.start()
+            pos = start + match.end() - match.start()
+            # Skip optional [...]
+            if pos < len(text) and text[pos] == '[':
+                bracket_depth = 1
+                pos += 1
+                while pos < len(text) and bracket_depth > 0:
+                    if text[pos] == '[':
+                        bracket_depth += 1
+                    elif text[pos] == ']':
+                        bracket_depth -= 1
+                    pos += 1
+            # Match required {...} with nested brace support
+            if pos < len(text) and text[pos] == '{':
+                brace_depth = 1
+                pos += 1
+                while pos < len(text) and brace_depth > 0:
+                    if text[pos] == '{':
+                        brace_depth += 1
+                    elif text[pos] == '}':
+                        brace_depth -= 1
+                    pos += 1
+                if first_pos is None:
+                    first_pos = start
+                regions_to_remove.append((start, pos))
+            i = pos if pos > start else start + 1
+
+        if not regions_to_remove:
+            return text
+
+        # Remove regions in reverse order to preserve indices
+        for start, end in reversed(regions_to_remove):
+            text = text[:start] + text[end:]
+
+        # Insert the new author at the first original position
+        replacement = f'\\author{{{new_author}}}'
+        text = text[:first_pos] + replacement + text[first_pos:]
+        return text
+
+    @staticmethod
+    def _replace_abstract_command(text: str, new_content: str) -> str:
+        """
+        Replace the content inside \\abstract{...} command (brace-matched).
+        - **Description**:
+            - Handles nested braces and multi-line content.
+
+        - **Args**:
+            - `text` (str): LaTeX source
+            - `new_content` (str): New abstract text
+
+        - **Returns**:
+            - `str`: Text with abstract command content replaced
+        """
+        pattern_start = '\\abstract{'
+        start_idx = text.find(pattern_start)
+        if start_idx == -1:
+            return text
+        brace_count = 1
+        content_start = start_idx + len(pattern_start)
+        i = content_start
+        while i < len(text) and brace_count > 0:
+            if text[i] == '{':
+                brace_count += 1
+            elif text[i] == '}':
+                brace_count -= 1
+            i += 1
+        if brace_count == 0:
+            return text[:start_idx] + f'\\abstract{{{new_content}}}' + text[i:]
+        return text
+
+    @staticmethod
+    def _remove_abstract_command(text: str) -> str:
+        """
+        Remove \\abstract{...} command entirely (brace-matched).
+        - **Description**:
+            - Used when both \\abstract{} and \\begin{abstract} exist to
+              eliminate duplication.
+
+        - **Args**:
+            - `text` (str): LaTeX source
+
+        - **Returns**:
+            - `str`: Text with abstract command removed
+        """
+        pattern_start = '\\abstract{'
+        start_idx = text.find(pattern_start)
+        if start_idx == -1:
+            return text
+        brace_count = 1
+        i = start_idx + len(pattern_start)
+        while i < len(text) and brace_count > 0:
+            if text[i] == '{':
+                brace_count += 1
+            elif text[i] == '}':
+                brace_count -= 1
+            i += 1
+        if brace_count == 0:
+            return text[:start_idx] + text[i:]
+        return text
+
+    @staticmethod
+    def _extract_bib_commands(text: str) -> str:
+        """
+        Extract and normalise bibliography commands from template text.
+        - **Returns**:
+            - `str`: Bibliography commands with file name replaced by 'references'.
+        """
+        bib_commands = ""
+        bib_style_match = re.search(r'\\bibliographystyle\{[^}]+\}', text)
+        bib_file_match = re.search(r'\\bibliography\{[^}]+\}', text)
+        printbib_match = re.search(r'\\printbibliography', text)
+        if bib_style_match:
+            bib_commands += bib_style_match.group(0) + "\n"
+        if bib_file_match:
+            bib_commands += "\\bibliography{references}\n"
+        elif printbib_match:
+            bib_commands += "\\printbibliography\n"
+        return bib_commands
+
+    @staticmethod
+    def _find_brace_end(text: str, open_brace_pos: int) -> int:
+        """
+        Find the position just after the closing brace matching the one at open_brace_pos.
+        - **Args**:
+            - `text` (str): Source text.
+            - `open_brace_pos` (int): Index of the opening '{'.
+        - **Returns**:
+            - `int`: Index just past the matching '}'.  Falls back to open_brace_pos+1.
+        """
+        depth = 0
+        i = open_brace_pos
+        while i < len(text):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        return open_brace_pos + 1
 
     async def inject_template(self, state: TypesetterAgentState) -> Dict[str, Any]:
         """
@@ -999,6 +1215,8 @@ class TypesetterAgent(BaseAgent):
         # Create default template_config if not provided
         if template_config is None:
             template_config = TemplateConfig()
+        if not (template_config.paper_title or "").strip():
+            raise ValueError("typesetter.inject_template requires non-empty template_config.paper_title")
         
         # Determine final main.tex path
         final_main_tex = os.path.join(work_dir, "main.tex")
@@ -1048,10 +1266,26 @@ class TypesetterAgent(BaseAgent):
             
             body_input_text = "\n\n".join(input_commands)
             
-            # Abstract \input command
-            abstract_input = ""
-            if "abstract" in section_file_map:
-                abstract_input = f"\\input{{{section_file_map['abstract']}}}"
+            # Abstract is inlined into main.tex (do not use sections/abstract.tex)
+            abstract_inline = ""
+            if sections_dict.get("abstract", "").strip():
+                abstract_inline = sections_dict["abstract"].strip()
+                abstract_inline = re.sub(r'^\\begin\{abstract\}\s*', '', abstract_inline)
+                abstract_inline = re.sub(r'\s*\\end\{abstract\}$', '', abstract_inline)
+                abstract_inline = self._apply_citation_style(abstract_inline, template_config.citation_style)
+                abstract_inline = re.sub(r'(?<!\\)%', r'\\%', abstract_inline).strip()
+            if not abstract_inline:
+                raise ValueError("typesetter.inject_template missing abstract content in multi-file mode")
+
+            # Conclusion is also inlined into main.tex (do not use sections/conclusion.tex)
+            conclusion_inline = ""
+            if sections_dict.get("conclusion", "").strip():
+                conclusion_text = sections_dict["conclusion"].strip()
+                conclusion_text = self._strip_leading_section_command(conclusion_text)
+                conclusion_text = self._apply_citation_style(conclusion_text, template_config.citation_style)
+                conclusion_text = re.sub(r'(?<!\\)%', r'\\%', conclusion_text)
+                conclusion_title = section_titles.get("conclusion", "Conclusion") if section_titles else "Conclusion"
+                conclusion_inline = f"\\section{{{conclusion_title}}}\n\n{conclusion_text}"
             
             # Inject into template
             if main_tex_path and os.path.exists(main_tex_path):
@@ -1062,12 +1296,17 @@ class TypesetterAgent(BaseAgent):
                 # Build a sections dict compatible with _smart_inject_content
                 # but using \input commands instead of inline content
                 input_sections = {
-                    "abstract": abstract_input,
-                    "body": body_input_text,
+                    "abstract": abstract_inline,
+                    "body": "\n\n".join([p for p in [body_input_text, conclusion_inline] if p.strip()]),
                 }
                 compiled_tex = self._smart_inject_content(
                     template_content, input_sections, template_config, bib_entries
                 )
+                structure_errors = self._validate_compiled_tex_structure(compiled_tex)
+                if structure_errors:
+                    raise ValueError(
+                        f"typesetter.inject_template structure validation failed: {structure_errors}"
+                    )
                 
                 # Copy template directory files if needed
                 if main_tex_path != final_main_tex:
@@ -1084,9 +1323,9 @@ class TypesetterAgent(BaseAgent):
                 preamble = self._build_preamble_from_config(template_config)
                 
                 full_content = ""
-                if abstract_input:
-                    full_content = f"\\begin{{abstract}}\n{abstract_input}\n\\end{{abstract}}\n\n"
-                full_content += body_input_text
+                if abstract_inline:
+                    full_content = f"\\begin{{abstract}}\n{abstract_inline}\n\\end{{abstract}}\n\n"
+                full_content += "\n\n".join([p for p in [body_input_text, conclusion_inline] if p.strip()])
                 
                 bib_style = template_config.bib_style or "plain"
                 template = Template(MAIN_TEX_TEMPLATE)
@@ -1096,6 +1335,11 @@ class TypesetterAgent(BaseAgent):
                     has_bibliography=len(bib_entries) > 0,
                     bib_style=bib_style,
                 )
+                structure_errors = self._validate_compiled_tex_structure(compiled_tex)
+                if structure_errors:
+                    raise ValueError(
+                        f"typesetter.inject_template structure validation failed: {structure_errors}"
+                    )
             
             # Write main.tex
             with open(final_main_tex, "w", encoding="utf-8") as f:

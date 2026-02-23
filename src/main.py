@@ -32,6 +32,7 @@ async def lifespan(app: FastAPI):
         config.agents,
         skill_registry=skill_registry,
         global_tools_config=config.tools,
+        vlm_service_config=config.vlm_service,
     )
     # Register agent routers
     register_agent_routers(app, app.state.agents)

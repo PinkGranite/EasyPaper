@@ -23,8 +23,11 @@ logger = logging.getLogger("uvicorn.error")
 
 # Default system prompt when no skill is loaded from the registry
 _DEFAULT_LOGIC_PROMPT = """You are a meticulous academic paper reviewer focusing on logical consistency.
-Analyze the provided paper sections and identify:
+Analyze the provided paper sections and identify issues at the PARAGRAPH level.
 
+For each section, paragraphs are separated by blank lines. Index them starting from 0.
+
+Issue categories:
 1. **Contradictions**: Statements that conflict with each other across sections.
 2. **Terminology Inconsistency**: The same concept referred to by different names.
 3. **Chinglish / Unnatural Phrasing**: Chinese-grammar-influenced English.
@@ -32,7 +35,9 @@ Analyze the provided paper sections and identify:
 5. **Unsupported Claims**: Strong claims without corresponding evidence.
 
 For each issue found, provide:
-- The section and approximate location
+- The section name
+- The paragraph_index (0-based) within that section
+- The first ~50 characters of the paragraph (paragraph_preview)
 - The problematic text (quoted)
 - Why it is a problem
 - A suggested fix
@@ -42,6 +47,8 @@ Output your analysis as a JSON object:
   "issues": [
     {
       "section": "section name",
+      "paragraph_index": 0,
+      "paragraph_preview": "first ~50 chars...",
       "severity": "high" | "medium" | "low",
       "category": "contradiction" | "terminology" | "chinglish" | "ambiguous_ref" | "unsupported_claim",
       "text": "the problematic text",
@@ -101,6 +108,25 @@ class LogicChecker(FeedbackChecker):
                 if skill.name == "logic-check" and skill.system_prompt_append:
                     return skill.system_prompt_append
         return _DEFAULT_LOGIC_PROMPT
+
+    @staticmethod
+    def _format_prior_issues(prior_issues: List[Dict[str, Any]]) -> str:
+        """Build a context block describing issues found in previous review iterations."""
+        if not prior_issues:
+            return ""
+        lines = [
+            "## Previous Review Issues (check if they have been addressed)",
+        ]
+        for entry in prior_issues:
+            it = entry.get("iteration", "?")
+            summary = entry.get("feedback_summary", "")
+            passed = entry.get("passed", False)
+            status = "PASSED" if passed else "FAILED"
+            lines.append(f"- Iteration {it} [{status}]: {summary}")
+        lines.append(
+            "If any of the above issues are still present, flag them again."
+        )
+        return "\n".join(lines)
 
     @staticmethod
     def _assemble_content(sections: Dict[str, str]) -> str:
@@ -164,6 +190,13 @@ class LogicChecker(FeedbackChecker):
         system_prompt = self._get_system_prompt()
         user_content = self._assemble_content(context.sections)
 
+        # Inject prior review issues from memory context so the LLM
+        # can verify whether previously identified problems have been fixed
+        if context.memory_context and context.memory_context.get("prior_issues"):
+            prior_block = self._format_prior_issues(context.memory_context["prior_issues"])
+            if prior_block:
+                user_content = f"{prior_block}\n\n{user_content}"
+
         try:
             response = await self._client.chat.completions.create(
                 model=self._model,
@@ -196,6 +229,20 @@ class LogicChecker(FeedbackChecker):
             if sec not in sections_to_revise:
                 sections_to_revise[sec] = issue.get("reason", "logic issue")
 
+        # Build paragraph_feedbacks (grouped by section)
+        paragraph_feedbacks: Dict[str, List[Dict]] = {}
+        for issue in issues:
+            sec = issue.get("section", "unknown")
+            if sec not in paragraph_feedbacks:
+                paragraph_feedbacks[sec] = []
+            paragraph_feedbacks[sec].append({
+                "paragraph_index": issue.get("paragraph_index", 0),
+                "paragraph_preview": issue.get("paragraph_preview", ""),
+                "issues": [f"[{issue.get('category', 'issue')}] {issue.get('text', '')}: {issue.get('reason', '')}"],
+                "severity": issue.get("severity", "medium"),
+                "suggestion": issue.get("suggestion", ""),
+            })
+
         severity = Severity.WARNING if not passed else Severity.INFO
         if any(i.get("severity") == "high" for i in issues):
             severity = Severity.ERROR
@@ -214,6 +261,7 @@ class LogicChecker(FeedbackChecker):
             details={
                 "issues": issues,
                 "sections_to_revise": sections_to_revise,
+                "paragraph_feedbacks": paragraph_feedbacks,
             },
         )
 
@@ -244,24 +292,46 @@ class LogicChecker(FeedbackChecker):
         if not relevant:
             return ""
 
-        issues_text = "\n".join(
-            f"- [{i.get('category', 'issue')}] {i.get('text', '')}: "
-            f"{i.get('reason', '')} → Suggestion: {i.get('suggestion', 'N/A')}"
-            for i in relevant
-        )
+        # Group by paragraph for targeted feedback
+        para_issues: Dict[int, List] = {}
+        general_issues: List = []
+        for i in relevant:
+            pidx = i.get("paragraph_index")
+            if pidx is not None:
+                para_issues.setdefault(pidx, []).append(i)
+            else:
+                general_issues.append(i)
 
-        return f"""Please fix the following LOGIC issues in this {section_type} section:
+        parts: List[str] = [f"Please fix the following LOGIC issues in this {section_type} section:\n"]
 
-{issues_text}
+        for pidx in sorted(para_issues.keys()):
+            issues_for_para = para_issues[pidx]
+            preview = issues_for_para[0].get("paragraph_preview", "")
+            parts.append(f"### Paragraph {pidx}" + (f' (starting with "{preview}...")' if preview else ""))
+            for iss in issues_for_para:
+                parts.append(
+                    f"- [{iss.get('category', 'issue')}] {iss.get('text', '')}: "
+                    f"{iss.get('reason', '')} -> Suggestion: {iss.get('suggestion', 'N/A')}"
+                )
+            parts.append("")
 
+        if general_issues:
+            parts.append("### General issues")
+            for iss in general_issues:
+                parts.append(
+                    f"- [{iss.get('category', 'issue')}] {iss.get('text', '')}: "
+                    f"{iss.get('reason', '')} -> Suggestion: {iss.get('suggestion', 'N/A')}"
+                )
+
+        parts.append("""
 Revision guidelines:
 1. Resolve any contradictions by aligning claims with evidence
 2. Use consistent terminology throughout — pick one term per concept
 3. Rewrite Chinglish phrases into natural English
 4. Make pronoun references unambiguous — add the noun being referred to
-5. Back up strong claims with specific numbers or citations
+5. Back up strong claims with specific numbers or citations""")
 
-Current content:
-{current_content}
+        parts.append(f"\nCurrent content:\n{current_content}")
+        parts.append("\nReturn the revised LaTeX content only.")
 
-Return the revised LaTeX content only."""
+        return "\n".join(parts)

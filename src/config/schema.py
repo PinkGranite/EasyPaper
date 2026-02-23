@@ -66,9 +66,18 @@ class VLMReviewConfig(BaseModel):
     max_blank_area: float = 0.15
 
 
+class VLMServiceConfig(BaseModel):
+    """Shared VLM service configuration (used by Planner and VLMReviewAgent)."""
+    enabled: bool = True
+    provider: str = "openai"
+    model: Optional[str] = None
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+
+
 class AgentConfig(BaseModel):
     name: str
-    model: ModelConfig
+    model: Optional[ModelConfig] = None
     max_tokens: int = 2000
     timeout: int = 20
     log_level: str = "INFO"
@@ -91,3 +100,4 @@ class AppConfig(BaseModel):
     agents: List[AgentConfig]
     skills: Optional[SkillsConfig] = None
     tools: Optional[ToolsConfig] = None
+    vlm_service: Optional[VLMServiceConfig] = None

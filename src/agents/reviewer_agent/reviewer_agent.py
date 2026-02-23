@@ -39,10 +39,9 @@ class ReviewerAgent(BaseAgent):
         - Generates revision guidance
     """
     
-    # Default checkers to register
-    DEFAULT_CHECKERS: List[Type[FeedbackChecker]] = [
-        WordCountChecker,
-    ]
+    # Default checkers — WordCountChecker removed; word count is now
+    # an informational metric only, not a hard constraint.
+    DEFAULT_CHECKERS: List[Type[FeedbackChecker]] = []
     
     def __init__(
         self,
@@ -189,23 +188,95 @@ class ReviewerAgent(BaseAgent):
             for c in self._checkers
         ]
     
+    async def answer(self, question: str, memory=None) -> str:
+        """
+        Quick consultation — answer a writing quality or consistency question.
+        - **Description**:
+            - Uses a lightweight LLM call with focused context extracted
+              from SessionMemory.
+            - Designed to be called via AskTool during WriterAgent's
+              ReAct loop.
+
+        - **Args**:
+            - `question` (str): The question to answer
+            - `memory` (SessionMemory, optional): Session memory for context
+
+        - **Returns**:
+            - `answer` (str): Brief assessment or guidance
+        """
+        context_parts: List[str] = []
+        if memory is not None:
+            for stype, content in getattr(memory, "generated_sections", {}).items():
+                if content.strip():
+                    preview = content[:600] + ("..." if len(content) > 600 else "")
+                    context_parts.append(f"[{stype}]: {preview}")
+            for rec in getattr(memory, "review_history", [])[-2:]:
+                context_parts.append(
+                    f"[Review iter {rec.iteration}]: {rec.feedback_summary}"
+                )
+
+        context_block = "\n".join(context_parts) if context_parts else "No context available."
+
+        try:
+            llm_client = AsyncOpenAI(
+                api_key=self.config.api_key,
+                base_url=self.config.base_url,
+            )
+            response = await llm_client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an academic paper reviewer providing brief, "
+                            "focused feedback. Answer the question concisely based "
+                            "on the provided context. Keep your response under 200 words."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Paper context:\n{context_block}\n\n"
+                            f"Question: {question}"
+                        ),
+                    },
+                ],
+                temperature=0.3,
+                max_tokens=300,
+            )
+            return response.choices[0].message.content or "No answer generated."
+        except Exception as e:
+            logger.error("reviewer.answer error: %s", e)
+            return f"Could not answer: {e}"
+
     async def review(
         self,
         context: ReviewContext,
         iteration: int = 0,
+        memory=None,
     ) -> ReviewResult:
         """
-        Run all enabled checkers on the context
-        
+        Run all enabled checkers on the context.
+
         - **Args**:
             - `context` (ReviewContext): Review context with paper data
             - `iteration` (int): Current iteration number
-            
+            - `memory` (SessionMemory, optional): Shared session memory.
+              When provided, checkers can read prior issues and plan
+              details directly instead of relying on serialized snapshots.
+
         - **Returns**:
             - `ReviewResult`: Aggregated review result
         """
+        # Inject memory into context for checkers that support it
+        if memory is not None and hasattr(context, "memory_context"):
+            if context.memory_context is None:
+                from ..shared.session_memory import SessionMemory
+                if isinstance(memory, SessionMemory):
+                    context.memory_context = memory.to_review_context_dict()
+
         result = ReviewResult(iteration=iteration)
-        
+
         logger.info(
             "reviewer.review iteration=%d sections=%s total_words=%d",
             iteration,

@@ -73,20 +73,9 @@ agents:
 #     timeout: 10
 
   - name: vlm_review
-    model:
-      # Must be a vision-capable model
-      model_name: openai/gpt-4o
-      api_key: YOUR_OPENROUTER_KEY
-      base_url: https://openrouter.ai/api/v1
+    # VLM provider is configured via vlm_service below; only agent behavior here
     vlm_review_config:
       enabled: true
-      provider: openai
-      # Optional: override model config
-      # vlm_model: google/gemini-2.0-flash-exp:free
-      # vlm_model: anthropic/claude-3.5-sonnet
-      # vlm_model: openai/gpt-4o
-      # vlm_api_key: YOUR_VLM_API_KEY
-      # vlm_base_url: https://openrouter.ai/api/v1
       render_dpi: 150
       max_pages_to_analyze: 12
       check_overflow: true
@@ -94,3 +83,11 @@ agents:
       check_layout: false
       min_fill_percentage: 0.85
       max_blank_area: 0.15
+
+# Shared VLM service (PlannerAgent + VLMReviewAgent share the same provider)
+vlm_service:
+  enabled: true
+  provider: openai
+  model: openai/gpt-4o
+  api_key: YOUR_OPENROUTER_KEY
+  base_url: https://openrouter.ai/api/v1

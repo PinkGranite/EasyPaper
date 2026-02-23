@@ -16,6 +16,7 @@ from langgraph.graph import StateGraph, END
 from typing_extensions import TypedDict
 
 from ..base import BaseAgent
+from ..shared.vlm_service import VLMService
 from ...config.schema import ModelConfig
 from .models import (
     VLMReviewRequest,
@@ -124,23 +125,27 @@ class VLMReviewAgent(BaseAgent):
         vlm_model: Optional[str] = None,
         vlm_base_url: Optional[str] = None,
         render_dpi: int = 150,
+        vlm_service: Optional[VLMService] = None,
         **kwargs
     ):
         """
-        Initialize VLM Review Agent
-        
-        Args:
-            model_config: Model configuration (from config file)
-            vlm_review_config: VLM Review specific config (from config file)
-            vlm_provider: VLM provider name (openai, claude, qwen)
-            vlm_api_key: API key for VLM provider
-            vlm_model: Model name to use
-            vlm_base_url: Custom base URL (for OpenRouter, etc.)
-            render_dpi: DPI for PDF rendering
-            **kwargs: Additional options
+        Initialize VLM Review Agent.
+
+        - **Args**:
+            - `model_config` (ModelConfig, optional): Model configuration
+            - `vlm_review_config` (Any, optional): VLM Review specific config
+            - `vlm_provider` (str): VLM provider name (openai, claude, qwen)
+            - `vlm_api_key` (str, optional): API key for VLM provider
+            - `vlm_model` (str, optional): Model name to use
+            - `vlm_base_url` (str, optional): Custom base URL
+            - `render_dpi` (int): DPI for PDF rendering
+            - `vlm_service` (VLMService, optional): Shared VLM service instance.
+              When provided, the agent reuses its provider instead of creating one.
+            - `**kwargs`: Additional options
         """
         self.model_config = model_config
         self.vlm_review_config = vlm_review_config
+        self._vlm_service = vlm_service
         
         # Read from vlm_review_config if available, otherwise use defaults
         if vlm_review_config:
@@ -188,7 +193,7 @@ class VLMReviewAgent(BaseAgent):
         self.pdf_renderer = PDFRenderer(dpi=self.render_dpi)
         self.page_counter = PageCounter()
         
-        # VLM provider (lazy init)
+        # VLM provider (lazy init — shared VLMService takes priority)
         self._vlm: Optional[VLMProvider] = None
         
         # Build LangGraph workflow
@@ -205,22 +210,22 @@ class VLMReviewAgent(BaseAgent):
     
     @property
     def vlm(self) -> VLMProvider:
-        """Get or create VLM provider"""
+        """Get or create VLM provider. Reuses shared VLMService provider when available."""
         if self._vlm is None:
-            if not self.vlm_api_key:
-                raise ValueError(f"API key required for VLM provider: {self.vlm_provider_name}")
-            
-            # Build kwargs with base_url if provided
-            create_kwargs = dict(self.kwargs)
-            if self.vlm_base_url:
-                create_kwargs["base_url"] = self.vlm_base_url
-            
-            self._vlm = VLMFactory.create(
-                provider=self.vlm_provider_name,
-                api_key=self.vlm_api_key,
-                model=self.vlm_model,
-                **create_kwargs
-            )
+            if self._vlm_service is not None:
+                self._vlm = self._vlm_service._get_provider()
+            else:
+                if not self.vlm_api_key:
+                    raise ValueError(f"API key required for VLM provider: {self.vlm_provider_name}")
+                create_kwargs = dict(self.kwargs)
+                if self.vlm_base_url:
+                    create_kwargs["base_url"] = self.vlm_base_url
+                self._vlm = VLMFactory.create(
+                    provider=self.vlm_provider_name,
+                    api_key=self.vlm_api_key,
+                    model=self.vlm_model,
+                    **create_kwargs
+                )
         return self._vlm
     
     def _build_graph(self) -> StateGraph:
@@ -500,6 +505,7 @@ class VLMReviewAgent(BaseAgent):
             overflow_detected=overflow_detected,
             underfill_detected=underfill_detected,
             issues=issues,
+            prior_vlm_issues=request.prior_vlm_issues,
         )
         
         result = VLMReviewResult(
@@ -621,11 +627,19 @@ class VLMReviewAgent(BaseAgent):
         overflow_pages: float,
         page_analyses: List[PageAnalysis],
     ) -> Dict[str, SectionAdvice]:
-        """Generate section-level advice based on analysis"""
+        """Generate section-level advice based on analysis and plan context."""
         advice = {}
         
         if not request.sections_info:
             return advice
+
+        # Enrich sections_info with plan targets when available
+        if request.plan_context and request.plan_context.get("plan_sections"):
+            for ps in request.plan_context["plan_sections"]:
+                stype = ps.get("section_type", "")
+                if stype in request.sections_info:
+                    request.sections_info[stype]["plan_estimated_words"] = ps.get("estimated_words", 0)
+                    request.sections_info[stype]["plan_num_paragraphs"] = ps.get("num_paragraphs", 0)
         
         sections_info = request.sections_info
         words_per_page = WORDS_PER_PAGE.get(request.template_type, 800)
@@ -748,8 +762,9 @@ class VLMReviewAgent(BaseAgent):
         overflow_detected: bool,
         underfill_detected: bool,
         issues: List[LayoutIssue],
+        prior_vlm_issues: Optional[List[str]] = None,
     ) -> str:
-        """Generate human-readable summary"""
+        """Generate human-readable summary, noting any prior VLM issues."""
         parts = []
         
         parts.append(f"PDF has {total_pages} total pages (body limit: {page_limit}).")
@@ -768,6 +783,11 @@ class VLMReviewAgent(BaseAgent):
         
         if critical or high or medium:
             parts.append(f"Issues found: {critical} critical, {high} high, {medium} medium.")
+
+        if prior_vlm_issues:
+            still = [p for p in prior_vlm_issues if any(p.lower() in i.description.lower() for i in issues)]
+            if still:
+                parts.append(f"Recurring issues from prior review: {len(still)}.")
         
         return " ".join(parts)
     
@@ -775,16 +795,30 @@ class VLMReviewAgent(BaseAgent):
     # Public API
     # =========================================================================
     
-    async def review(self, request: VLMReviewRequest) -> VLMReviewResult:
+    async def review(self, request: VLMReviewRequest, memory=None) -> VLMReviewResult:
         """
-        Review a PDF file
-        
-        Args:
-            request: VLMReviewRequest with PDF path and options
-            
-        Returns:
-            VLMReviewResult with analysis and recommendations
+        Review a PDF file.
+
+        - **Args**:
+            - `request` (VLMReviewRequest): PDF path and review options
+            - `memory` (SessionMemory, optional): Shared memory for plan
+              context and prior VLM issues.
+
+        - **Returns**:
+            - `VLMReviewResult`: Analysis and recommendations
         """
+        # Inject memory-derived context into request when available
+        if memory is not None:
+            if request.plan_context is None:
+                request.plan_context = memory.to_review_context_dict()
+            if request.prior_vlm_issues is None:
+                prior: list = []
+                for rec in getattr(memory, "review_history", []):
+                    if "vlm" in rec.reviewer.lower() and rec.feedback_summary:
+                        prior.append(rec.feedback_summary)
+                if prior:
+                    request.prior_vlm_issues = prior
+
         print(f"[VLMReview] Starting review: {request.pdf_path}")
         print(f"[VLMReview] Page limit: {request.page_limit}, Template: {request.template_type}")
         

@@ -1,12 +1,14 @@
 """
 Prompt Compiler - Shared prompt generation utilities
 - **Description**:
-    - Compiles SimpleSectionInput/SynthesisSectionInput into LLM prompts
+    - Compiles section plans into LLM prompts
+    - Uses paragraph-level structure from PaperPlan
     - Provides section-specific prompt templates
     - Used by both Commander Agent and MetaData Agent
 """
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
 import json
+import os
 
 if TYPE_CHECKING:
     from ...skills.models import WritingSkill
@@ -23,7 +25,7 @@ def _inject_skill_constraints(
     - **Args**:
         - `prompt_parts` (list): Mutable list of prompt segments to append to
         - `active_skills` (List[WritingSkill] | None): Skills loaded from the registry
-        - `section_type` (str): Current section being written (used for matching)
+        - `section_type` (str): Current section being written
     """
     if not active_skills:
         return
@@ -38,9 +40,6 @@ def _inject_skill_constraints(
         )
         if constraints:
             prompt_parts.append(f"\n## Writing Style Constraints\n{constraints}")
-
-# Import models (will be available after section_models.py is updated)
-# Using forward references to avoid circular imports
 
 
 # =============================================================================
@@ -110,6 +109,189 @@ This section should:
 
 
 # =============================================================================
+# Paragraph-level writing structure
+# =============================================================================
+
+def _format_paragraph_guidance(section_plan: Any) -> str:
+    """
+    Format paragraph-level writing guidance from a SectionPlan.
+
+    - **Args**:
+        - `section_plan`: SectionPlan object with paragraphs list
+
+    - **Returns**:
+        - `str`: Formatted paragraph guidance for the LLM prompt
+    """
+    paragraphs = getattr(section_plan, "paragraphs", None)
+    if not paragraphs:
+        # Backward-compat: fall back to key_points + target_words
+        parts = []
+        key_points = getattr(section_plan, "key_points", None)
+        if callable(key_points):
+            key_points = None
+        if key_points:
+            points_str = "\n".join(f"- {p}" for p in key_points)
+            parts.append(f"**Key Points to Cover**:\n{points_str}")
+        refs = getattr(section_plan, "references_to_cite", None)
+        if callable(refs):
+            refs = None
+        if refs:
+            parts.append(f"**References to Cite**: {', '.join(refs)}")
+        guidance = getattr(section_plan, "writing_guidance", "")
+        if guidance:
+            parts.append(f"**Writing Guidance**: {guidance}")
+        return "\n".join(parts) if parts else ""
+
+    n = len(paragraphs)
+    total_sentences = sum(getattr(p, "approx_sentences", 5) for p in paragraphs)
+
+    lines = [f"Write this section with **{n} paragraphs** (~{total_sentences} sentences total):\n"]
+
+    for i, para in enumerate(paragraphs, 1):
+        role = getattr(para, "role", "evidence")
+        sents = getattr(para, "approx_sentences", 5)
+        kp = getattr(para, "key_point", "")
+        supporting = getattr(para, "supporting_points", [])
+        refs = getattr(para, "references_to_cite", [])
+        fig_refs = getattr(para, "figures_to_reference", [])
+        tbl_refs = getattr(para, "tables_to_reference", [])
+
+        lines.append(f"**Paragraph {i}** (role: {role}, ~{sents} sentences):")
+        if kp:
+            lines.append(f"  - Key point: {kp}")
+        for sp in supporting:
+            lines.append(f"  - Supporting: {sp}")
+        if refs:
+            lines.append(f"  - Cite: {', '.join(refs)}")
+        if fig_refs:
+            lines.append(f"  - Reference figures: {', '.join(fig_refs)}")
+        if tbl_refs:
+            lines.append(f"  - Reference tables: {', '.join(tbl_refs)}")
+        lines.append("")
+
+    guidance = getattr(section_plan, "writing_guidance", "")
+    if guidance:
+        lines.append(f"**Writing Guidance**: {guidance}")
+
+    return "\n".join(lines)
+
+
+def _format_figure_placement_guidance(section_plan: Any, figures: List[Any]) -> str:
+    """
+    Format figure placement guidance using FigurePlacement semantics.
+
+    - **Args**:
+        - `section_plan`: SectionPlan with figures (FigurePlacement list)
+        - `figures`: Available FigureSpec objects
+
+    - **Returns**:
+        - `str`: Formatted figure guidance for the prompt
+    """
+    placements = getattr(section_plan, "figures", None)
+    if not placements:
+        return ""
+
+    figure_map = {}
+    for fig in (figures or []):
+        fig_id = fig.id if hasattr(fig, "id") else fig.get("id", "")
+        if fig_id:
+            figure_map[fig_id] = fig
+
+    parts = ["\n## Figures to DEFINE in this section"]
+    parts.append("**CREATE the complete figure environment for each figure below.**\n")
+
+    for fp in placements:
+        fig_id = fp.figure_id
+        fig = figure_map.get(fig_id)
+        if not fig:
+            continue
+
+        caption = fig.caption if hasattr(fig, "caption") else fig.get("caption", "")
+        desc = fig.description if hasattr(fig, "description") else fig.get("description", "")
+        file_path = fig.file_path if hasattr(fig, "file_path") else fig.get("file_path", "")
+        wide = fp.is_wide
+
+        filename = os.path.basename(file_path) if file_path else f"{fig_id.replace('fig:', '')}.pdf"
+        env_name = "figure*" if wide else "figure"
+        width = "\\\\textwidth" if wide else "0.9\\\\linewidth"
+
+        parts.append(f"- **{fig_id}**: {caption}")
+        if desc:
+            parts.append(f"  Description: {desc}")
+        if fp.message:
+            parts.append(f"  Message: {fp.message}")
+        if fp.caption_guidance:
+            parts.append(f"  Caption guidance: {fp.caption_guidance}")
+        if wide:
+            parts.append(f"  **Note: WIDE figure - use {env_name} to span both columns.**")
+        parts.append(f"  Position: {fp.position_hint} in the section")
+        parts.append(f"  **Required LaTeX:**")
+        parts.append(f"  ```latex")
+        parts.append(f"  \\\\begin{{{env_name}}}[t]")
+        parts.append(f"  \\\\centering")
+        parts.append(f"  \\\\includegraphics[width={width}]{{figures/{filename}}}")
+        parts.append(f"  \\\\caption{{{caption}}}\\\\label{{{fig_id}}}")
+        parts.append(f"  \\\\end{{{env_name}}}")
+        parts.append(f"  ```\n")
+
+    return "\n".join(parts)
+
+
+def _format_table_placement_guidance(
+    section_plan: Any,
+    tables: List[Any],
+    converted_tables: Optional[Dict[str, str]] = None,
+) -> str:
+    """Format table placement guidance using TablePlacement semantics."""
+    placements = getattr(section_plan, "tables", None)
+    if not placements:
+        return ""
+
+    table_map = {}
+    for tbl in (tables or []):
+        tbl_id = tbl.id if hasattr(tbl, "id") else tbl.get("id", "")
+        if tbl_id:
+            table_map[tbl_id] = tbl
+
+    _converted = converted_tables or {}
+    parts = ["\n## Tables to DEFINE in this section"]
+    parts.append("**Include the complete table environment for each table below.**\n")
+
+    for tp in placements:
+        tbl_id = tp.table_id
+        tbl = table_map.get(tbl_id)
+        if not tbl:
+            continue
+
+        caption = tbl.caption if hasattr(tbl, "caption") else tbl.get("caption", "")
+        desc = tbl.description if hasattr(tbl, "description") else tbl.get("description", "")
+        wide = tp.is_wide
+        env_name = "table*" if wide else "table"
+
+        parts.append(f"- **{tbl_id}**: {caption}")
+        if desc:
+            parts.append(f"  Description: {desc}")
+        if tp.message:
+            parts.append(f"  Message: {tp.message}")
+        if wide:
+            parts.append(f"  **Note: WIDE table - use {env_name} to span both columns.**")
+        parts.append(f"  Position: {tp.position_hint} in the section")
+
+        if tbl_id in _converted:
+            parts.append(f"  **Required LaTeX (include this exact table):**")
+            parts.append(f"  ```latex")
+            parts.append(f"  {_converted[tbl_id]}")
+            parts.append(f"  ```\n")
+        else:
+            content = tbl.content if hasattr(tbl, "content") else tbl.get("content", "")
+            if content:
+                parts.append(f"  Data:\n  {content[:500]}")
+            parts.append(f"  **Required: Create \\\\begin{{{env_name}}}...\\\\end{{{env_name}}} with \\\\label{{{tbl_id}}}**\n")
+
+    return "\n".join(parts)
+
+
+# =============================================================================
 # Prompt Compilation Functions
 # =============================================================================
 
@@ -126,117 +308,101 @@ def compile_section_prompt(
     active_skills: Optional[List["WritingSkill"]] = None,
 ) -> str:
     """
-    Compile a prompt for section generation
-    
-    Args:
-        section_type: Type of section (introduction, method, etc.)
-        thesis: Core thesis/theme of the section
-        content_points: Key points to express
-        references: Available references
-        figures: Available figures
-        tables: Available tables
-        word_limit: Optional word limit
-        style_guide: Target venue style
-        intro_context: Introduction content for context (body sections)
-    
-    Returns:
-        Compiled prompt string for LLM
+    Compile a prompt for section generation (generic fallback).
+
+    - **Args**:
+        - `section_type` (str): Type of section
+        - `thesis` (str): Core thesis/theme
+        - `content_points` (List[str]): Key points to express
+        - `references` (List[Any]): Available references
+        - `figures` (List[Any]): Available figures
+        - `tables` (List[Any]): Available tables
+        - `word_limit` (Optional[int]): Word limit
+        - `style_guide` (Optional[str]): Target venue style
+        - `intro_context` (Optional[str]): Introduction content for context
+        - `active_skills` (Optional[List[WritingSkill]]): Active writing skills
+
+    - **Returns**:
+        - `str`: Compiled prompt string for LLM
     """
     content_points = content_points or []
     references = references or []
     figures = figures or []
     tables = tables or []
-    
-    # Get base prompt for section type
+
     base_prompt = SECTION_PROMPTS.get(section_type, SECTION_PROMPTS.get("method", ""))
-    
-    # Build the prompt
     prompt_parts = [base_prompt]
-    
-    # Add thesis if provided
+
     if thesis:
         prompt_parts.append(f"\n## Core Theme\n{thesis}")
-    
-    # Add content points
+
     if content_points:
         points_str = "\n".join(f"- {p}" for p in content_points)
         prompt_parts.append(f"\n## Key Points to Address\n{points_str}")
-    
-    # Add introduction context for body sections
+
     if intro_context and section_type not in ["introduction", "abstract"]:
-        # Truncate if too long
         context = intro_context[:1500] + "..." if len(intro_context) > 1500 else intro_context
         prompt_parts.append(f"\n## Paper Introduction (for context)\n{context}")
-    
-    # Add references info
+
     if references:
         refs_info = []
-        for ref in references[:20]:  # Limit to 20 refs
-            if hasattr(ref, 'ref_id'):
+        for ref in references[:20]:
+            if hasattr(ref, "ref_id"):
                 ref_str = f"- [{ref.ref_id}]"
-                if hasattr(ref, 'title') and ref.title:
+                if hasattr(ref, "title") and ref.title:
                     ref_str += f": {ref.title}"
-                if hasattr(ref, 'authors') and ref.authors:
+                if hasattr(ref, "authors") and ref.authors:
                     ref_str += f" ({ref.authors})"
                 refs_info.append(ref_str)
             elif isinstance(ref, dict):
-                ref_id = ref.get('ref_id', ref.get('id', 'unknown'))
+                ref_id = ref.get("ref_id", ref.get("id", "unknown"))
                 ref_str = f"- [{ref_id}]"
-                if ref.get('title'):
+                if ref.get("title"):
                     ref_str += f": {ref.get('title')}"
                 refs_info.append(ref_str)
         if refs_info:
             prompt_parts.append(f"\n## Available References\n" + "\n".join(refs_info))
-    
-    # Add figures info
+
     if figures:
         figs_info = []
         for fig in figures:
-            if hasattr(fig, 'figure_id'):
-                fig_str = f"- {fig.figure_id}"
-                if hasattr(fig, 'caption') and fig.caption:
+            if hasattr(fig, "figure_id"):
+                figs_info.append(f"- {fig.figure_id}")
+            elif hasattr(fig, "id"):
+                fig_str = f"- {fig.id}"
+                if hasattr(fig, "caption") and fig.caption:
                     fig_str += f": {fig.caption}"
                 figs_info.append(fig_str)
             elif isinstance(fig, dict):
-                fig_id = fig.get('figure_id', fig.get('id', 'unknown'))
-                fig_str = f"- {fig_id}"
-                if fig.get('caption'):
-                    fig_str += f": {fig.get('caption')}"
-                figs_info.append(fig_str)
+                fig_id = fig.get("figure_id", fig.get("id", "unknown"))
+                figs_info.append(f"- {fig_id}")
         if figs_info:
             prompt_parts.append(f"\n## Available Figures\n" + "\n".join(figs_info))
-    
-    # Add tables info
+
     if tables:
         tables_info = []
         for tbl in tables:
-            if hasattr(tbl, 'table_id'):
-                tbl_str = f"- {tbl.table_id}"
-                if hasattr(tbl, 'caption') and tbl.caption:
+            if hasattr(tbl, "table_id"):
+                tables_info.append(f"- {tbl.table_id}")
+            elif hasattr(tbl, "id"):
+                tbl_str = f"- {tbl.id}"
+                if hasattr(tbl, "caption") and tbl.caption:
                     tbl_str += f": {tbl.caption}"
                 tables_info.append(tbl_str)
             elif isinstance(tbl, dict):
-                tbl_id = tbl.get('table_id', tbl.get('id', 'unknown'))
-                tbl_str = f"- {tbl_id}"
-                if tbl.get('caption'):
-                    tbl_str += f": {tbl.get('caption')}"
-                tables_info.append(tbl_str)
+                tbl_id = tbl.get("table_id", tbl.get("id", "unknown"))
+                tables_info.append(f"- {tbl_id}")
         if tables_info:
             prompt_parts.append(f"\n## Available Tables\n" + "\n".join(tables_info))
-    
-    # Add constraints
+
     constraints = []
-    if word_limit:
-        constraints.append(f"- Word limit: approximately {word_limit} words")
     if style_guide:
         constraints.append(f"- Style guide: {style_guide}")
     if constraints:
         prompt_parts.append(f"\n## Constraints\n" + "\n".join(constraints))
-    
-    # Inject skill constraints before output instructions
+
     _inject_skill_constraints(prompt_parts, active_skills, section_type)
 
-    # Add output instructions
     prompt_parts.append("""
 ## Output Instructions
 - Generate LaTeX content for the section body only
@@ -246,7 +412,7 @@ def compile_section_prompt(
 - Use \\ref{tab:id} for table references
 - Write in academic English with clear, precise language
 """)
-    
+
     return "\n".join(prompt_parts)
 
 
@@ -258,26 +424,23 @@ def compile_introduction_prompt(
     experiments_summary: str,
     references: List[Any] = None,
     style_guide: Optional[str] = None,
-    section_plan: Any = None,  # SectionPlan from planner
-    figures: List[Any] = None,  # FigureSpec list
-    tables: List[Any] = None,   # TableSpec list
+    section_plan: Any = None,
+    figures: List[Any] = None,
+    tables: List[Any] = None,
     active_skills: Optional[List["WritingSkill"]] = None,
 ) -> str:
     """
-    Compile prompt for Introduction generation (Phase 1 - Leader section)
-    
-    The Introduction sets the tone for the entire paper and extracts
-    key contributions that will be used by subsequent sections.
-    
-    Args:
-        section_plan: Optional SectionPlan with target_words, key_points, writing_guidance
-        figures: Optional list of FigureSpec for available figures
-        tables: Optional list of TableSpec for available tables
+    Compile prompt for Introduction generation (Phase 1 - Leader section).
+
+    - **Args**:
+        - `section_plan`: SectionPlan with paragraph-level structure
+        - `figures`: Available FigureSpec list
+        - `tables`: Available TableSpec list
     """
     references = references or []
     figures = figures or []
     tables = tables or []
-    
+
     prompt = f"""You are writing the Introduction section for a research paper titled: "{paper_title}"
 
 ## Role of Introduction
@@ -301,89 +464,95 @@ The Introduction is the LEADER section that:
 ### Experiments Overview
 {experiments_summary}
 """
-    
-    # Add plan guidance if available
+
+    # Paragraph-level planning guidance
     if section_plan:
-        prompt += "\n## Planning Guidance\n"
-        if hasattr(section_plan, 'target_words') and section_plan.target_words:
-            prompt += f"**Target Length**: Approximately {section_plan.target_words} words\n"
-        if hasattr(section_plan, 'key_points') and section_plan.key_points:
-            points_str = "\n".join(f"- {p}" for p in section_plan.key_points)
-            prompt += f"**Key Points to Cover**:\n{points_str}\n"
-        if hasattr(section_plan, 'references_to_cite') and section_plan.references_to_cite:
-            prompt += f"**References to Cite**: {', '.join(section_plan.references_to_cite)}\n"
-        if hasattr(section_plan, 'writing_guidance') and section_plan.writing_guidance:
-            prompt += f"**Writing Guidance**: {section_plan.writing_guidance}\n"
-    
-    # Add references with strong constraint on valid keys
+        guidance = _format_paragraph_guidance(section_plan)
+        if guidance:
+            prompt += f"\n## Writing Structure\n{guidance}\n"
+
+    # References with citation rules
     if references:
         refs_info = []
         valid_keys = []
         for ref in references[:15]:
             if isinstance(ref, dict):
-                ref_id = ref.get('ref_id', ref.get('id', ''))
-                title = ref.get('title', '')
+                ref_id = ref.get("ref_id", ref.get("id", ""))
+                title = ref.get("title", "")
                 if ref_id:
                     valid_keys.append(ref_id)
-                    refs_info.append(f"- \\cite{{{ref_id}}}: {title[:80]}" if title else f"- \\cite{{{ref_id}}}")
+                    refs_info.append(
+                        f"- \\cite{{{ref_id}}}: {title[:80]}" if title
+                        else f"- \\cite{{{ref_id}}}"
+                    )
         if refs_info:
             prompt += f"\n### CRITICAL: Citation Rules\n"
             prompt += f"**ONLY use these citation keys. DO NOT invent or hallucinate citations.**\n"
             prompt += f"**Valid keys**: {', '.join(valid_keys)}\n\n"
             prompt += "Available references:\n" + "\n".join(refs_info)
             prompt += "\n\n**WARNING**: Any citation not in the above list will be automatically removed.\n"
-    
-    # Add figures info
-    if figures:
+            assigned_refs = getattr(section_plan, "assigned_refs", []) if section_plan else []
+            if assigned_refs:
+                prompt += (
+                    "\n\n**Coverage priority for this section**:\n"
+                    "Prioritize integrating these assigned citation keys in this section where relevant:\n"
+                    + ", ".join(assigned_refs[:8])
+                    + "\nDo not force unrelated citations; integrate naturally with matching claims.\n"
+                )
+
+    # Figure placement guidance
+    if section_plan:
+        fig_guidance = _format_figure_placement_guidance(section_plan, figures)
+        if fig_guidance:
+            prompt += fig_guidance
+
+        # Cross-section figure references
+        figs_to_ref = getattr(section_plan, "figures_to_reference", [])
+        if figs_to_ref:
+            prompt += f"\n## Figures to REFERENCE (already defined elsewhere)\n"
+            prompt += "**DO NOT create \\\\begin{{figure}} - just reference with Figure~\\\\ref{{fig:id}}.**\n"
+            for fig_id in figs_to_ref:
+                prompt += f"- {fig_id}\n"
+    elif figures:
         figs_info = []
         for fig in figures:
-            fig_id = fig.id if hasattr(fig, 'id') else fig.get('id', '')
-            caption = fig.caption if hasattr(fig, 'caption') else fig.get('caption', '')
-            desc = fig.description if hasattr(fig, 'description') else fig.get('description', '')
+            fig_id = fig.id if hasattr(fig, "id") else fig.get("id", "")
+            caption = fig.caption if hasattr(fig, "caption") else fig.get("caption", "")
             if fig_id:
-                info = f"- \\ref{{{fig_id}}}: {caption}"
-                if desc:
-                    info += f" ({desc})"
-                figs_info.append(info)
+                figs_info.append(f"- \\ref{{{fig_id}}}: {caption}")
         if figs_info:
             prompt += f"\n### Available Figures\n" + "\n".join(figs_info)
-    
-    # Add tables info
-    if tables:
+
+    # Table guidance
+    if section_plan:
+        tbl_guidance = _format_table_placement_guidance(section_plan, tables)
+        if tbl_guidance:
+            prompt += tbl_guidance
+    elif tables:
         tables_info = []
         for tbl in tables:
-            tbl_id = tbl.id if hasattr(tbl, 'id') else tbl.get('id', '')
-            caption = tbl.caption if hasattr(tbl, 'caption') else tbl.get('caption', '')
-            desc = tbl.description if hasattr(tbl, 'description') else tbl.get('description', '')
+            tbl_id = tbl.id if hasattr(tbl, "id") else tbl.get("id", "")
+            caption = tbl.caption if hasattr(tbl, "caption") else tbl.get("caption", "")
             if tbl_id:
-                info = f"- \\ref{{{tbl_id}}}: {caption}"
-                if desc:
-                    info += f" ({desc})"
-                tables_info.append(info)
+                tables_info.append(f"- \\ref{{{tbl_id}}}: {caption}")
         if tables_info:
             prompt += f"\n### Available Tables\n" + "\n".join(tables_info)
-    
-    # Add style guide
+
     if style_guide:
         prompt += f"\n\n## Target Venue: {style_guide}"
-    
-    # Inject skill constraints
+
     if active_skills:
         intro_parts: list = []
         _inject_skill_constraints(intro_parts, active_skills, "introduction")
         if intro_parts:
             prompt += "\n" + "\n".join(intro_parts)
-    
+
     prompt += """
 
 ## Output Requirements
 1. Generate LaTeX content for the Introduction section body
 2. Do NOT include \\section{Introduction} - just the content
-3. Structure the introduction with clear paragraphs:
-   - Opening: Context and motivation
-   - Problem statement and gap
-   - Contributions (use itemize environment)
-   - Paper organization (optional)
+3. Structure the introduction with clear paragraphs as specified above
 4. Use \\cite{key} for citations
 5. Use \\ref{fig:id} for figure references and \\ref{tab:id} for table references
 6. Write in formal academic English
@@ -397,7 +566,7 @@ At the end, clearly state the contributions using:
 
 This helps maintain consistency across the paper.
 """
-    
+
     return prompt
 
 
@@ -408,29 +577,30 @@ def compile_body_section_prompt(
     contributions: List[str] = None,
     references: List[Any] = None,
     style_guide: Optional[str] = None,
-    section_plan: Any = None,  # SectionPlan from planner
-    figures: List[Any] = None,  # FigureSpec list
-    tables: List[Any] = None,   # TableSpec list
-    converted_tables: Optional[Dict[str, str]] = None,  # table_id -> LaTeX code
+    section_plan: Any = None,
+    figures: List[Any] = None,
+    tables: List[Any] = None,
+    converted_tables: Optional[Dict[str, str]] = None,
     active_skills: Optional[List["WritingSkill"]] = None,
+    memory_context: Optional[str] = None,
 ) -> str:
     """
-    Compile prompt for Body section generation (Phase 2)
-    
-    Body sections receive context from Introduction to maintain consistency.
-    
-    Args:
-        section_plan: Optional SectionPlan with target_words, key_points, writing_guidance
-        figures: Optional list of FigureSpec for available figures
-        tables: Optional list of TableSpec for available tables
+    Compile prompt for Body section generation (Phase 2).
+
+    - **Args**:
+        - `section_plan`: SectionPlan with paragraph-level structure and FigurePlacement
+        - `figures`: Available FigureSpec list
+        - `tables`: Available TableSpec list
+        - `converted_tables`: table_id -> LaTeX code mapping
+        - `memory_context` (str, optional): Cross-section context from SessionMemory
     """
     contributions = contributions or []
     references = references or []
     figures = figures or []
     tables = tables or []
-    
+
     base_prompt = SECTION_PROMPTS.get(section_type, "")
-    
+
     prompt = f"""{base_prompt}
 
 ## Section Content Source
@@ -443,197 +613,132 @@ def compile_body_section_prompt(
 """
     for i, contrib in enumerate(contributions, 1):
         prompt += f"{i}. {contrib}\n"
-    
-    # Add plan guidance if available
+
+    # Memory-provided cross-section coordination context
+    if memory_context:
+        prompt += f"\n## Coordination Context (from Session Memory)\n{memory_context}\n"
+
+    # Paragraph-level planning guidance
     if section_plan:
-        prompt += "\n## Planning Guidance\n"
-        if hasattr(section_plan, 'target_words') and section_plan.target_words:
-            prompt += f"**Target Length**: Approximately {section_plan.target_words} words\n"
-        if hasattr(section_plan, 'key_points') and section_plan.key_points:
-            points_str = "\n".join(f"- {p}" for p in section_plan.key_points)
-            prompt += f"**Key Points to Cover**:\n{points_str}\n"
-        if hasattr(section_plan, 'references_to_cite') and section_plan.references_to_cite:
-            prompt += f"**References to Cite**: {', '.join(section_plan.references_to_cite)}\n"
-        if hasattr(section_plan, 'writing_guidance') and section_plan.writing_guidance:
-            prompt += f"**Writing Guidance**: {section_plan.writing_guidance}\n"
-    
+        guidance = _format_paragraph_guidance(section_plan)
+        if guidance:
+            prompt += f"\n## Writing Structure\n{guidance}\n"
+
+    # References
     if references:
         refs_info = []
         valid_keys = []
         for ref in references[:10]:
             if isinstance(ref, dict):
-                ref_id = ref.get('ref_id', ref.get('id', ''))
-                title = ref.get('title', '')
+                ref_id = ref.get("ref_id", ref.get("id", ""))
+                title = ref.get("title", "")
                 if ref_id:
                     valid_keys.append(ref_id)
-                    refs_info.append(f"- \\cite{{{ref_id}}}: {title[:60]}" if title else f"- \\cite{{{ref_id}}}")
+                    refs_info.append(
+                        f"- \\cite{{{ref_id}}}: {title[:60]}" if title
+                        else f"- \\cite{{{ref_id}}}"
+                    )
         if refs_info:
             prompt += f"\n## CRITICAL: Citation Rules\n"
             prompt += f"**ONLY use these citation keys. DO NOT invent citations.**\n"
             prompt += f"**Valid keys**: {', '.join(valid_keys)}\n\n"
             prompt += "\n".join(refs_info)
-    
-    # Determine which figures to DEFINE vs REFERENCE
-    figures_to_define = []
-    figures_to_reference = []
-    
-    if section_plan:
-        figures_to_define = getattr(section_plan, 'figures_to_define', []) or []
-        figures_to_reference = getattr(section_plan, 'figures_to_reference', []) or []
-    
-    # Build figure lookup
-    figure_map = {}
-    if figures:
-        for fig in figures:
-            fig_id = fig.id if hasattr(fig, 'id') else fig.get('id', '')
-            if fig_id:
-                figure_map[fig_id] = fig
-    
-    # Add figures to DEFINE (create \begin{figure} environment)
-    if figures_to_define:
-        prompt += f"\n## Figures to DEFINE in this section\n"
-        prompt += "**CREATE the complete figure environment for each figure below.**\n\n"
-        for fig_id in figures_to_define:
-            fig = figure_map.get(fig_id)
-            if fig:
-                caption = fig.caption if hasattr(fig, 'caption') else fig.get('caption', '')
-                desc = fig.description if hasattr(fig, 'description') else fig.get('description', '')
-                file_path = fig.file_path if hasattr(fig, 'file_path') else fig.get('file_path', '')
-                wide = fig.wide if hasattr(fig, 'wide') else fig.get('wide', False)
-                import os
-                filename = os.path.basename(file_path) if file_path else f"{fig_id.replace('fig:', '')}.pdf"
-                
-                # Use figure* for wide figures (double-column spanning)
-                env_name = "figure*" if wide else "figure"
-                width = "\\\\textwidth" if wide else "0.9\\\\linewidth"
-                
-                prompt += f"- **{fig_id}**: {caption}\n"
-                if desc:
-                    prompt += f"  Description: {desc}\n"
-                if wide:
-                    prompt += f"  **Note: This is a WIDE figure - use {env_name} to span both columns.**\n"
-                prompt += f"  **Required LaTeX:**\n"
-                prompt += f"  ```latex\n"
-                prompt += f"  \\\\begin{{{env_name}}}[t]\n"
-                prompt += f"  \\\\centering\n"
-                prompt += f"  \\\\includegraphics[width={width}]{{figures/{filename}}}\n"
-                prompt += f"  \\\\caption{{{caption}}}\\\\label{{{fig_id}}}\n"
-                prompt += f"  \\\\end{{{env_name}}}\n"
-                prompt += f"  ```\n\n"
-    
-    # Add figures to REFERENCE only (use \ref{})
-    if figures_to_reference:
-        prompt += f"\n## Figures to REFERENCE (already defined elsewhere)\n"
-        prompt += "**DO NOT create \\\\begin{{figure}} for these - just reference them with Figure~\\\\ref{{fig:id}}.**\n"
-        for fig_id in figures_to_reference:
-            fig = figure_map.get(fig_id)
-            if fig:
-                caption = fig.caption if hasattr(fig, 'caption') else fig.get('caption', '')
-                prompt += f"- {fig_id}: {caption} → use `Figure~\\\\ref{{{fig_id}}}`\n"
-    
-    # Determine which tables to DEFINE vs REFERENCE
-    tables_to_define = []
-    tables_to_reference = []
-    
-    if section_plan:
-        tables_to_define = getattr(section_plan, 'tables_to_define', []) or []
-        tables_to_reference = getattr(section_plan, 'tables_to_reference', []) or []
-    
-    # Build table lookup
-    table_map = {}
-    if tables:
-        for tbl in tables:
-            tbl_id = tbl.id if hasattr(tbl, 'id') else tbl.get('id', '')
-            if tbl_id:
-                table_map[tbl_id] = tbl
-    
-    # Add tables to DEFINE (create \begin{table} environment)
-    _converted = converted_tables or {}
-    if tables_to_define:
-        prompt += f"\n## Tables to DEFINE in this section\n"
-        prompt += "**Include the complete table environment for each table below.**\n\n"
-        for tbl_id in tables_to_define:
-            tbl = table_map.get(tbl_id)
-            if tbl:
-                caption = tbl.caption if hasattr(tbl, 'caption') else tbl.get('caption', '')
-                desc = tbl.description if hasattr(tbl, 'description') else tbl.get('description', '')
-                wide = tbl.wide if hasattr(tbl, 'wide') else tbl.get('wide', False)
-                env_name = "table*" if wide else "table"
+            assigned_refs = getattr(section_plan, "assigned_refs", []) if section_plan else []
+            if assigned_refs:
+                prompt += (
+                    "\n\n## Citation Coverage Priority\n"
+                    "To improve reference coverage, prioritize citing these assigned keys in this section when relevant:\n"
+                    + ", ".join(assigned_refs[:10])
+                    + "\nUse each key only if it supports an actual statement in the text.\n"
+                )
 
-                # If pre-converted LaTeX exists, give it directly (like figures)
-                if tbl_id in _converted:
-                    prompt += f"- **{tbl_id}**: {caption}\n"
-                    if desc:
-                        prompt += f"  Description: {desc}\n"
-                    prompt += f"  **Required LaTeX (include this exact table in your output):**\n"
-                    prompt += f"  ```latex\n"
-                    prompt += f"  {_converted[tbl_id]}\n"
-                    prompt += f"  ```\n\n"
-                else:
-                    # Fallback: ask Writer to create from raw content
-                    content = tbl.content if hasattr(tbl, 'content') else tbl.get('content', '')
-                    prompt += f"- **{tbl_id}**: {caption}\n"
-                    if desc:
-                        prompt += f"  Description: {desc}\n"
-                    if content:
-                        prompt += f"  Data:\n  {content[:500]}\n"
-                    if wide:
-                        prompt += f"  **Note: This is a WIDE table - use {env_name} to span both columns.**\n"
-                    prompt += f"  **Required: Create \\\\begin{{{env_name}}}...\\\\end{{{env_name}}} with \\\\label{{{tbl_id}}}**\n\n"
-    
-    # Add tables to REFERENCE only (use \ref{})
-    if tables_to_reference:
-        prompt += f"\n## Tables to REFERENCE (already defined elsewhere)\n"
-        prompt += "**DO NOT create \\\\begin{{table}} for these - just reference them with Table~\\\\ref{{tab:id}}.**\n"
-        for tbl_id in tables_to_reference:
-            tbl = table_map.get(tbl_id)
-            if tbl:
-                caption = tbl.caption if hasattr(tbl, 'caption') else tbl.get('caption', '')
-                prompt += f"- {tbl_id}: {caption} → use `Table~\\\\ref{{{tbl_id}}}`\n"
-    
-    # Legacy fallback: if no define/reference lists, show all as available (backward compat)
-    if not figures_to_define and not figures_to_reference and figures:
-        figs_info = []
-        for fig in figures:
-            fig_id = fig.id if hasattr(fig, 'id') else fig.get('id', '')
-            caption = fig.caption if hasattr(fig, 'caption') else fig.get('caption', '')
-            if fig_id:
-                figs_info.append(f"- {fig_id}: {caption}")
-        if figs_info:
-            prompt += f"\n## Available Figures (reference only with \\\\ref{{}})\n" + "\n".join(figs_info)
-    
-    if not tables_to_define and not tables_to_reference and tables:
-        tables_info = []
-        for tbl in tables:
-            tbl_id = tbl.id if hasattr(tbl, 'id') else tbl.get('id', '')
-            caption = tbl.caption if hasattr(tbl, 'caption') else tbl.get('caption', '')
-            if tbl_id:
-                tables_info.append(f"- {tbl_id}: {caption}")
-        if tables_info:
-            prompt += f"\n## Available Tables (reference only with \\\\ref{{}})\n" + "\n".join(tables_info)
-    
+    # Figure placement guidance (using FigurePlacement semantics)
+    if section_plan:
+        fig_guidance = _format_figure_placement_guidance(section_plan, figures)
+        if fig_guidance:
+            prompt += fig_guidance
+
+        figs_to_ref = getattr(section_plan, "figures_to_reference", [])
+        if figs_to_ref:
+            prompt += f"\n## Figures to REFERENCE (already defined elsewhere)\n"
+            prompt += "**DO NOT create \\\\begin{{figure}} for these - just reference them with Figure~\\\\ref{{fig:id}}.**\n"
+            figure_map = {}
+            for fig in figures:
+                fid = fig.id if hasattr(fig, "id") else fig.get("id", "")
+                if fid:
+                    figure_map[fid] = fig
+            for fig_id in figs_to_ref:
+                fig = figure_map.get(fig_id)
+                caption = ""
+                if fig:
+                    caption = fig.caption if hasattr(fig, "caption") else fig.get("caption", "")
+                prompt += f"- {fig_id}: {caption} -> use `Figure~\\\\ref{{{fig_id}}}`\n"
+
+        # Table placement guidance
+        tbl_guidance = _format_table_placement_guidance(section_plan, tables, converted_tables)
+        if tbl_guidance:
+            prompt += tbl_guidance
+
+        tbls_to_ref = getattr(section_plan, "tables_to_reference", [])
+        if tbls_to_ref:
+            prompt += f"\n## Tables to REFERENCE (already defined elsewhere)\n"
+            prompt += "**DO NOT create \\\\begin{{table}} for these - just reference them with Table~\\\\ref{{tab:id}}.**\n"
+            table_map = {}
+            for tbl in tables:
+                tid = tbl.id if hasattr(tbl, "id") else tbl.get("id", "")
+                if tid:
+                    table_map[tid] = tbl
+            for tbl_id in tbls_to_ref:
+                tbl = table_map.get(tbl_id)
+                caption = ""
+                if tbl:
+                    caption = tbl.caption if hasattr(tbl, "caption") else tbl.get("caption", "")
+                prompt += f"- {tbl_id}: {caption} -> use `Table~\\\\ref{{{tbl_id}}}`\n"
+
+    else:
+        # Legacy fallback: no section_plan, show all figures/tables as available
+        if figures:
+            figs_info = []
+            for fig in figures:
+                fig_id = fig.id if hasattr(fig, "id") else fig.get("id", "")
+                caption = fig.caption if hasattr(fig, "caption") else fig.get("caption", "")
+                if fig_id:
+                    figs_info.append(f"- {fig_id}: {caption}")
+            if figs_info:
+                prompt += f"\n## Available Figures (reference only with \\\\ref{{}})\n" + "\n".join(figs_info)
+
+        if tables:
+            tables_info = []
+            for tbl in tables:
+                tbl_id = tbl.id if hasattr(tbl, "id") else tbl.get("id", "")
+                caption = tbl.caption if hasattr(tbl, "caption") else tbl.get("caption", "")
+                if tbl_id:
+                    tables_info.append(f"- {tbl_id}: {caption}")
+            if tables_info:
+                prompt += f"\n## Available Tables (reference only with \\\\ref{{}})\n" + "\n".join(tables_info)
+
     if style_guide:
         prompt += f"\n\n## Target Venue: {style_guide}"
-    
-    # Inject skill constraints
+
     if active_skills:
         body_parts: list = []
         _inject_skill_constraints(body_parts, active_skills, section_type)
         if body_parts:
             prompt += "\n" + "\n".join(body_parts)
-    
+
     prompt += """
 
 ## Output Requirements
 1. Generate LaTeX content for the section body only
 2. Do NOT include \\section{} command
-3. Maintain consistency with the Introduction's framing
-4. Support the stated contributions where relevant
-5. Use \\cite{key} for citations
-6. Use \\ref{fig:id} for figure references and \\ref{tab:id} for table references
-7. Use clear academic writing style
+3. Follow the paragraph structure specified above
+4. Maintain consistency with the Introduction's framing
+5. Support the stated contributions where relevant
+6. Use \\cite{key} for citations
+7. Use \\ref{fig:id} for figure references and \\ref{tab:id} for table references
+8. Use clear academic writing style
 """
-    
+
     return prompt
 
 
@@ -644,31 +749,26 @@ def compile_synthesis_prompt(
     key_contributions: List[str] = None,
     word_limit: Optional[int] = None,
     style_guide: Optional[str] = None,
-    section_plan: Any = None,  # SectionPlan from planner
+    section_plan: Any = None,
     active_skills: Optional[List["WritingSkill"]] = None,
+    memory_context: Optional[str] = None,
 ) -> str:
     """
-    Compile prompt for Synthesis sections (Abstract/Conclusion - Phase 3)
-    
-    These sections synthesize content from already-generated sections
-    rather than generating from scratch.
-    
-    Args:
-        section_plan: Optional SectionPlan with target_words, writing_guidance
+    Compile prompt for Synthesis sections (Abstract/Conclusion - Phase 3).
+
+    - **Args**:
+        - `section_plan`: SectionPlan with paragraph-level structure
+        - `memory_context` (str, optional): Cross-section summary from SessionMemory
     """
     key_contributions = key_contributions or []
-    
+
     # Extract plan guidance
-    plan_key_points = []
+    plan_guidance = ""
     plan_writing_guidance = ""
     if section_plan:
-        if hasattr(section_plan, 'target_words') and section_plan.target_words:
-            word_limit = section_plan.target_words
-        if hasattr(section_plan, 'key_points') and section_plan.key_points:
-            plan_key_points = section_plan.key_points
-        if hasattr(section_plan, 'writing_guidance') and section_plan.writing_guidance:
-            plan_writing_guidance = section_plan.writing_guidance
-    
+        plan_guidance = _format_paragraph_guidance(section_plan)
+        plan_writing_guidance = getattr(section_plan, "writing_guidance", "")
+
     if section_type == "abstract":
         prompt = f"""You are writing the Abstract for a research paper titled: "{paper_title}"
 
@@ -688,13 +788,10 @@ Synthesize a concise abstract (150-250 words) from the following paper sections.
 """
         for contrib in key_contributions:
             prompt += f"- {contrib}\n"
-        
-        # Add plan key points if available
-        if plan_key_points:
-            prompt += "\n## Key Points to Cover (from Planner - MUST include all)\n"
-            for point in plan_key_points:
-                prompt += f"- {point}\n"
-        
+
+        if plan_guidance:
+            prompt += f"\n## Writing Structure (from Planner)\n{plan_guidance}\n"
+
         prompt += """
 ## Abstract Structure
 1. Problem/Motivation (1-2 sentences)
@@ -705,14 +802,13 @@ Synthesize a concise abstract (150-250 words) from the following paper sections.
 ## Output Requirements
 - Generate ONLY the abstract text
 - Do NOT include \\begin{abstract} or any LaTeX commands
+- Do NOT include any citations (\\cite{...}) — abstracts must be self-contained
 - Write in third person, present/past tense
 - Be specific about results (include numbers if available)
 """
-        
-        # Add plan writing guidance if available
         if plan_writing_guidance:
             prompt += f"\n## Writing Guidance (IMPORTANT - follow strictly)\n{plan_writing_guidance}\n"
-        
+
     elif section_type == "conclusion":
         prompt = f"""You are writing the Conclusion for a research paper titled: "{paper_title}"
 
@@ -734,13 +830,10 @@ Write a conclusion that synthesizes the paper's contributions and findings.
 """
         for contrib in key_contributions:
             prompt += f"- {contrib}\n"
-        
-        # Add plan key points if available
-        if plan_key_points:
-            prompt += "\n## Key Points to Cover (from Planner - MUST include all)\n"
-            for point in plan_key_points:
-                prompt += f"- {point}\n"
-        
+
+        if plan_guidance:
+            prompt += f"\n## Writing Structure (from Planner)\n{plan_guidance}\n"
+
         prompt += """
 ## Conclusion Structure
 1. Summary of contributions (1 paragraph)
@@ -751,74 +844,62 @@ Write a conclusion that synthesizes the paper's contributions and findings.
 ## Output Requirements
 - Generate LaTeX content for the Conclusion section body
 - Do NOT include \\section{Conclusion}
+- Do NOT include any citations (\\cite{...}) — conclusions must stand alone
 - Be concise but comprehensive
 - End on a forward-looking note
 """
-        
-        # Add plan writing guidance if available
         if plan_writing_guidance:
             prompt += f"\n## Writing Guidance (IMPORTANT - follow strictly)\n{plan_writing_guidance}\n"
     else:
-        # Generic synthesis prompt
         prompt = f"""Synthesize content for the {section_type} section based on:
 
 {json.dumps(prior_sections, indent=2)[:3000]}
 
 Key contributions: {key_contributions}
 """
-    
-    # Inject skill constraints
+
+    # Memory-provided global context for synthesis
+    if memory_context:
+        prompt += f"\n## Section Overview (from Session Memory)\n{memory_context}\n"
+
     if active_skills:
         synth_parts: list = []
         _inject_skill_constraints(synth_parts, active_skills, section_type)
         if synth_parts:
             prompt += "\n" + "\n".join(synth_parts)
 
-    # Add constraints with strong emphasis on word limit
-    if word_limit:
-        prompt += f"\n\n## STRICT LENGTH CONSTRAINT\n"
-        prompt += f"**MAXIMUM {word_limit} words** - This is a HARD limit. Do NOT exceed this word count.\n"
-        prompt += f"Count your words before finalizing. If over {word_limit}, cut content ruthlessly.\n"
     if style_guide:
         prompt += f"\n- Style guide: {style_guide}"
-    
+
     return prompt
 
 
 def extract_contributions_from_intro(intro_content: str) -> List[str]:
     """
-    Extract contribution statements from Introduction content
-    
+    Extract contribution statements from Introduction content.
     Looks for itemize environments or numbered contributions.
     """
     contributions = []
-    
-    # Look for itemize content
     import re
-    
-    # Pattern for \item content
-    item_pattern = r'\\item\s*(.+?)(?=\\item|\\end{itemize}|$)'
-    
-    # Find itemize blocks
-    itemize_pattern = r'\\begin{itemize}(.*?)\\end{itemize}'
+
+    item_pattern = r"\\item\s*(.+?)(?=\\item|\\end{itemize}|$)"
+    itemize_pattern = r"\\begin{itemize}(.*?)\\end{itemize}"
     itemize_matches = re.findall(itemize_pattern, intro_content, re.DOTALL)
-    
+
     for block in itemize_matches:
         items = re.findall(item_pattern, block, re.DOTALL)
         for item in items:
-            # Clean up the item text
             clean_item = item.strip()
-            clean_item = re.sub(r'\\[a-zA-Z]+{([^}]*)}', r'\1', clean_item)  # Remove LaTeX commands
-            clean_item = re.sub(r'\s+', ' ', clean_item)  # Normalize whitespace
+            clean_item = re.sub(r"\\[a-zA-Z]+{([^}]*)}", r"\1", clean_item)
+            clean_item = re.sub(r"\s+", " ", clean_item)
             if clean_item and len(clean_item) > 10:
-                contributions.append(clean_item[:200])  # Limit length
-    
-    # If no itemize found, look for "contribution" mentions
+                contributions.append(clean_item[:200])
+
     if not contributions:
-        contrib_pattern = r'(?:contribution|we propose|we introduce|our approach)\s*[:\-]?\s*(.+?)(?:\.|$)'
+        contrib_pattern = r"(?:contribution|we propose|we introduce|our approach)\s*[:\-]?\s*(.+?)(?:\.|$)"
         matches = re.findall(contrib_pattern, intro_content.lower(), re.IGNORECASE)
         for match in matches[:5]:
             if len(match) > 10:
                 contributions.append(match.strip()[:200])
-    
-    return contributions[:5]  # Return at most 5 contributions
+
+    return contributions[:5]

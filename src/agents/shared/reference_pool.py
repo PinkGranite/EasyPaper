@@ -9,9 +9,13 @@ ReferencePool - Persistent reference management across paper generation phases.
     - Generates the final .bib file content from all accumulated references.
 """
 
+import asyncio
 import json
+import logging
 import re
 from typing import Any, Dict, List, Optional, Set
+
+logger = logging.getLogger("uvicorn.error")
 
 
 class ReferencePool:
@@ -37,6 +41,82 @@ class ReferencePool:
         )
         self._discovered_refs: List[Dict[str, Any]] = []
         self._all_keys: Set[str] = {r["ref_id"] for r in self._core_refs if r.get("ref_id")}
+
+    @classmethod
+    async def create(
+        cls,
+        initial_refs: List[str],
+        paper_search_config: Optional[Dict[str, Any]] = None,
+    ) -> "ReferencePool":
+        """
+        Async factory that resolves plain-text references via search before
+        falling back to heuristic conversion.
+
+        - **Args**:
+            - `initial_refs` (List[str]): User-provided reference strings
+              (BibTeX or plain text).
+            - `paper_search_config` (dict, optional): Config for PaperSearchTool.
+
+        - **Returns**:
+            - `ReferencePool`: Fully initialised pool with high-quality BibTeX.
+        """
+        from ..shared.tools.paper_search import PaperSearchTool
+
+        cfg = paper_search_config or {}
+        tool = PaperSearchTool(
+            semantic_scholar_api_key=cfg.get("semantic_scholar_api_key"),
+            default_max_results=1,
+            timeout=cfg.get("timeout", 10),
+        )
+
+        resolved: List[str] = []
+        for ref_str in initial_refs:
+            if re.search(r"@\w+\{", ref_str):
+                resolved.append(ref_str)
+                continue
+            # Plain text — try to search
+            query = cls._extract_search_query(ref_str)
+            if not query:
+                resolved.append(ref_str)
+                continue
+            try:
+                result = await tool.execute(query=query, max_results=1)
+                papers = (result.data or {}).get("papers", []) if result.success else []
+                if papers and papers[0].get("bibtex"):
+                    resolved.append(papers[0]["bibtex"])
+                    logger.info("ref_pool.search_resolved query='%s' -> %s",
+                                query[:60], papers[0].get("bibtex_key", "?"))
+                else:
+                    logger.info("ref_pool.search_miss query='%s', using heuristic", query[:60])
+                    resolved.append(ref_str)
+            except Exception as exc:
+                logger.warning("ref_pool.search_error query='%s': %s", query[:60], exc)
+                resolved.append(ref_str)
+            await asyncio.sleep(1.0)
+
+        return cls(resolved)
+
+    @staticmethod
+    def _extract_search_query(plaintext: str) -> str:
+        """
+        Extract a search query from a plain-text citation string.
+        Tries to find the paper title; falls back to first-author + year.
+        """
+        plaintext = plaintext.strip().rstrip(".")
+        year_match = re.search(r"\((\d{4})\)", plaintext)
+        year_str = year_match.group(1) if year_match else ""
+
+        # Use the sentence-split heuristic to find the title portion
+        parts = ReferencePool._split_citation_sentences(plaintext)
+        if len(parts) >= 2:
+            title_candidate = parts[1].strip()
+            if len(title_candidate) > 10:
+                return title_candidate
+        # Fallback: first author last name + year
+        first_author = plaintext.split(",")[0].split("&")[0].strip()
+        if first_author and year_str:
+            return f"{first_author} {year_str}"
+        return plaintext[:120]
 
     # ------------------------------------------------------------------
     # Public properties
@@ -316,20 +396,29 @@ class ReferencePool:
 
     def _parse_bibtex_list(self, bibtex_list: List[str]) -> List[Dict[str, Any]]:
         """
-        Parse a list of BibTeX entry strings into structured dicts.
+        Parse a list of reference strings into structured dicts.
+        - **Description**:
+            - Accepts both BibTeX entries and plain-text citations.
+            - Plain-text citations are auto-converted to BibTeX format
+              via heuristic parsing.
 
         - **Args**:
-            - `bibtex_list` (List[str]): Raw BibTeX strings.
+            - `bibtex_list` (List[str]): Raw reference strings (BibTeX or plain text).
 
         - **Returns**:
             - `List[Dict]`: Parsed reference dicts with ref_id, title,
               authors, year, bibtex fields.
         """
         parsed = []
-        for bibtex in bibtex_list:
-            parsed.append(
-                self._parse_single_bibtex(bibtex, fallback_id=f"ref_{len(parsed) + 1}")
-            )
+        for ref_str in bibtex_list:
+            if re.search(r"@\w+\{", ref_str):
+                parsed.append(
+                    self._parse_single_bibtex(ref_str, fallback_id=f"ref_{len(parsed) + 1}")
+                )
+            else:
+                parsed.append(
+                    self._convert_plaintext_to_bibtex(ref_str, index=len(parsed) + 1)
+                )
         return parsed
 
     @staticmethod
@@ -368,6 +457,85 @@ class ReferencePool:
                 "ref_id": fallback_id,
                 "bibtex": bibtex,
             }
+
+    @staticmethod
+    def _split_citation_sentences(citation: str) -> List[str]:
+        """
+        Split a plain-text citation into logical sentences (author / title /
+        journal) without breaking on author-initial periods like "E. H.".
+        """
+        # Replace abbreviation periods (single capital + period) with placeholder
+        protected = re.sub(r'(?<=[A-Z])\.(?=\s|,|&|\))', '\x00', citation)
+        parts = [p.strip() for p in protected.split('.') if p.strip()]
+        # Restore abbreviation periods
+        return [p.replace('\x00', '.') for p in parts]
+
+    @staticmethod
+    def _convert_plaintext_to_bibtex(citation: str, index: int = 1) -> Dict[str, Any]:
+        """
+        Convert a plain-text citation string to a BibTeX entry.
+        - **Description**:
+            - Heuristically extracts author, year, title, and journal.
+            - Uses sentence-boundary detection that skips periods after
+              single capital letters (author initials).
+
+        - **Args**:
+            - `citation` (str): Plain-text citation string.
+            - `index` (int): Fallback index for generating ref_id.
+
+        - **Returns**:
+            - `Dict[str, Any]`: Structured reference dict with generated BibTeX.
+        """
+        citation = citation.strip()
+        year = None
+        year_match = re.search(r'\((\d{4})\)', citation)
+        if year_match:
+            year = int(year_match.group(1))
+
+        authors_str = ""
+        title_str = ""
+        journal_str = ""
+
+        parts = ReferencePool._split_citation_sentences(citation)
+        if len(parts) >= 3:
+            authors_str = parts[0]
+            title_str = parts[1]
+            journal_str = parts[2]
+        elif len(parts) == 2:
+            authors_str = parts[0]
+            title_str = parts[1]
+        elif len(parts) == 1:
+            title_str = parts[0]
+
+        authors_str = re.sub(r'\s*\(\d{4}\)\s*$', '', authors_str).strip()
+        journal_str = re.sub(r'\s*\d+,?\s*\w*\d*\s*\(\d{4}\)\.?$', '', journal_str).strip()
+
+        first_author = authors_str.split(',')[0].split('&')[0].strip()
+        last_name = first_author.split()[-1] if first_author else "unknown"
+        last_name = re.sub(r'[^a-zA-Z]', '', last_name).lower()
+        year_str = str(year) if year else "nd"
+        title_words = [w.lower() for w in re.findall(r'[a-zA-Z]+', title_str) if len(w) > 3]
+        title_key = title_words[0] if title_words else "ref"
+        ref_id = f"{last_name}{year_str}{title_key}"
+
+        bibtex = (
+            f"@article{{{ref_id},\n"
+            f"  title = {{{title_str}}},\n"
+            f"  author = {{{authors_str}}},\n"
+        )
+        if year:
+            bibtex += f"  year = {{{year}}},\n"
+        if journal_str:
+            bibtex += f"  journal = {{{journal_str}}},\n"
+        bibtex += "}"
+
+        return {
+            "ref_id": ref_id,
+            "title": title_str,
+            "authors": authors_str,
+            "year": year,
+            "bibtex": bibtex,
+        }
 
     @staticmethod
     def _split_bibtex_entries(combined: str) -> Dict[str, str]:

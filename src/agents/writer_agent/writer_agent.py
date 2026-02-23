@@ -5,8 +5,8 @@ Writer Agent
     - Focuses on academic writing quality and proper citation usage
     - Supports iterative review and refinement with tool-based validation
     - Dual-mode tool invocation:
-        - Type 1 (ReAct): generate_content can use react_loop with search_papers
-          for autonomous reference discovery during writing
+        - Type 1 (ReAct): generate_content can use react_loop with AskTool
+          for consulting memory/planner/reviewer during writing
         - Type 2 (Fixed Sequence): mini_review executes CitationValidatorTool,
           WordCountTool, and KeyPointCoverageTool in fixed deterministic order
 """
@@ -145,6 +145,10 @@ class WriterAgentState(TypedDict):
     # Final tracking
     invalid_citations_removed: Optional[List[str]]
 
+    # Shared memory + peer agents for AskTool (ReAct consultation)
+    memory: Optional[Any]
+    peers: Optional[Dict[str, Any]]
+
 
 class WriterAgent(ReActAgent):
     """
@@ -155,7 +159,7 @@ class WriterAgent(ReActAgent):
         - Generates academic LaTeX content based on compiled prompts.
         - Dual-mode tool invocation:
             - Type 1 (ReAct): generate_content can optionally use react_loop
-              with search_papers for autonomous reference discovery.
+              with AskTool for consulting memory/planner/reviewer.
             - Type 2 (Fixed Sequence): mini_review executes citation validation,
               word count, and key point coverage tools in fixed order.
         - Iteratively revises content based on review feedback.
@@ -170,7 +174,6 @@ class WriterAgent(ReActAgent):
                     "validate_citations",
                     "count_words",
                     "check_key_points",
-                    "search_papers",
                 ],
                 max_react_iterations=3,
             )
@@ -245,39 +248,66 @@ class WriterAgent(ReActAgent):
 
     async def generate_content(self, state: WriterAgentState) -> Dict[str, Any]:
         """
-        Generate LaTeX content using LLM.
+        Generate LaTeX content using ReAct loop with AskTool access.
+        - **Description**:
+            - Registers the ``ask`` tool (backed by memory/planner/reviewer)
+              so the LLM can consult them during writing.
+            - Falls back to a plain LLM call when no tools are available.
         """
         print(f"[WriterAgent] Generating content for: {state.get('section_type')}")
-        
+
         system_prompt = state.get("system_prompt", "")
         user_prompt = state.get("user_prompt", "")
         citation_format = state.get("citation_format", "cite")
-        
-        # Build the full system prompt
+        memory = state.get("memory")
+        peers = state.get("peers") or {}
+
         full_system = f"{WRITER_SYSTEM_BASE}\n\n{system_prompt}"
-        
-        # Adjust citation format instruction if needed
+
         if citation_format != "cite":
-            full_system = full_system.replace("\\cite{reference_id}", f"\\{citation_format}{{reference_id}}")
-        
+            full_system = full_system.replace(
+                "\\cite{reference_id}",
+                f"\\{citation_format}{{reference_id}}",
+            )
+
+        # Build tool context for AskTool + PaperSearchTool
+        tool_context: Dict[str, Any] = {
+            "valid_keys": set(state.get("valid_citation_keys", [])),
+            "key_points": state.get("key_points", []),
+        }
+        tool_names: List[str] = []
+
+        if memory is not None:
+            tool_context["memory"] = memory
+            tool_names.append("ask")
+        if peers.get("planner"):
+            tool_context["planner"] = peers["planner"]
+            if "ask" not in tool_names:
+                tool_names.append("ask")
+        if peers.get("reviewer"):
+            tool_context["reviewer"] = peers["reviewer"]
+            if "ask" not in tool_names:
+                tool_names.append("ask")
+
+        self.setup_tools(tool_names, **tool_context)
+
+        messages = [
+            {"role": "system", "content": full_system},
+            {"role": "user", "content": user_prompt},
+        ]
+
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": full_system},
-                    {"role": "user", "content": user_prompt}
-                ],
+            generated_content, _ = await self.react_loop(
+                messages=messages,
+                tool_names=tool_names,
                 temperature=0.7,
                 max_tokens=4000,
             )
-            
-            generated_content = response.choices[0].message.content
             generated_content = self._clean_latex_output(generated_content)
-            
         except Exception as e:
             print(f"[WriterAgent] Error generating content: {e}")
             generated_content = f"% Error generating content: {str(e)}"
-        
+
         return {
             "generated_content": generated_content,
             "llm_calls": state.get("llm_calls", 0) + 1,
@@ -315,34 +345,28 @@ class WriterAgent(ReActAgent):
                     issues.append(f"Invalid citations: {invalid_citations}")
                     fixed_content = result.data.get("fixed_content", content)
         
-        # 2. Word count check
+        # 2. Word count (informational only — not a pass/fail criterion)
         word_counter = WordCountTool()
         target_words = state.get("target_words")
         wc_result = await word_counter.execute(content=fixed_content, target_words=target_words)
-        
         word_count = wc_result.data.get("word_count", 0) if wc_result.data else 0
         
-        if target_words:
-            min_words = int(target_words * 0.7)
-            max_words = int(target_words * 1.3)
-            
-            if word_count < min_words:
-                issues.append(f"Word count too low: {word_count} < {min_words} (target: {target_words})")
-            elif word_count > max_words:
-                warnings.append(f"Word count high: {word_count} > {max_words} (target: {target_words})")
-        
-        # 3. Key point coverage
+        # 3. Key point coverage — all key points must be addressed
         key_points = state.get("key_points", [])
         coverage = 1.0
+        missing_kps: list = []
         if key_points:
             kp_tool = KeyPointCoverageTool(key_points)
             kp_result = await kp_tool.execute(content=fixed_content)
             
             if kp_result.data:
                 coverage = kp_result.data.get("coverage", 1.0)
-                if coverage < 0.5:
-                    missing = kp_result.data.get("missing", [])
-                    warnings.append(f"Low key point coverage ({coverage:.0%}): {missing[:3]}")
+                missing_kps = kp_result.data.get("missing", [])
+                if coverage < 1.0 and missing_kps:
+                    issues.append(
+                        f"Missing key points ({coverage:.0%} coverage): "
+                        + "; ".join(missing_kps[:5])
+                    )
         
         # Determine if passed
         passed = len(issues) == 0
@@ -356,6 +380,7 @@ class WriterAgent(ReActAgent):
             "word_count": word_count,
             "target_words": target_words,
             "key_point_coverage": coverage,
+            "missing_key_points": missing_kps,
         }
         
         # Build revision prompt if needed
@@ -432,26 +457,28 @@ class WriterAgent(ReActAgent):
         
         if review_result.get("invalid_citations"):
             parts.append(f"\nREMOVE these invalid citations completely (do not replace): {review_result['invalid_citations']}")
-        
-        if review_result.get("word_count") and review_result.get("target_words"):
-            wc = review_result["word_count"]
-            target = review_result["target_words"]
-            if wc < target * 0.7:
-                parts.append(f"\nExpand content to approximately {target} words (currently {wc}).")
-            elif wc > target * 1.3:
-                parts.append(f"\nReduce content to approximately {target} words (currently {wc}).")
+
+        # Explicit guidance for missing key points
+        missing = review_result.get("missing_key_points", [])
+        if missing:
+            parts.append("\nYou MUST address the following key points that are currently missing:")
+            for kp in missing:
+                parts.append(f"  - {kp}")
         
         return "\n".join(parts)
 
     async def extract_references(self, state: WriterAgentState) -> Dict[str, Any]:
         """
-        Extract citation and figure references from generated content.
+        Extract citation and figure references from generated content,
+        then persist the result in SessionMemory if available.
         """
         print(f"[WriterAgent] Extracting references")
-        
+
         content = state.get("generated_content", "")
         citation_format = state.get("citation_format", "cite")
-        
+        section_type = state.get("section_type", "unknown")
+        memory = state.get("memory")
+
         # Extract citations
         cite_pattern = rf'\\{citation_format}\{{([^}}]+)\}}'
         citation_matches = re.findall(cite_pattern, content)
@@ -461,8 +488,7 @@ class WriterAgent(ReActAgent):
                 cid = cid.strip()
                 if cid and cid not in citation_ids:
                     citation_ids.append(cid)
-        
-        # Also check for standard \cite if format is different
+
         if citation_format != "cite":
             std_matches = re.findall(r'\\cite\{([^}]+)\}', content)
             for match in std_matches:
@@ -470,17 +496,27 @@ class WriterAgent(ReActAgent):
                     cid = cid.strip()
                     if cid and cid not in citation_ids:
                         citation_ids.append(cid)
-        
+
         # Extract figure references
         figure_pattern = r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}'
-        figure_ids = re.findall(figure_pattern, content)
-        figure_ids = list(set(figure_ids))
-        
+        figure_ids = list(set(re.findall(figure_pattern, content)))
+
         # Extract table references
         table_pattern = r'\\begin\{table\}.*?\\label\{([^}]+)\}'
-        table_ids = re.findall(table_pattern, content, re.DOTALL)
-        table_ids = list(set(table_ids))
-        
+        table_ids = list(set(re.findall(table_pattern, content, re.DOTALL)))
+
+        # Persist to SessionMemory
+        if memory is not None:
+            memory.update_section(section_type, content)
+            wc = len(content.split())
+            memory.log(
+                "writer", "generation", f"completed_{section_type}",
+                narrative=f"Writer finished drafting {section_type} ({wc} words, {len(citation_ids)} citations, {state.get('iteration', 1)} iteration(s)).",
+                word_count=wc,
+                iterations=state.get("iteration", 1),
+                citations=len(citation_ids),
+            )
+
         return {
             "citation_ids": citation_ids,
             "figure_ids": figure_ids,
@@ -523,34 +559,41 @@ class WriterAgent(ReActAgent):
         
         return content.strip()
 
-    async def run(self,
-                  system_prompt: str,
-                  user_prompt: str,
-                  section_type: str = "introduction",
-                  citation_format: str = "cite",
-                  constraints: Optional[List[str]] = None,
-                  valid_citation_keys: Optional[List[str]] = None,
-                  target_words: Optional[int] = None,
-                  key_points: Optional[List[str]] = None,
-                  max_iterations: int = 2,
-                  enable_review: bool = True):
+    async def run(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        section_type: str = "introduction",
+        citation_format: str = "cite",
+        constraints: Optional[List[str]] = None,
+        valid_citation_keys: Optional[List[str]] = None,
+        target_words: Optional[int] = None,
+        key_points: Optional[List[str]] = None,
+        max_iterations: int = 2,
+        enable_review: bool = True,
+        memory: Optional[Any] = None,
+        peers: Optional[Dict[str, Any]] = None,
+    ):
         """
-        Run the Writer Agent with iterative review.
-        
-        Args:
-            system_prompt: Full system prompt with context
-            user_prompt: User's writing instruction
-            section_type: Type of section being written
-            citation_format: Citation command format
-            constraints: Additional constraints
-            valid_citation_keys: List of valid citation keys for validation
-            target_words: Target word count for the section
-            key_points: Key points that should be covered
-            max_iterations: Maximum revision iterations (default 2)
-            enable_review: Whether to enable mini-review (default True)
+        Run the Writer Agent with iterative review and ReAct consultation.
 
-        Returns:
-            dict: Generated content and review results
+        - **Args**:
+            - `system_prompt` (str): Full system prompt with context
+            - `user_prompt` (str): Writing instruction
+            - `section_type` (str): Type of section being written
+            - `citation_format` (str): Citation command format
+            - `constraints` (List[str], optional): Additional constraints
+            - `valid_citation_keys` (List[str], optional): Valid citation keys
+            - `target_words` (int, optional): Target word count
+            - `key_points` (List[str], optional): Key points to cover
+            - `max_iterations` (int): Maximum revision iterations
+            - `enable_review` (bool): Whether to enable mini-review
+            - `memory` (SessionMemory, optional): Shared session memory
+            - `peers` (Dict, optional): Peer agents for AskTool routing
+              e.g. ``{"planner": planner_agent, "reviewer": reviewer_agent}``
+
+        - **Returns**:
+            - `dict`: Generated content and review results
         """
         initial_state = {
             "system_prompt": system_prompt,
@@ -569,8 +612,11 @@ class WriterAgent(ReActAgent):
             # Initialize iteration
             "iteration": 0,
             "review_history": [],
+            # Shared memory + peers for ReAct AskTool
+            "memory": memory,
+            "peers": peers,
         }
-        
+
         return await self.agent.ainvoke(initial_state)
 
     @property

@@ -80,10 +80,11 @@ def create_reviewer_router(agent: "ReviewerAgent") -> APIRouter:
                 sections=request.sections,
                 word_counts=request.word_counts,
                 target_pages=request.target_pages or 8,
-                section_targets=request.section_targets,  # From plan
+                section_targets=request.section_targets,
                 template_path=request.template_path,
                 style_guide=request.style_guide,
                 metadata=request.metadata,
+                memory_context=request.memory_context,
             )
             
             # Run review

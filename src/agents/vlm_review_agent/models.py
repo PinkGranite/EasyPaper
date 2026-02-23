@@ -96,6 +96,8 @@ class VLMReviewRequest(BaseModel):
     check_underfill: bool = True
     check_layout: bool = True
     sections_info: Optional[Dict[str, Any]] = None  # Section word counts, etc.
+    plan_context: Optional[Dict[str, Any]] = None  # Plan section targets from memory
+    prior_vlm_issues: Optional[List[str]] = None  # Issues from prior VLM reviews
     
     # Thresholds
     min_fill_percentage: float = 0.85  # Last page should be at least 85% filled

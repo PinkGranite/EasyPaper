@@ -151,7 +151,39 @@ class StyleChecker(FeedbackChecker):
             lower_content = content.lower()
             word_count = self._word_count(content)
 
-            # 1. Anti-pattern detection
+            # Split content into paragraphs for paragraph-level tracking
+            paragraphs = [p.strip() for p in re.split(r"\n\s*\n", content) if p.strip()]
+            para_issues_map: List[Dict] = []
+
+            for pidx, para_text in enumerate(paragraphs):
+                para_lower = para_text.lower()
+                para_problems: List[str] = []
+
+                # Anti-pattern detection per paragraph
+                for pat in anti_patterns:
+                    if pat.lower() in para_lower:
+                        count = para_lower.count(pat.lower())
+                        para_problems.append(f"AI-style word '{pat}' x{count}")
+
+                # Contraction detection per paragraph
+                contractions = _CONTRACTION_RE.findall(para_text)
+                if contractions:
+                    unique = list(set(c.lower() for c in contractions))[:3]
+                    para_problems.append(f"Contractions: {', '.join(unique)}")
+
+                if para_problems:
+                    preview = para_text[:50].replace("\n", " ")
+                    para_issues_map.append({
+                        "paragraph_index": pidx,
+                        "paragraph_preview": preview,
+                        "issues": para_problems,
+                        "severity": "warning",
+                        "suggestion": "Replace AI-style words and expand contractions",
+                    })
+
+            # Section-level checks (not paragraph-specific)
+
+            # 1. Anti-pattern detection (section aggregate)
             matched_patterns: List[str] = []
             for pat in anti_patterns:
                 if pat.lower() in lower_content:
@@ -162,7 +194,7 @@ class StyleChecker(FeedbackChecker):
                     f"AI-style words detected: {', '.join(matched_patterns)}"
                 )
 
-            # 2. Contraction detection
+            # 2. Contraction detection (section aggregate)
             contractions = _CONTRACTION_RE.findall(content)
             if contractions:
                 unique = list(set(c.lower() for c in contractions))[:5]
@@ -197,13 +229,6 @@ class StyleChecker(FeedbackChecker):
                 )
 
             # 5. Stacked connective adverbs
-            connectives = re.findall(
-                r"(?i)^(Furthermore|Moreover|Additionally|In addition|Besides|"
-                r"Also|Consequently|Hence|Thus|Therefore|Meanwhile|Likewise)[,\s]",
-                content,
-                re.MULTILINE,
-            )
-            # Check for consecutive connective-starting sentences
             sentences = re.split(r"(?<=[.!?])\s+", content)
             consecutive = 0
             max_consec = 0
@@ -231,6 +256,7 @@ class StyleChecker(FeedbackChecker):
                 all_issues.append({
                     "section": section_type,
                     "issues": section_issues,
+                    "paragraph_feedbacks": para_issues_map,
                 })
                 sections_to_revise[section_type] = "; ".join(section_issues)
 
@@ -247,6 +273,14 @@ class StyleChecker(FeedbackChecker):
                 f"{len(all_issues)} section(s)."
             )
 
+        # Collect paragraph feedbacks across all sections
+        paragraph_feedbacks: Dict[str, List[Dict]] = {}
+        for entry in all_issues:
+            sec = entry.get("section", "")
+            pfb = entry.get("paragraph_feedbacks", [])
+            if pfb:
+                paragraph_feedbacks[sec] = pfb
+
         return FeedbackResult(
             checker_name=self.name,
             passed=passed,
@@ -256,6 +290,7 @@ class StyleChecker(FeedbackChecker):
             details={
                 "section_issues": all_issues,
                 "sections_to_revise": sections_to_revise,
+                "paragraph_feedbacks": paragraph_feedbacks,
             },
         )
 
@@ -282,28 +317,45 @@ class StyleChecker(FeedbackChecker):
         """
         section_issues = feedback.details.get("section_issues", [])
         issues_for_section: List[str] = []
+        para_fb_for_section: List[Dict] = []
         for entry in section_issues:
             if entry.get("section") == section_type:
                 issues_for_section = entry.get("issues", [])
+                para_fb_for_section = entry.get("paragraph_feedbacks", [])
                 break
 
         if not issues_for_section:
             return ""
 
+        parts: List[str] = [f"Please fix the following STYLE issues in this {section_type} section:\n"]
+
+        # Paragraph-level details
+        if para_fb_for_section:
+            for pfb in para_fb_for_section:
+                pidx = pfb.get("paragraph_index", "?")
+                preview = pfb.get("paragraph_preview", "")
+                para_issues = pfb.get("issues", [])
+                parts.append(f"### Paragraph {pidx}" + (f' ("{preview}...")' if preview else ""))
+                for pi in para_issues:
+                    parts.append(f"  - {pi}")
+                suggestion = pfb.get("suggestion", "")
+                if suggestion:
+                    parts.append(f"  -> {suggestion}")
+                parts.append("")
+
+        # Section-level summary
         issues_text = "\n".join(f"- {issue}" for issue in issues_for_section)
+        parts.append(f"Section-level summary:\n{issues_text}")
 
-        return f"""Please fix the following STYLE issues in this {section_type} section:
-
-{issues_text}
-
+        parts.append("""
 Revision guidelines:
 1. Replace AI-style words with concrete, specific academic alternatives
-2. Expand all contractions to full forms (it's → it is, don't → do not)
+2. Expand all contractions to full forms (it's -> it is, don't -> do not)
 3. Reduce em-dash usage to at most one per paragraph
-4. Break up "First...Second...Third..." patterns — vary sentence structure
-5. Do NOT stack connective adverbs in consecutive sentences
+4. Break up "First...Second...Third..." patterns - vary sentence structure
+5. Do NOT stack connective adverbs in consecutive sentences""")
 
-Current content:
-{current_content}
+        parts.append(f"\nCurrent content:\n{current_content}")
+        parts.append("\nReturn the revised LaTeX content only.")
 
-Return the revised LaTeX content only."""
+        return "\n".join(parts)
