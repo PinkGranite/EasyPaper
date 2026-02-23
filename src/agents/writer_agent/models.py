@@ -40,8 +40,25 @@ class WriterPayload(BaseModel):
     valid_citation_keys: List[str] = Field(default_factory=list)
     target_words: Optional[int] = None
     key_points: List[str] = Field(default_factory=list)
+    revision_plan: Optional[Dict[str, Any]] = None
     max_iterations: int = 2
     enable_review: bool = True
+
+
+class ExecutionReceipt(BaseModel):
+    """
+    Writer execution-only receipt for one revision task.
+    - **Description**:
+        - Captures what was executed without policy decisions
+        - Standardized as target + instruction + constraints + disposition + evidence
+    """
+    target_id: str
+    section_type: str
+    disposition: str  # executed | no_change | failed
+    instruction: str = ""
+    constraints: Dict[str, Any] = Field(default_factory=dict)
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    paragraph_index: Optional[int] = None
 
 
 class GeneratedContent(BaseModel):
@@ -62,6 +79,8 @@ class GeneratedContent(BaseModel):
     review_passed: bool = True
     invalid_citations_removed: List[str] = Field(default_factory=list)
     paragraph_units: List[Dict[str, Any]] = Field(default_factory=list)
+    writer_response_section: List[ExecutionReceipt] = Field(default_factory=list)
+    writer_response_paragraph: List[ExecutionReceipt] = Field(default_factory=list)
 
 
 class ParagraphUnit(BaseModel):
@@ -100,3 +119,5 @@ class WriterResult(BaseModel):
     error: Optional[str] = None
     # Detailed review info
     review_history: List[ReviewResult] = Field(default_factory=list)
+    writer_response_section: List[ExecutionReceipt] = Field(default_factory=list)
+    writer_response_paragraph: List[ExecutionReceipt] = Field(default_factory=list)

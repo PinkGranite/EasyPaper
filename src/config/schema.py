@@ -22,7 +22,6 @@ class WriterConfig(BaseModel):
 class PaperSearchConfig(BaseModel):
     """Configuration for the paper search tool."""
     semantic_scholar_api_key: Optional[str] = None
-    default_max_results: int = 5
     timeout: int = 10
 
 

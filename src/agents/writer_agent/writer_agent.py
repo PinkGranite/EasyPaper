@@ -82,6 +82,7 @@ IMPORTANT:
 - Fix ALL issues mentioned in the feedback
 - Keep the same general structure and content
 - Make minimal changes needed to address the issues
+- Preserve existing valid citations and citation density unless the feedback explicitly requires removal.
 - If citations were flagged as invalid, REMOVE them entirely (don't replace with other citations)
 - NEVER use Markdown formatting — this is LaTeX. Use \\textbf{}, \\textit{}, \\subsection{}, \\begin{itemize}, etc.
 
@@ -140,7 +141,10 @@ class WriterAgentState(TypedDict):
     # Review results
     review_result: Optional[Dict[str, Any]]
     revision_prompt: Optional[str]
+    revision_plan: Optional[Dict[str, Any]]
     review_history: Annotated[List[Dict[str, Any]], operator.add]
+    writer_response_section: Annotated[List[Dict[str, Any]], operator.add]
+    writer_response_paragraph: Annotated[List[Dict[str, Any]], operator.add]
     
     # Final tracking
     invalid_citations_removed: Optional[List[str]]
@@ -410,15 +414,24 @@ class WriterAgent(ReActAgent):
         print(f"[WriterAgent] Revising content (iteration {state.get('iteration', 1) + 1})")
         
         revision_prompt = state.get("revision_prompt", "")
+        revision_plan = state.get("revision_plan") or {}
         previous_content = state.get("generated_content", "")
         original_user_prompt = state.get("user_prompt", "")
+        section_type = state.get("section_type", "unknown")
         
         # Build multi-turn conversation for revision
         messages = [
             {"role": "system", "content": REVISION_SYSTEM_PROMPT},
             {"role": "user", "content": f"Original request:\n{original_user_prompt}"},
             {"role": "assistant", "content": previous_content},
-            {"role": "user", "content": f"Review feedback - please revise:\n{revision_prompt}"}
+            {
+                "role": "user",
+                "content": (
+                    f"Review feedback - please revise:\n{revision_prompt}\n\n"
+                    f"Structured revision plan (must follow if provided):\n"
+                    f"{revision_plan}"
+                ),
+            }
         ]
         
         try:
@@ -435,11 +448,67 @@ class WriterAgent(ReActAgent):
         except Exception as e:
             print(f"[WriterAgent] Error revising content: {e}")
             revised_content = previous_content  # Keep previous if revision fails
+
+        changed = revised_content.strip() != previous_content.strip()
+        disposition = "executed" if changed else "no_change"
+        section_target = str(
+            revision_plan.get("section_type")
+            or revision_plan.get("target")
+            or section_type
+        )
+        normalized_constraints = revision_plan.get("constraints", {}) or {}
+        constraints_payload = {
+            "preserve_claims": (
+                normalized_constraints.get("preserve_claims", [])
+                if isinstance(normalized_constraints, dict)
+                else revision_plan.get("preserve_claims", [])
+            ),
+            "do_not_change": (
+                normalized_constraints.get("do_not_change", [])
+                if isinstance(normalized_constraints, dict)
+                else revision_plan.get("do_not_change", [])
+            ),
+        }
+        section_response = {
+            "target_id": section_target,
+            "section_type": section_target,
+            "instruction": str(
+                revision_plan.get("instruction")
+                or revision_prompt
+                or "Apply upstream review instructions exactly."
+            ),
+            "constraints": constraints_payload,
+            "disposition": disposition,
+            "evidence": {
+                "before_words": len(previous_content.split()),
+                "after_words": len(revised_content.split()),
+            },
+        }
+        paragraph_responses: List[Dict[str, Any]] = []
+        target_paragraphs = revision_plan.get("target_paragraphs", []) or []
+        para_instructions = revision_plan.get("paragraph_instructions", {}) or {}
+        for pidx in target_paragraphs:
+            if not isinstance(pidx, int) and not str(pidx).isdigit():
+                continue
+            pid = int(pidx)
+            paragraph_responses.append({
+                "target_id": f"{section_target}.p{pid}",
+                "section_type": section_target,
+                "paragraph_index": pid,
+                "instruction": str(para_instructions.get(pid, para_instructions.get(str(pid), ""))),
+                "constraints": constraints_payload,
+                "disposition": disposition,
+                "evidence": {
+                    "content_changed": changed,
+                },
+            })
         
         return {
             "generated_content": revised_content,
             "llm_calls": state.get("llm_calls", 0) + 1,
             "iteration": state.get("iteration", 1) + 1,
+            "writer_response_section": [section_response],
+            "writer_response_paragraph": paragraph_responses,
         }
 
     def _build_revision_prompt(self, review_result: Dict[str, Any]) -> str:
@@ -528,6 +597,8 @@ class WriterAgent(ReActAgent):
             "figure_ids": figure_ids,
             "table_ids": table_ids,
             "paragraph_units": paragraph_units,
+            "writer_response_section": state.get("writer_response_section", []),
+            "writer_response_paragraph": state.get("writer_response_paragraph", []),
         }
 
     def _extract_paragraph_units(
@@ -610,6 +681,7 @@ class WriterAgent(ReActAgent):
         valid_citation_keys: Optional[List[str]] = None,
         target_words: Optional[int] = None,
         key_points: Optional[List[str]] = None,
+        revision_plan: Optional[Dict[str, Any]] = None,
         max_iterations: int = 2,
         enable_review: bool = True,
         memory: Optional[Any] = None,
@@ -627,6 +699,7 @@ class WriterAgent(ReActAgent):
             - `valid_citation_keys` (List[str], optional): Valid citation keys
             - `target_words` (int, optional): Target word count
             - `key_points` (List[str], optional): Key points to cover
+            - `revision_plan` (Dict[str, Any], optional): Paragraph-level revision constraints
             - `max_iterations` (int): Maximum revision iterations
             - `enable_review` (bool): Whether to enable mini-review
             - `memory` (SessionMemory, optional): Shared session memory
@@ -648,11 +721,14 @@ class WriterAgent(ReActAgent):
             "valid_citation_keys": valid_citation_keys or [],
             "target_words": target_words,
             "key_points": key_points or [],
+            "revision_plan": revision_plan or {},
             "max_iterations": max_iterations,
             "enable_review": enable_review,
             # Initialize iteration
             "iteration": 0,
             "review_history": [],
+            "writer_response_section": [],
+            "writer_response_paragraph": [],
             # Shared memory + peers for ReAct AskTool
             "memory": memory,
             "peers": peers,

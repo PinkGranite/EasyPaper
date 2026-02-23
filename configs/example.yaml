@@ -69,7 +69,6 @@ agents:
 #   max_react_iterations: 3
 #   paper_search:
 #     semantic_scholar_api_key: null  # Optional: set for higher rate limits
-#     default_max_results: 5
 #     timeout: 10
 
   - name: vlm_review

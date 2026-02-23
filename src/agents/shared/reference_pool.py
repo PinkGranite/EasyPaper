@@ -65,7 +65,6 @@ class ReferencePool:
         cfg = paper_search_config or {}
         tool = PaperSearchTool(
             semantic_scholar_api_key=cfg.get("semantic_scholar_api_key"),
-            default_max_results=1,
             timeout=cfg.get("timeout", 10),
         )
 

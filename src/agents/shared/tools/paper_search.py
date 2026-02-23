@@ -467,7 +467,6 @@ class PaperSearchTool(WriterTool):
     def __init__(
         self,
         semantic_scholar_api_key: Optional[str] = None,
-        default_max_results: int = 5,
         timeout: int = 10,
     ):
         self._ss_client = SemanticScholarClient(
@@ -476,7 +475,6 @@ class PaperSearchTool(WriterTool):
         )
         # arXiv gets a shorter timeout to avoid blocking
         self._arxiv_client = ArxivClient(timeout=min(timeout, 5))
-        self._default_max_results = default_max_results
 
     @property
     def name(self) -> str:
@@ -503,8 +501,11 @@ class PaperSearchTool(WriterTool):
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum number of papers to return. Default is 5.",
-                    "default": 5
+                    "description": (
+                        "Maximum number of papers to return. "
+                        "The caller should choose this based on current writing needs."
+                    ),
+                    "minimum": 1
                 },
                 "year_range": {
                     "type": "string",
@@ -520,7 +521,7 @@ class PaperSearchTool(WriterTool):
                     "default": "semantic_scholar"
                 }
             },
-            "required": ["query"]
+            "required": ["query", "max_results"]
         }
 
     def _is_arxiv_available(self) -> bool:
@@ -603,7 +604,20 @@ class PaperSearchTool(WriterTool):
               - `bibtex`: Combined BibTeX string for all found papers.
               - `total_found`: Number of papers found.
         """
-        max_res = max_results or self._default_max_results
+        if max_results is None:
+            return ToolResult(
+                success=False,
+                message="Parameter 'max_results' is required and must be >= 1.",
+                data={"papers": [], "bibtex": "", "total_found": 0},
+            )
+        if max_results < 1:
+            return ToolResult(
+                success=False,
+                message="Parameter 'max_results' must be >= 1.",
+                data={"papers": [], "bibtex": "", "total_found": 0},
+            )
+
+        max_res = max_results
         print(f"[Tool:search_papers] Searching '{query}' (max={max_res}, "
               f"source={source}, years={year_range or 'any'})...")
 

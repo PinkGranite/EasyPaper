@@ -465,7 +465,6 @@ class PlannerAgent(BaseAgent):
         cfg = paper_search_config or {}
         tool = PaperSearchTool(
             semantic_scholar_api_key=cfg.get("semantic_scholar_api_key"),
-            default_max_results=cfg.get("default_max_results", 3),
             timeout=cfg.get("timeout", 10),
         )
 
@@ -492,7 +491,7 @@ class PlannerAgent(BaseAgent):
                 if i > 0:
                     await asyncio.sleep(1.5)
                 try:
-                    result = await tool.execute(query=query)
+                    result = await tool.execute(query=query, max_results=3)
                     if not result.success:
                         continue
                     papers = result.data.get("papers", []) if result.data else []

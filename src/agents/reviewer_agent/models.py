@@ -26,6 +26,18 @@ class FeedbackLevel(str, Enum):
     SENTENCE = "sentence"
 
 
+class IssueType(str, Enum):
+    """Canonical issue taxonomy for generalized review workflows."""
+    TERM_CONSISTENCY = "term_consistency"
+    LOGICAL_CONTRADICTION = "logical_contradiction"
+    CLAIM_EVIDENCE_GAP = "claim_evidence_gap"
+    UNSUPPORTED_GENERALIZATION = "unsupported_generalization"
+    STYLE_NOISE = "style_noise"
+    LATEX_FORMAT = "latex_format"
+    LAYOUT_CONSTRAINT = "layout_constraint"
+    OTHER = "other"
+
+
 class FeedbackResult(BaseModel):
     """
     Result from a single feedback checker
@@ -71,6 +83,58 @@ class HierarchicalFeedbackItem(BaseModel):
     confidence: float = 0.0
 
 
+class RevisionTask(BaseModel):
+    """
+    Executable revision task produced by review orchestration.
+    - **Description**:
+        - Encodes what to revise, why, and what to preserve
+        - Used by metadata-layer revision planners and exporters
+    """
+    task_id: str = ""
+    section_type: str
+    level: FeedbackLevel = FeedbackLevel.SECTION
+    target_id: str = ""
+    paragraph_indices: List[int] = Field(default_factory=list)
+    action: str = "revise"
+    priority: int = 5
+    rationale: str = ""
+    instruction: str = ""
+    preserve_claims: List[str] = Field(default_factory=list)
+    do_not_change: List[str] = Field(default_factory=list)
+    expected_change: str = ""
+    source_agents: List[str] = Field(default_factory=list)
+    source_checkers: List[str] = Field(default_factory=list)
+    issue_type: IssueType = IssueType.OTHER
+    acceptance_criteria: List[str] = Field(default_factory=list)
+
+
+class ConflictResolutionRecord(BaseModel):
+    """
+    Conflict resolution output for competing suggestions.
+    - **Description**:
+        - Captures what conflicted and why a decision was selected
+    """
+    section_type: str = ""
+    target_id: str = ""
+    candidates: List[Dict[str, Any]] = Field(default_factory=list)
+    selected_action: str = ""
+    selected_source: str = ""
+    reason: str = ""
+    applied_guardrail: Optional[str] = None
+
+
+class SemanticCheckRecord(BaseModel):
+    """
+    Before/after semantic consistency check record.
+    """
+    section_type: str
+    passed: bool = True
+    summary: str = ""
+    risks: List[str] = Field(default_factory=list)
+    action_taken: str = "accepted"
+    checker: str = "semantic_guard_llm"
+
+
 class ParagraphFeedback(BaseModel):
     """
     Feedback for a specific paragraph within a section.
@@ -108,6 +172,8 @@ class SectionFeedback(BaseModel):
     paragraph_instructions: Dict[int, str] = Field(default_factory=dict)
     feedback_level: FeedbackLevel = FeedbackLevel.SECTION
     target_id: str = ""  # e.g. "method" or "method.p3"
+    issue_type: IssueType = IssueType.OTHER
+    acceptance_criteria: List[str] = Field(default_factory=list)
 
 
 class ReviewContext(BaseModel):
@@ -166,6 +232,11 @@ class ReviewResult(BaseModel):
     requires_revision: Dict[str, List[str]] = Field(default_factory=dict)
     section_feedbacks: List[SectionFeedback] = Field(default_factory=list)
     hierarchical_feedbacks: List[HierarchicalFeedbackItem] = Field(default_factory=list)
+    revision_tasks: List[RevisionTask] = Field(default_factory=list)
+    decision_trace: List[Dict[str, Any]] = Field(default_factory=list)
+    conflict_resolution: List[ConflictResolutionRecord] = Field(default_factory=list)
+    semantic_checks: List[SemanticCheckRecord] = Field(default_factory=list)
+    orchestrator_summary: str = ""
     
     def add_feedback(self, feedback: FeedbackResult):
         """Add a feedback result and update passed status"""
@@ -183,6 +254,10 @@ class ReviewResult(BaseModel):
     def add_hierarchical_feedback(self, item: HierarchicalFeedbackItem):
         """Append hierarchical feedback item."""
         self.hierarchical_feedbacks.append(item)
+
+    def add_revision_task(self, task: RevisionTask):
+        """Append executable revision task."""
+        self.revision_tasks.append(task)
 
 
 class ReviewRequest(BaseModel):

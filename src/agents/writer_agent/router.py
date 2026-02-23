@@ -166,6 +166,7 @@ def create_writer_router(agent_instance):
                 valid_citation_keys=payload.valid_citation_keys,
                 target_words=payload.target_words,
                 key_points=payload.key_points,
+                revision_plan=payload.revision_plan,
                 max_iterations=payload.max_iterations,
                 enable_review=payload.enable_review,
             )
@@ -177,6 +178,8 @@ def create_writer_router(agent_instance):
             table_ids = agent_result.get("table_ids", [])
             invalid_citations_removed = agent_result.get("invalid_citations_removed", [])
             review_history = agent_result.get("review_history", [])
+            writer_response_section = agent_result.get("writer_response_section", [])
+            writer_response_paragraph = agent_result.get("writer_response_paragraph", [])
 
             # Calculate word count (rough estimate)
             word_count = len(generated_content.split())
@@ -193,6 +196,8 @@ def create_writer_router(agent_instance):
                 review_passed=agent_result.get("review_result", {}).get("passed", True),
                 invalid_citations_removed=invalid_citations_removed,
                 paragraph_units=agent_result.get("paragraph_units", []),
+                writer_response_section=writer_response_section,
+                writer_response_paragraph=writer_response_paragraph,
             )
 
             latency = time.time() - start
@@ -218,6 +223,8 @@ def create_writer_router(agent_instance):
                 status="ok",
                 result=result,
                 review_history=review_history_models,
+                writer_response_section=writer_response_section,
+                writer_response_paragraph=writer_response_paragraph,
             )
 
         except Exception as e:

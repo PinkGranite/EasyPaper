@@ -6,6 +6,8 @@ Reviewer Agent
     - Extensible architecture for adding new checkers
 """
 import logging
+import json
+import re
 from typing import List, Dict, Any, Optional, Type, TYPE_CHECKING
 from fastapi import APIRouter
 from openai import AsyncOpenAI
@@ -21,6 +23,8 @@ from .models import (
     ParagraphFeedback,
     HierarchicalFeedbackItem,
     FeedbackLevel,
+    RevisionTask,
+    IssueType,
 )
 from .checkers.base import FeedbackChecker
 from .checkers.word_count import WordCountChecker
@@ -374,6 +378,10 @@ class ReviewerAgent(BaseAgent):
                                     paragraph_instructions=sf.get("paragraph_instructions", {}),
                                     feedback_level=FeedbackLevel.SECTION,
                                     target_id=sf.get("target_id", section_type),
+                                    issue_type=self._coerce_issue_type(sf.get("issue_type", checker.name)),
+                                    acceptance_criteria=self._default_acceptance_criteria(
+                                        self._coerce_issue_type(sf.get("issue_type", checker.name))
+                                    ),
                                 )
                                 result.section_feedbacks.append(section_fb)
                                 result.add_hierarchical_feedback(HierarchicalFeedbackItem(
@@ -443,6 +451,8 @@ class ReviewerAgent(BaseAgent):
                                 paragraph_instructions=para_instructions,
                                 feedback_level=FeedbackLevel.SECTION,
                                 target_id=section_type,
+                                issue_type=self._coerce_issue_type(checker.name),
+                                acceptance_criteria=self._default_acceptance_criteria(self._coerce_issue_type(checker.name)),
                             )
                             result.section_feedbacks.append(section_fb)
                         
@@ -461,8 +471,219 @@ class ReviewerAgent(BaseAgent):
             len(result.feedbacks),
             len(result.requires_revision),
         )
-        
+        await self._orchestrate_reviewer_feedback(context=context, result=result)
         return result
+
+    async def _orchestrate_reviewer_feedback(
+        self,
+        context: ReviewContext,
+        result: ReviewResult,
+    ) -> None:
+        """
+        Synthesize checker outputs into unified hierarchical suggestions.
+        - **Description**:
+            - Uses an LLM orchestrator for cross-checker consolidation
+            - Falls back to deterministic task extraction when LLM fails
+        """
+        if not result.section_feedbacks and not result.hierarchical_feedbacks:
+            return
+
+        prompt_payload = {
+            "sections": list(context.sections.keys()),
+            "feedbacks": [
+                fb.model_dump() if hasattr(fb, "model_dump") else fb
+                for fb in result.feedbacks
+            ],
+            "section_feedbacks": [
+                sf.model_dump() if hasattr(sf, "model_dump") else sf
+                for sf in result.section_feedbacks
+            ],
+            "hierarchical_feedbacks": [
+                hf.model_dump() if hasattr(hf, "model_dump") else hf
+                for hf in result.hierarchical_feedbacks
+            ],
+        }
+
+        llm_output: Dict[str, Any] = {}
+        try:
+            llm_client = AsyncOpenAI(
+                api_key=self.config.api_key,
+                base_url=self.config.base_url,
+            )
+            response = await llm_client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a reviewer orchestrator. Merge checker outputs into "
+                            "an executable revision plan. Return JSON only with keys: "
+                            "summary, revision_tasks. Each revision task must include "
+                            "section_type, level, target_id, paragraph_indices, action, "
+                            "priority (1-10), rationale, instruction, preserve_claims, "
+                            "do_not_change, expected_change, source_agents, source_checkers, "
+                            "issue_type, acceptance_criteria."
+                        ),
+                    },
+                    {"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False)},
+                ],
+                temperature=0.2,
+                max_tokens=2000,
+            )
+            raw = response.choices[0].message.content or ""
+            cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip())
+            cleaned = re.sub(r"\n?```\s*$", "", cleaned)
+            llm_output = json.loads(cleaned) if cleaned else {}
+        except Exception as e:
+            logger.warning("reviewer.orchestrator_llm_failed: %s", e)
+            llm_output = {}
+
+        tasks_data = llm_output.get("revision_tasks") if isinstance(llm_output, dict) else None
+        if isinstance(tasks_data, list) and tasks_data:
+            for idx, task in enumerate(tasks_data):
+                try:
+                    parsed = RevisionTask(
+                        task_id=task.get("task_id") or f"rt_{result.iteration}_{idx}",
+                        section_type=str(task.get("section_type", "")),
+                        level=FeedbackLevel(str(task.get("level", "section"))),
+                        target_id=str(task.get("target_id", task.get("section_type", ""))),
+                        paragraph_indices=[int(x) for x in task.get("paragraph_indices", [])],
+                        action=str(task.get("action", "revise")),
+                        priority=max(1, min(10, int(task.get("priority", 5)))),
+                        rationale=str(task.get("rationale", "")),
+                        instruction=str(task.get("instruction", "")),
+                        preserve_claims=[str(x) for x in task.get("preserve_claims", [])],
+                        do_not_change=[str(x) for x in task.get("do_not_change", [])],
+                        expected_change=str(task.get("expected_change", "")),
+                        source_agents=[str(x) for x in task.get("source_agents", ["reviewer"])],
+                        source_checkers=[str(x) for x in task.get("source_checkers", [])],
+                        issue_type=IssueType(str(task.get("issue_type", "other"))),
+                        acceptance_criteria=[str(x) for x in task.get("acceptance_criteria", [])],
+                    )
+                    if parsed.section_type:
+                        if not parsed.acceptance_criteria:
+                            parsed.acceptance_criteria = self._default_acceptance_criteria(parsed.issue_type)
+                        result.add_revision_task(parsed)
+                except Exception:
+                    continue
+
+        if not result.revision_tasks:
+            # Deterministic fallback task extraction.
+            for idx, sf in enumerate(result.section_feedbacks):
+                result.add_revision_task(RevisionTask(
+                    task_id=f"rt_fallback_{result.iteration}_{idx}",
+                    section_type=sf.section_type,
+                    level=FeedbackLevel.PARAGRAPH if sf.target_paragraphs else FeedbackLevel.SECTION,
+                    target_id=sf.target_id or sf.section_type,
+                    paragraph_indices=sf.target_paragraphs or [],
+                    action=sf.action or "revise",
+                    priority=8 if sf.action in ("fix_latex", "logic_fix") else 6,
+                    rationale=sf.revision_prompt[:240],
+                    instruction=sf.revision_prompt,
+                    preserve_claims=["Preserve factual claims and citations"],
+                    do_not_change=["Do not introduce unsupported claims"],
+                    expected_change="Address reviewer issues with minimal regression",
+                    source_agents=["reviewer"],
+                    source_checkers=list({
+                        hf.checker for hf in result.hierarchical_feedbacks
+                        if hf.section_type == sf.section_type and hf.checker
+                    }),
+                    issue_type=IssueType.OTHER,
+                    acceptance_criteria=self._default_acceptance_criteria(IssueType.OTHER),
+                ))
+
+        result.orchestrator_summary = str(llm_output.get("summary", "")).strip() if isinstance(llm_output, dict) else ""
+        if not result.orchestrator_summary:
+            result.orchestrator_summary = (
+                f"Built {len(result.revision_tasks)} executable revision task(s) from checker evidence."
+            )
+
+    async def verify_execution(
+        self,
+        section_type: str,
+        task_contract: Dict[str, Any],
+        before_text: str,
+        after_text: str,
+        semantic_passed: bool,
+        semantic_summary: str,
+    ) -> Dict[str, Any]:
+        """
+        Build reviewer-side acceptance conclusion for one revision task.
+        - **Description**:
+            - Reviewer owns acceptance judgment; Writer only returns execution receipts
+            - Semantic consistency is treated as a hard acceptance gate
+        """
+        changed = (before_text or "").strip() != (after_text or "").strip()
+        passed = bool(semantic_passed and changed)
+        criteria = [str(x) for x in (task_contract.get("acceptance_criteria", []) or [])]
+        gate_map: Dict[str, bool] = {
+            "execution_changed": changed,
+            "semantic_preserved": bool(semantic_passed),
+            "contradiction_resolved": bool(semantic_passed and changed),
+            "evidence_sufficient": bool(semantic_passed and changed),
+        }
+        gate_results = [
+            {
+                "gate": gate,
+                "passed": bool(gate_map.get(gate, True)),
+            }
+            for gate in criteria
+        ]
+        if criteria:
+            passed = all(bool(item.get("passed", False)) for item in gate_results)
+        return {
+            "section_type": section_type,
+            "target": str(task_contract.get("target") or section_type),
+            "instruction": str(task_contract.get("instruction") or ""),
+            "constraints": task_contract.get("constraints", {}),
+            "passed": passed,
+            "changed": changed,
+            "semantic_passed": bool(semantic_passed),
+            "acceptance_criteria": criteria,
+            "acceptance_gates": gate_results,
+            "summary": (
+                "Accepted: revision executed and semantic consistency passed."
+                if passed
+                else "Rejected: no effective change or semantic consistency failed."
+            ),
+            "reason": semantic_summary,
+            "source_agent": "reviewer",
+            "source_stage": "reviewer_verification",
+        }
+
+    @staticmethod
+    def _default_acceptance_criteria(issue_type: IssueType) -> List[str]:
+        """
+        Return default acceptance gates by issue type.
+        - **Description**:
+            - Provides generalized, reusable verification gates
+            - Keeps orchestration robust even when LLM omits criteria
+        """
+        base = ["execution_changed", "semantic_preserved"]
+        if issue_type == IssueType.LOGICAL_CONTRADICTION:
+            return base + ["contradiction_resolved"]
+        if issue_type in (IssueType.CLAIM_EVIDENCE_GAP, IssueType.UNSUPPORTED_GENERALIZATION):
+            return base + ["evidence_sufficient"]
+        return base
+
+    @staticmethod
+    def _coerce_issue_type(raw: Any) -> IssueType:
+        """Convert raw issue type string to canonical enum with fallback."""
+        value = str(raw or "").strip().lower()
+        aliases = {
+            "logic": IssueType.LOGICAL_CONTRADICTION,
+            "logic_check": IssueType.LOGICAL_CONTRADICTION,
+            "style": IssueType.STYLE_NOISE,
+            "style_check": IssueType.STYLE_NOISE,
+            "fix_latex": IssueType.LATEX_FORMAT,
+            "layout": IssueType.LAYOUT_CONSTRAINT,
+        }
+        if value in aliases:
+            return aliases[value]
+        try:
+            return IssueType(value)
+        except Exception:
+            return IssueType.OTHER
     
     def get_revision_prompt(
         self,

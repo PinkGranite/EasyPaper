@@ -221,6 +221,13 @@ class LogicChecker(FeedbackChecker):
         issues = result.get("issues", [])
         passed = result.get("passed", True)
         summary = result.get("summary", "")
+        severity = Severity.WARNING if not passed else Severity.INFO
+        if any(i.get("severity") in ("high", "critical") for i in issues):
+            severity = Severity.ERROR
+        message = summary if summary else (
+            f"Logic check found {len(issues)} issue(s)." if issues
+            else "Logic check passed."
+        )
 
         # Build sections_to_revise map
         sections_to_revise: Dict[str, str] = {}
@@ -276,15 +283,6 @@ class LogicChecker(FeedbackChecker):
                 "message": message,
                 "suggested_action": "logic_fix",
             })
-
-        severity = Severity.WARNING if not passed else Severity.INFO
-        if any(i.get("severity") == "high" for i in issues):
-            severity = Severity.ERROR
-
-        message = summary if summary else (
-            f"Logic check found {len(issues)} issue(s)." if issues
-            else "Logic check passed."
-        )
 
         return FeedbackResult(
             checker_name=self.name,

@@ -10,6 +10,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any
+import hashlib
 
 from pydantic import BaseModel, Field
 
@@ -38,6 +39,16 @@ class ReviewRecord(BaseModel):
     section_feedbacks: Dict[str, Any] = Field(default_factory=dict)
     hierarchical_feedbacks: List[Dict[str, Any]] = Field(default_factory=list)
     agent_feedbacks: Dict[str, Dict[str, List[Dict[str, Any]]]] = Field(default_factory=dict)
+    decision_trace: List[Dict[str, Any]] = Field(default_factory=list)
+    revision_plan: List[Dict[str, Any]] = Field(default_factory=list)
+    before_after_semantic_check: List[Dict[str, Any]] = Field(default_factory=list)
+    conflict_resolution: List[Dict[str, Any]] = Field(default_factory=list)
+    baseline_gap_audit: Dict[str, Any] = Field(default_factory=dict)
+    issue_lifecycle: List[Dict[str, Any]] = Field(default_factory=list)
+    writer_response_section: List[Dict[str, Any]] = Field(default_factory=list)
+    writer_response_paragraph: List[Dict[str, Any]] = Field(default_factory=list)
+    reviewer_verification: List[Dict[str, Any]] = Field(default_factory=list)
+    regression_report: Dict[str, Any] = Field(default_factory=dict)
     actions_taken: List[str] = Field(default_factory=list)
     result_snapshot: Dict[str, int] = Field(default_factory=dict)
 
@@ -84,27 +95,61 @@ class ReviewRecord(BaseModel):
         """
         Build iteration-centric hierarchical export payload.
         - **Description**:
-            - Groups feedback by agent and level for downstream analysis
+            - Groups feedback by level (document/section/paragraph/sentence)
+            - Each feedback item explicitly includes source_agent/source_stage
             - Preserves actions and a compact result snapshot
         """
-        # Build level buckets from flat hierarchical feedback if explicit
-        # per-agent buckets are unavailable.
-        agent_feedbacks = self.agent_feedbacks or {}
-        if not agent_feedbacks and self.hierarchical_feedbacks:
-            for item in self.hierarchical_feedbacks:
-                agent = str(item.get("agent", "reviewer"))
-                level = str(item.get("level", "section"))
-                if agent not in agent_feedbacks:
-                    agent_feedbacks[agent] = {
-                        "document_feedbacks": [],
-                        "section_feedbacks": [],
-                        "paragraph_feedbacks": [],
-                        "sentence_feedbacks": [],
-                    }
+        level_buckets: Dict[str, List[Dict[str, Any]]] = {
+            "document_feedbacks": [],
+            "section_feedbacks": [],
+            "paragraph_feedbacks": [],
+            "sentence_feedbacks": [],
+        }
+
+        # Primary source: grouped agent feedbacks assembled by metadata agent.
+        if self.agent_feedbacks:
+            for agent_name, grouped in self.agent_feedbacks.items():
+                if not isinstance(grouped, dict):
+                    continue
+                for bucket in level_buckets.keys():
+                    for raw_item in (grouped.get(bucket, []) or []):
+                        if not isinstance(raw_item, dict):
+                            continue
+                        item = dict(raw_item)
+                        source_agent = str(
+                            item.get("source_agent")
+                            or item.get("agent")
+                            or item.get("checker")
+                            or agent_name
+                            or "reviewer"
+                        )
+                        source_stage = str(item.get("source_stage") or source_agent)
+                        item["source_agent"] = source_agent
+                        item["source_stage"] = source_stage
+                        item.setdefault("agent", source_agent)
+                        level_buckets[bucket].append(item)
+
+        # Fallback source: flat hierarchical feedbacks.
+        if not any(level_buckets.values()) and self.hierarchical_feedbacks:
+            for raw_item in self.hierarchical_feedbacks:
+                if not isinstance(raw_item, dict):
+                    continue
+                item = dict(raw_item)
+                level = str(item.get("level", "section")).strip().lower()
                 bucket = f"{level}_feedbacks"
-                if bucket not in agent_feedbacks[agent]:
+                if bucket not in level_buckets:
                     bucket = "section_feedbacks"
-                agent_feedbacks[agent][bucket].append(item)
+                source_agent = str(
+                    item.get("source_agent")
+                    or item.get("agent")
+                    or item.get("checker")
+                    or "reviewer"
+                )
+                source_stage = str(item.get("source_stage") or source_agent)
+                item["source_agent"] = source_agent
+                item["source_stage"] = source_stage
+                item.setdefault("agent", source_agent)
+                level_buckets[bucket].append(item)
 
         return {
             "iteration": self.iteration,
@@ -112,7 +157,20 @@ class ReviewRecord(BaseModel):
             "timestamp": self.timestamp,
             "passed": self.passed,
             "summary": self.feedback_summary,
-            "agents": agent_feedbacks,
+            "document_feedbacks": level_buckets["document_feedbacks"],
+            "section_feedbacks": level_buckets["section_feedbacks"],
+            "paragraph_feedbacks": level_buckets["paragraph_feedbacks"],
+            "sentence_feedbacks": level_buckets["sentence_feedbacks"],
+            "decision_trace": self.decision_trace,
+            "revision_plan": self.revision_plan,
+            "before_after_semantic_check": self.before_after_semantic_check,
+            "conflict_resolution": self.conflict_resolution,
+            "baseline_gap_audit": self.baseline_gap_audit,
+            "issue_lifecycle": self.issue_lifecycle,
+            "writer_response_section": self.writer_response_section,
+            "writer_response_paragraph": self.writer_response_paragraph,
+            "reviewer_verification": self.reviewer_verification,
+            "regression_report": self.regression_report,
             "actions_taken": self.actions_taken,
             "result_snapshot": self.result_snapshot,
         }
@@ -148,6 +206,7 @@ class SessionMemory:
         self.contributions: List[str] = []
         self.review_history: List[ReviewRecord] = []
         self.agent_logs: List[AgentLogEntry] = []
+        self.issue_store: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Query interface
@@ -202,6 +261,180 @@ class SessionMemory:
         if not record.timestamp:
             record.timestamp = datetime.now().isoformat()
         self.review_history.append(record)
+
+    @staticmethod
+    def _make_issue_id(item: Dict[str, Any]) -> str:
+        """
+        Builds a stable issue identifier from normalized fields.
+        - **Description**:
+         - Uses target, issue type, checker/source, and message fingerprint to deduplicate issues across iterations.
+
+        - **Args**:
+         - `item` (Dict[str, Any]): Hierarchical feedback item.
+
+        - **Returns**:
+         - `issue_id` (str): Stable hashed issue id.
+        """
+        target_id = str(item.get("target_id", "document"))
+        issue_type = str(item.get("issue_type", "issue")).lower()
+        checker = str(item.get("checker", item.get("source_agent", "reviewer"))).lower()
+        message = str(item.get("message", "")).strip().lower()
+        msg_digest = hashlib.sha1(message.encode("utf-8")).hexdigest()[:10]
+        return f"{target_id}|{issue_type}|{checker}|{msg_digest}"
+
+    @staticmethod
+    def _infer_locked_mode(item: Dict[str, Any]) -> str:
+        """
+        Infers lock mode for issue stability policy.
+        - **Returns**:
+         - `locked_mode` (str): `hard` for logic/fact/citation correctness, else `soft`.
+        """
+        issue_type = str(item.get("issue_type", "")).lower()
+        message = str(item.get("message", "")).lower()
+        hard_keywords = [
+            "logic", "contradiction", "fact", "citation", "reference",
+            "broken", "invalid", "latex", "compile",
+        ]
+        if any(k in issue_type for k in hard_keywords) or any(k in message for k in hard_keywords):
+            return "hard"
+        return "soft"
+
+    def update_issue_lifecycle(
+        self,
+        iteration: int,
+        hierarchical_feedbacks: List[Dict[str, Any]],
+        writer_response_section: Optional[List[Dict[str, Any]]] = None,
+        writer_response_paragraph: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Updates issue lifecycle state from current iteration signals.
+        - **Description**:
+         - Creates or updates issue records for current feedback.
+         - Marks unresolved prior issues as resolved/regressed according to writer outcomes.
+         - Produces iteration-level lifecycle delta and regression report.
+
+        - **Args**:
+         - `iteration` (int): Current review iteration.
+         - `hierarchical_feedbacks` (List[Dict[str, Any]]): Current review feedback items.
+         - `writer_response_section` (Optional[List[Dict[str, Any]]]): Section-level writer responses.
+         - `writer_response_paragraph` (Optional[List[Dict[str, Any]]): Paragraph-level writer responses.
+
+        - **Returns**:
+         - `result` (Dict[str, Any]): Contains lifecycle events and regression counters.
+        """
+        current_ids: set = set()
+        lifecycle_events: List[Dict[str, Any]] = []
+        section_resp = writer_response_section or []
+        para_resp = writer_response_paragraph or []
+
+        for raw in hierarchical_feedbacks or []:
+            if not isinstance(raw, dict):
+                continue
+            issue_id = self._make_issue_id(raw)
+            current_ids.add(issue_id)
+            locked_mode = self._infer_locked_mode(raw)
+            existing = self.issue_store.get(issue_id)
+            if existing is None:
+                rec = {
+                    "issue_id": issue_id,
+                    "target_id": str(raw.get("target_id", "document")),
+                    "section_type": str(raw.get("section_type") or ""),
+                    "level": str(raw.get("level", "section")),
+                    "source_agent": str(raw.get("source_agent") or raw.get("agent") or "reviewer"),
+                    "checker": str(raw.get("checker") or ""),
+                    "issue_type": str(raw.get("issue_type") or "issue"),
+                    "message": str(raw.get("message") or ""),
+                    "severity": str(raw.get("severity") or "warning"),
+                    "status": "open",
+                    "first_iteration": iteration,
+                    "last_iteration": iteration,
+                    "locked_mode": locked_mode,
+                    "history": [{"iteration": iteration, "status": "open"}],
+                }
+                self.issue_store[issue_id] = rec
+                lifecycle_events.append({
+                    "issue_id": issue_id,
+                    "event": "created",
+                    "status": "open",
+                    "locked_mode": locked_mode,
+                })
+            else:
+                previous_status = str(existing.get("status", "open"))
+                new_status = "regressed" if previous_status == "resolved" else "open"
+                existing["status"] = new_status
+                existing["last_iteration"] = iteration
+                existing["history"].append({"iteration": iteration, "status": new_status})
+                lifecycle_events.append({
+                    "issue_id": issue_id,
+                    "event": "seen_again",
+                    "status": new_status,
+                    "from_status": previous_status,
+                    "locked_mode": existing.get("locked_mode", locked_mode),
+                })
+
+        handled_targets = {
+            str(r.get("target_id") or r.get("section_type") or "")
+            for r in section_resp + para_resp
+            if isinstance(r, dict)
+        }
+        reopened_hard = 0
+        for issue_id, rec in self.issue_store.items():
+            if rec.get("last_iteration") == iteration:
+                continue
+            target = str(rec.get("target_id", ""))
+            section_type = str(rec.get("section_type", ""))
+            if target in handled_targets or section_type in handled_targets:
+                prev_status = str(rec.get("status", "open"))
+                rec["status"] = "resolved"
+                rec["history"].append({"iteration": iteration, "status": "resolved"})
+                lifecycle_events.append({
+                    "issue_id": issue_id,
+                    "event": "resolved_by_writer",
+                    "from_status": prev_status,
+                    "status": "resolved",
+                    "locked_mode": rec.get("locked_mode", "soft"),
+                })
+                if prev_status == "regressed" and rec.get("locked_mode") == "hard":
+                    reopened_hard += 1
+
+        unresolved = sum(1 for rec in self.issue_store.values() if rec.get("status") in ("open", "regressed", "in_progress"))
+        reopened_total = sum(1 for event in lifecycle_events if event.get("status") == "regressed")
+        hard_violations = sum(
+            1 for event in lifecycle_events
+            if event.get("status") == "regressed" and event.get("locked_mode") == "hard"
+        )
+        regression_report = {
+            "iteration": iteration,
+            "created_issues": sum(1 for e in lifecycle_events if e.get("event") == "created"),
+            "reopened_issues": reopened_total,
+            "hard_lock_violations": hard_violations,
+            "resolved_issues": sum(1 for e in lifecycle_events if e.get("event") == "resolved_by_writer"),
+            "unresolved_issues": unresolved,
+            "recovered_hard_regressions": reopened_hard,
+        }
+        return {
+            "issue_lifecycle": lifecycle_events,
+            "regression_report": regression_report,
+        }
+
+    def get_issue_context(self, limit: int = 40) -> Dict[str, Any]:
+        """
+        Returns issue-memory context for reviewer/writer prompts.
+        - **Args**:
+         - `limit` (int): Maximum issues to include.
+        - **Returns**:
+         - `context` (Dict[str, Any]): Unresolved/resolved issue summaries.
+        """
+        all_items = list(self.issue_store.values())
+        unresolved = [x for x in all_items if x.get("status") in ("open", "regressed", "in_progress")]
+        resolved = [x for x in all_items if x.get("status") == "resolved"]
+        unresolved = sorted(unresolved, key=lambda x: (x.get("last_iteration", 0), x.get("severity", "")), reverse=True)[:limit]
+        resolved = sorted(resolved, key=lambda x: x.get("last_iteration", 0), reverse=True)[: max(1, limit // 3)]
+        return {
+            "unresolved_issues": unresolved,
+            "recent_resolved_issues": resolved,
+            "issue_store_size": len(all_items),
+        }
 
     def log(
         self,
@@ -380,6 +613,7 @@ class SessionMemory:
             "prior_issues": prior_issues,
             "word_counts": word_counts,
             "contributions": self.contributions,
+            "issue_memory": self.get_issue_context(limit=30),
         }
 
     # ------------------------------------------------------------------
@@ -577,6 +811,106 @@ class SessionMemory:
     # Persistence
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _extract_top_issues(record: ReviewRecord, limit: int = 5) -> List[Dict[str, Any]]:
+        issues: List[Dict[str, Any]] = []
+        for item in record.hierarchical_feedbacks:
+            if not isinstance(item, dict):
+                continue
+            message = str(item.get("message", "")).strip()
+            if not message:
+                continue
+            issues.append({
+                "target": str(item.get("target_id", "document")),
+                "level": str(item.get("level", "section")),
+                "source_agent": str(item.get("source_agent") or item.get("agent") or "reviewer"),
+                "issue": message[:240],
+            })
+            if len(issues) >= limit:
+                break
+        if issues:
+            return issues
+        if record.feedback_summary:
+            return [{
+                "target": "document",
+                "level": "document",
+                "source_agent": record.reviewer,
+                "issue": record.feedback_summary[:240],
+            }]
+        return []
+
+    @staticmethod
+    def _extract_core_tasks(record: ReviewRecord, limit: int = 6) -> List[Dict[str, Any]]:
+        tasks: List[Dict[str, Any]] = []
+        for raw in record.revision_plan:
+            if not isinstance(raw, dict):
+                continue
+            instruction = str(raw.get("instruction", "")).strip()
+            if not instruction:
+                continue
+            tasks.append({
+                "target": str(raw.get("target_id") or raw.get("target") or raw.get("section_type") or "unknown"),
+                "instruction": instruction[:260],
+                "constraints": {
+                    "preserve_claims": raw.get("preserve_claims", []),
+                    "do_not_change": raw.get("do_not_change", []),
+                },
+                "reason": str(raw.get("rationale", ""))[:220],
+            })
+            if len(tasks) >= limit:
+                break
+        return tasks
+
+    @staticmethod
+    def _extract_risks(record: ReviewRecord, limit: int = 5) -> List[str]:
+        risks: List[str] = []
+        for event in record.issue_lifecycle:
+            if not isinstance(event, dict):
+                continue
+            status = str(event.get("status", ""))
+            if status in ("open", "regressed"):
+                msg = str(event.get("message", "")).strip()
+                target = str(event.get("target_id", ""))
+                if msg:
+                    risks.append(f"{target}: {msg[:180]}")
+            if len(risks) >= limit:
+                break
+        if not risks:
+            report = record.regression_report or {}
+            reopened = int(report.get("reopened_count", 0) or 0)
+            hard_lock = int(report.get("hard_lock_violations", 0) or 0)
+            if reopened > 0:
+                risks.append(f"reopened issues: {reopened}")
+            if hard_lock > 0:
+                risks.append(f"hard lock violations: {hard_lock}")
+        return risks[:limit]
+
+    def _build_readable_review_payload(self) -> Dict[str, Any]:
+        iterations: List[Dict[str, Any]] = []
+        for record in self.review_history:
+            verification = [
+                item for item in record.reviewer_verification
+                if isinstance(item, dict)
+            ]
+            iteration_status = "passed"
+            if any(not bool(v.get("passed", False)) for v in verification):
+                iteration_status = "needs_followup"
+            elif not record.passed:
+                iteration_status = "issues_detected"
+            iterations.append({
+                "iteration": record.iteration,
+                "status": iteration_status,
+                "top_issues": self._extract_top_issues(record),
+                "core_revision_tasks": self._extract_core_tasks(record),
+                "revision_result": {
+                    "reviewer_verification": verification,
+                    "semantic_checks": record.before_after_semantic_check,
+                    "summary": record.feedback_summary,
+                },
+                "open_risks": self._extract_risks(record),
+            })
+        return {"iterations": iterations}
+
     def persist_reviews(self, output_dir: Path) -> None:
         """
         Save review history as a flat, human-readable list of ReviewEntry items.
@@ -591,6 +925,24 @@ class SessionMemory:
         payload = {"iterations": iterations}
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         logger.info("session_memory.persisted_reviews path=%s iterations=%d", path, len(iterations))
+
+    def persist_readable_reviews(self, output_dir: Path) -> None:
+        """
+        Save concise human-readable review history.
+
+        - **Args**:
+            - `output_dir` (Path): Paper output directory
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        path = output_dir / "review_history_readable.json"
+        payload = self._build_readable_review_payload()
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        logger.info(
+            "session_memory.persisted_readable_reviews path=%s iterations=%d",
+            path,
+            len(payload.get("iterations", [])),
+        )
 
     def persist_logs(self, output_dir: Path) -> None:
         """
@@ -609,4 +961,5 @@ class SessionMemory:
     def persist_all(self, output_dir: Path) -> None:
         """Persist both reviews and logs."""
         self.persist_reviews(output_dir)
+        self.persist_readable_reviews(output_dir)
         self.persist_logs(output_dir)

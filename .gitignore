@@ -50,3 +50,5 @@ outputs/
 test*
 __*
 .cursor/
+docs/
+evaluation/

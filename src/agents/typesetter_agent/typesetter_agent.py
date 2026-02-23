@@ -282,7 +282,7 @@ class TypesetterAgent(BaseAgent):
         print(f"INPUT STATE [fetch_resources]: figure_ids={state.get('figure_ids')}")
         
         work_dir = state.get("work_dir")
-        figure_ids = state.get("figure_ids", [])
+        figure_ids = self._resolve_figure_ids(state)
         figures_dir = os.path.join(work_dir, "figures")
         
         resources = []
@@ -329,7 +329,133 @@ class TypesetterAgent(BaseAgent):
                 
                 resources.append(resource)
         
-        return {"resources": resources}
+        return {"resources": resources, "figure_ids": figure_ids}
+
+    def _resolve_figure_ids(self, state: TypesetterAgentState) -> List[str]:
+        """
+        Resolve figure IDs from payload and LaTeX content.
+        - **Description**:
+            - Prioritizes explicit `figure_ids` from caller.
+            - Falls back to parsing includegraphics targets and figure_paths keys.
+
+        - **Args**:
+            - `state` (TypesetterAgentState): Current workflow state.
+
+        - **Returns**:
+            - `figure_ids` (List[str]): Deduplicated figure IDs.
+        """
+        ids: set[str] = set()
+        for item in (state.get("figure_ids") or []):
+            if item:
+                ids.add(str(item))
+        for key in (state.get("figure_paths") or {}).keys():
+            if key:
+                ids.add(str(key))
+
+        if not ids:
+            latex_content = state.get("latex_content", "") or ""
+            sections = state.get("sections") or {}
+            combined = latex_content + "\n" + "\n".join(
+                content for content in sections.values() if isinstance(content, str)
+            )
+            for token in self._extract_includegraphics_targets(combined):
+                ids.add(token)
+        return sorted(ids)
+
+    @staticmethod
+    def _extract_includegraphics_targets(content: str) -> List[str]:
+        """
+        Extract likely figure IDs from includegraphics targets.
+        - **Description**:
+            - Skips explicit path-like targets and common file extensions.
+
+        - **Args**:
+            - `content` (str): LaTeX content.
+
+        - **Returns**:
+            - `targets` (List[str]): Candidate figure IDs.
+        """
+        pattern = r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}'
+        targets: List[str] = []
+        seen = set()
+        for raw in re.findall(pattern, content or ""):
+            token = str(raw).strip()
+            if not token:
+                continue
+            if "/" in token or token.startswith(".") or token.endswith(
+                (".png", ".jpg", ".jpeg", ".pdf", ".svg")
+            ):
+                continue
+            if token not in seen:
+                seen.add(token)
+                targets.append(token)
+        return targets
+
+    @staticmethod
+    def _strip_graphics_extension(path: str) -> str:
+        """
+        Strip known graphics extensions for LaTeX includegraphics.
+        - **Args**:
+            - `path` (str): Input graphics path.
+        - **Returns**:
+            - `str`: Path without extension when extension is image/pdf.
+        """
+        root, ext = os.path.splitext(path)
+        if ext.lower() in {".png", ".jpg", ".jpeg", ".pdf", ".svg", ".eps"}:
+            return root
+        return path
+
+    def _rewrite_includegraphics_targets(
+        self,
+        content: str,
+        work_dir: str,
+        id_to_rel_path: Dict[str, str],
+    ) -> str:
+        """
+        Rewrite includegraphics targets using resource-aware resolution.
+        - **Description**:
+            - Resolution order:
+              1) exact ID mapping from resources/figure_paths
+              2) existing valid relative path under work_dir
+              3) basename fallback under figures/ when file exists
+            - Adds a safe default width when includegraphics has no option block.
+            - Leaves unresolved targets unchanged.
+        """
+        if not content:
+            return content
+
+        def _resolve_target(raw_target: str) -> str:
+            target = raw_target.strip()
+            if not target:
+                return target
+            if target in id_to_rel_path:
+                return id_to_rel_path[target]
+
+            # Keep explicit, already-valid relative path.
+            abs_existing = os.path.join(work_dir, target)
+            if os.path.exists(abs_existing):
+                return self._strip_graphics_extension(target)
+
+            # Fallback: try basename in figures directory.
+            basename = os.path.basename(target)
+            candidate = os.path.join("figures", basename)
+            if os.path.exists(os.path.join(work_dir, candidate)):
+                return self._strip_graphics_extension(candidate)
+            return target
+
+        pattern = r'(\\includegraphics)(?:\[([^\]]*)\])?\{([^}]+)\}'
+
+        def _rewrite(match: re.Match) -> str:
+            cmd = match.group(1)
+            opts = match.group(2)
+            target = match.group(3)
+            resolved_target = _resolve_target(target)
+            if opts is None or not opts.strip():
+                # Prevent oversized figures when model omits explicit width.
+                return f"{cmd}[width=0.9\\linewidth]{{{resolved_target}}}"
+            return f"{cmd}[{opts}]{{{resolved_target}}}"
+
+        return re.sub(pattern, _rewrite, content)
 
     def _extract_citations_from_content(self, latex_content: str) -> List[str]:
         """
@@ -1255,6 +1381,22 @@ class TypesetterAgent(BaseAgent):
         bib_entries = state.get("bib_entries", [])
         template_config = state.get("template_config")
         main_tex_path = state.get("main_tex_path")
+        figure_paths = state.get("figure_paths", {}) or {}
+
+        id_to_rel_path: Dict[str, str] = {}
+        for resource in resources:
+            if resource.status == "downloaded" and resource.local_path:
+                rel_path = os.path.relpath(resource.local_path, work_dir)
+                id_to_rel_path[str(resource.resource_id)] = self._strip_graphics_extension(rel_path)
+        for fig_id, file_path in figure_paths.items():
+            if not fig_id:
+                continue
+            filename = os.path.basename(file_path or "")
+            if not filename:
+                continue
+            candidate = os.path.join("figures", filename)
+            if os.path.exists(os.path.join(work_dir, candidate)):
+                id_to_rel_path[str(fig_id)] = self._strip_graphics_extension(candidate)
         
         # Create default template_config if not provided
         if template_config is None:
@@ -1272,21 +1414,13 @@ class TypesetterAgent(BaseAgent):
             logger.info("typesetter.inject_template mode=multi-file sections=%s",
                         list(sections_dict.keys()))
             
-            # Replace figure placeholders in each section
-            for resource in resources:
-                if resource.status == "downloaded" and resource.local_path:
-                    rel_path = os.path.relpath(resource.local_path, work_dir)
-                    rel_path_no_ext = os.path.splitext(rel_path)[0]
-                    for sec_type in list(sections_dict.keys()):
-                        sections_dict[sec_type] = sections_dict[sec_type].replace(
-                            f"\\includegraphics{{{resource.resource_id}}}",
-                            f"\\includegraphics{{{rel_path_no_ext}}}"
-                        )
-                        sections_dict[sec_type] = re.sub(
-                            rf'\\includegraphics\[([^\]]*)\]\{{{resource.resource_id}\}}',
-                            rf'\\includegraphics[\1]{{{rel_path_no_ext}}}',
-                            sections_dict[sec_type]
-                        )
+            # Resolve includegraphics targets in each section.
+            for sec_type in list(sections_dict.keys()):
+                sections_dict[sec_type] = self._rewrite_includegraphics_targets(
+                    sections_dict[sec_type],
+                    work_dir=work_dir,
+                    id_to_rel_path=id_to_rel_path,
+                )
             
             # Write individual section files
             section_file_map = self._write_section_files(
@@ -1400,20 +1534,12 @@ class TypesetterAgent(BaseAgent):
         # Apply citation style to content
         latex_content = self._apply_citation_style(latex_content, template_config.citation_style)
         
-        # Replace figure placeholders with actual paths
-        for resource in resources:
-            if resource.status == "downloaded" and resource.local_path:
-                rel_path = os.path.relpath(resource.local_path, work_dir)
-                rel_path_no_ext = os.path.splitext(rel_path)[0]
-                latex_content = latex_content.replace(
-                    f"\\includegraphics{{{resource.resource_id}}}",
-                    f"\\includegraphics{{{rel_path_no_ext}}}"
-                )
-                latex_content = re.sub(
-                    rf'\\includegraphics\[([^\]]*)\]\{{{resource.resource_id}\}}',
-                    rf'\\includegraphics[\1]{{{rel_path_no_ext}}}',
-                    latex_content
-                )
+        # Resolve includegraphics targets in legacy content.
+        latex_content = self._rewrite_includegraphics_targets(
+            latex_content,
+            work_dir=work_dir,
+            id_to_rel_path=id_to_rel_path,
+        )
         
         # Parse sections from content
         sections = self._parse_sections_from_content(latex_content)
