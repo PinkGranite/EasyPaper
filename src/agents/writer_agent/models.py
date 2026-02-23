@@ -61,6 +61,31 @@ class GeneratedContent(BaseModel):
     iterations_used: int = 1
     review_passed: bool = True
     invalid_citations_removed: List[str] = Field(default_factory=list)
+    paragraph_units: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ParagraphUnit(BaseModel):
+    """
+    Paragraph-level structured unit extracted from section LaTeX.
+    - **Description**:
+        - Provides stable paragraph IDs for targeted revision
+        - Stores lightweight sentence splits for diagnostics
+    """
+    paragraph_id: str
+    section_type: str
+    paragraph_index: int
+    text: str
+    sentence_count: int = 0
+    sentences: List[str] = Field(default_factory=list)
+
+
+class SectionDraft(BaseModel):
+    """
+    Structured section draft with paragraph-addressable content.
+    """
+    section_type: str
+    latex_content: str
+    paragraphs: List[ParagraphUnit] = Field(default_factory=list)
 
 
 class WriterResult(BaseModel):

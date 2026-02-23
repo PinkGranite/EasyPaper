@@ -243,6 +243,40 @@ class LogicChecker(FeedbackChecker):
                 "suggestion": issue.get("suggestion", ""),
             })
 
+        section_feedbacks: List[Dict] = []
+        for sec, pfb in paragraph_feedbacks.items():
+            para_indices = []
+            para_instructions: Dict[int, str] = {}
+            for pf in pfb:
+                pidx = int(pf.get("paragraph_index", 0))
+                para_indices.append(pidx)
+                para_instructions[pidx] = (
+                    "Revise this paragraph to resolve logic inconsistencies, clarify references, "
+                    "and keep claims aligned with available evidence."
+                )
+            section_feedbacks.append({
+                "section_type": sec,
+                "current_word_count": context.word_counts.get(sec, 0),
+                "target_word_count": context.get_section_target(sec) or context.word_counts.get(sec, 0),
+                "action": "refine_paragraphs" if para_indices else "logic_fix",
+                "delta_words": 0,
+                "target_paragraphs": sorted(list(set(para_indices))),
+                "paragraph_instructions": para_instructions,
+            })
+
+        document_feedbacks = []
+        if not passed:
+            document_feedbacks.append({
+                "level": "document",
+                "agent": "reviewer",
+                "checker": self.name,
+                "target_id": "document",
+                "severity": severity.value,
+                "issue_type": "logical_consistency",
+                "message": message,
+                "suggested_action": "logic_fix",
+            })
+
         severity = Severity.WARNING if not passed else Severity.INFO
         if any(i.get("severity") == "high" for i in issues):
             severity = Severity.ERROR
@@ -262,6 +296,8 @@ class LogicChecker(FeedbackChecker):
                 "issues": issues,
                 "sections_to_revise": sections_to_revise,
                 "paragraph_feedbacks": paragraph_feedbacks,
+                "section_feedbacks": section_feedbacks,
+                "document_feedbacks": document_feedbacks,
             },
         )
 

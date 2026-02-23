@@ -192,6 +192,7 @@ def create_writer_router(agent_instance):
                 iterations_used=agent_result.get("iteration", 1),
                 review_passed=agent_result.get("review_result", {}).get("passed", True),
                 invalid_citations_removed=invalid_citations_removed,
+                paragraph_units=agent_result.get("paragraph_units", []),
             )
 
             latency = time.time() - start

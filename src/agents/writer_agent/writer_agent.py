@@ -144,6 +144,7 @@ class WriterAgentState(TypedDict):
     
     # Final tracking
     invalid_citations_removed: Optional[List[str]]
+    paragraph_units: Optional[List[Dict[str, Any]]]
 
     # Shared memory + peer agents for AskTool (ReAct consultation)
     memory: Optional[Any]
@@ -517,11 +518,51 @@ class WriterAgent(ReActAgent):
                 citations=len(citation_ids),
             )
 
+        paragraph_units = self._extract_paragraph_units(
+            section_type=section_type,
+            latex_content=content,
+        )
+
         return {
             "citation_ids": citation_ids,
             "figure_ids": figure_ids,
             "table_ids": table_ids,
+            "paragraph_units": paragraph_units,
         }
+
+    def _extract_paragraph_units(
+        self,
+        section_type: str,
+        latex_content: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Extract paragraph-addressable units from section LaTeX.
+        - **Description**:
+            - Uses blank-line paragraph splitting for stable IDs
+            - Adds a lightweight sentence split for diagnostic-level review
+        """
+        units: List[Dict[str, Any]] = []
+        if not latex_content or not latex_content.strip():
+            return units
+
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", latex_content) if p.strip()]
+        for idx, paragraph in enumerate(paragraphs):
+            sentence_candidates = [
+                s.strip()
+                for s in re.split(r"(?<=[.!?])\s+", paragraph.replace("\n", " "))
+                if s.strip()
+            ]
+            units.append(
+                {
+                    "paragraph_id": f"{section_type}.p{idx}",
+                    "section_type": section_type,
+                    "paragraph_index": idx,
+                    "text": paragraph,
+                    "sentence_count": len(sentence_candidates),
+                    "sentences": sentence_candidates,
+                }
+            )
+        return units
 
     def _clean_latex_output(self, content: str) -> str:
         """
@@ -615,6 +656,7 @@ class WriterAgent(ReActAgent):
             # Shared memory + peers for ReAct AskTool
             "memory": memory,
             "peers": peers,
+            "paragraph_units": [],
         }
 
         return await self.agent.ainvoke(initial_state)

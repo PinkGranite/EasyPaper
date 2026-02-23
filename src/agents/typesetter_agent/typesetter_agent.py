@@ -976,6 +976,10 @@ class TypesetterAgent(BaseAgent):
                 '\\end{document}',
                 f'\n{bib_command}\n\\end{{document}}'
             )
+
+        # Some templates rely on \maketitle to render title/abstract metadata.
+        # Ensure it exists even if earlier body replacement paths removed it.
+        result = self._ensure_maketitle_present(result)
         
         return result
 
@@ -1016,6 +1020,36 @@ class TypesetterAgent(BaseAgent):
         return errors
 
     @staticmethod
+    def _ensure_maketitle_present(text: str) -> str:
+        """
+        Ensure \\maketitle exists in the document body.
+        - **Description**:
+            - Inserts \\maketitle if missing.
+            - Prefers insertion after abstract content when available.
+
+        - **Args**:
+            - `text` (str): LaTeX source text.
+
+        - **Returns**:
+            - `str`: LaTeX text guaranteed to contain \\maketitle.
+        """
+        if '\\maketitle' in text or '\\begin{document}' not in text:
+            return text
+
+        anchor = text.index('\\begin{document}') + len('\\begin{document}')
+
+        abstract_cmd_match = re.search(r'\\abstract\{', text)
+        if abstract_cmd_match:
+            end = TypesetterAgent._find_brace_end(text, abstract_cmd_match.start() + len('\\abstract'))
+            anchor = max(anchor, end)
+        else:
+            abstract_env_match = re.search(r'\\begin\{abstract\}.*?\\end\{abstract\}', text, flags=re.DOTALL)
+            if abstract_env_match:
+                anchor = max(anchor, abstract_env_match.end())
+
+        return text[:anchor] + '\n\n\\maketitle' + text[anchor:]
+
+    @staticmethod
     def _replace_all_authors(text: str, new_author: str) -> str:
         """
         Remove all \\author commands and replace with a single clean one.
@@ -1042,6 +1076,11 @@ class TypesetterAgent(BaseAgent):
             if not match:
                 break
             start = i + match.start()
+            # Skip commented-out author samples (e.g., "%% \\author...")
+            line_start = text.rfind('\n', 0, start) + 1
+            if re.match(r'^\s*%', text[line_start:start]):
+                i = start + len(match.group(0))
+                continue
             pos = start + match.end() - match.start()
             # Skip optional [...]
             if pos < len(text) and text[pos] == '[':
@@ -1069,6 +1108,11 @@ class TypesetterAgent(BaseAgent):
             i = pos if pos > start else start + 1
 
         if not regions_to_remove:
+            title_match = re.search(r'\\title(?:\[[^\]]*\])?\{[^}]*\}', text, flags=re.DOTALL)
+            insertion = f'\n\\author{{{new_author}}}\n'
+            if title_match:
+                insert_pos = title_match.end()
+                return text[:insert_pos] + insertion + text[insert_pos:]
             return text
 
         # Remove regions in reverse order to preserve indices

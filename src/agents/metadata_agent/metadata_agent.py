@@ -1598,7 +1598,7 @@ class MetaDataAgent(ReActAgent):
                 
                 # Build figure LaTeX
                 figure_latex = f"""
-\\begin{{{env_name}}}[t]
+\\begin{{{env_name}}}[htbp]
 \\centering
 \\includegraphics[width={width}]{{figures/{filename}}}
 \\caption{{{fig.caption}}}\\label{{{fig_id}}}
@@ -1704,7 +1704,7 @@ class MetaDataAgent(ReActAgent):
                     # Generate a placeholder table
                     caption = tbl.caption or tbl_id
                     table_latex = (
-                        f"\\begin{{{env_name}}}[t]\n"
+                        f"\\begin{{{env_name}}}[htbp]\n"
                         f"\\centering\n"
                         f"\\caption{{{caption}}}\\label{{{tbl_id}}}\n"
                         f"\\begin{{tabular}}{{lcc}}\n"
@@ -1732,6 +1732,26 @@ class MetaDataAgent(ReActAgent):
                 generated_sections[section_type] = content
 
         return generated_sections
+
+    @staticmethod
+    def _normalize_float_placement(content: str) -> str:
+        """
+        Normalize figure/table placement hints to reduce end-of-document float piles.
+        - **Description**:
+            - Rewrites strict top-only placement ([t]) to [htbp].
+            - Leaves existing broader placement options unchanged.
+
+        - **Args**:
+            - `content` (str): Section LaTeX content.
+
+        - **Returns**:
+            - `str`: Content with normalized float placement.
+        """
+        if not content:
+            return content
+        content = re.sub(r'\\begin\{figure\*?\}\[t\]', lambda m: m.group(0).replace('[t]', '[htbp]'), content)
+        content = re.sub(r'\\begin\{table\*?\}\[t\]', lambda m: m.group(0).replace('[t]', '[htbp]'), content)
+        return content
 
     # =========================================================================
     # Pre-Generation Search Judgment (Phase A)
@@ -2085,6 +2105,7 @@ class MetaDataAgent(ReActAgent):
             for section_type in list(generated_sections.keys()):
                 content = generated_sections[section_type]
                 content = self._fix_latex_references(content)
+                content = self._normalize_float_placement(content)
                 fixed_content, invalid, valid = self._validate_and_fix_citations(
                     content, valid_citation_keys, remove_invalid=True
                 )
@@ -3305,6 +3326,21 @@ class MetaDataAgent(ReActAgent):
                 merged[fb.section_type] = fb
             elif existing.action == fb.action and abs(fb.delta_words) > abs(existing.delta_words):
                 merged[fb.section_type] = fb
+            else:
+                # Preserve paragraph-level targets/instructions from both sources.
+                merged_targets = sorted(
+                    list(set((existing.target_paragraphs or []) + (fb.target_paragraphs or [])))
+                )
+                existing.target_paragraphs = merged_targets
+                if fb.paragraph_instructions:
+                    existing.paragraph_instructions.update(fb.paragraph_instructions)
+                if fb.paragraph_feedbacks:
+                    existing.paragraph_feedbacks.extend(fb.paragraph_feedbacks)
+                if fb.revision_prompt and fb.revision_prompt not in (existing.revision_prompt or ""):
+                    if existing.revision_prompt:
+                        existing.revision_prompt += "\n\n" + fb.revision_prompt
+                    else:
+                        existing.revision_prompt = fb.revision_prompt
         
         return list(merged.values())
     
@@ -3387,13 +3423,27 @@ class MetaDataAgent(ReActAgent):
                 f"section={sf.section_type} action={sf.action} delta_words={sf.delta_words}"
             )
             
-            revised_content = await self._revise_section(
-                section_type=sf.section_type,
-                current_content=generated_sections[sf.section_type],
-                revision_prompt=revision_prompt,
-                metadata=metadata,
-                memory=memory,
-            )
+            current_content = generated_sections[sf.section_type]
+
+            # Paragraph-first revision path (higher precision than whole-section rewrite).
+            if sf.target_paragraphs:
+                revised_content = await self._revise_section_paragraphs(
+                    section_type=sf.section_type,
+                    current_content=current_content,
+                    target_paragraphs=sf.target_paragraphs,
+                    paragraph_instructions=sf.paragraph_instructions or {},
+                    fallback_prompt=revision_prompt,
+                    metadata=metadata,
+                    memory=memory,
+                )
+            else:
+                revised_content = await self._revise_section(
+                    section_type=sf.section_type,
+                    current_content=current_content,
+                    revision_prompt=revision_prompt,
+                    metadata=metadata,
+                    memory=memory,
+                )
             
             if revised_content:
                 revised_content = self._fix_latex_references(revised_content)
@@ -3416,6 +3466,80 @@ class MetaDataAgent(ReActAgent):
                 print(f"[MetaDataAgent] Revised {sf.section_type}: {new_word_count} words")
         
         return revised_sections
+
+    @staticmethod
+    def _split_section_paragraphs(content: str) -> List[str]:
+        """
+        Split section content into paragraph units.
+        - **Description**:
+            - Uses blank lines as paragraph boundaries
+            - Preserves paragraph order for stable paragraph IDs
+        """
+        if not content:
+            return []
+        return [p.strip() for p in re.split(r"\n\s*\n", content) if p.strip()]
+
+    @staticmethod
+    def _join_section_paragraphs(paragraphs: List[str]) -> str:
+        """Join paragraph units back into section LaTeX text."""
+        return "\n\n".join([p for p in paragraphs if p is not None]).strip()
+
+    async def _revise_section_paragraphs(
+        self,
+        section_type: str,
+        current_content: str,
+        target_paragraphs: List[int],
+        paragraph_instructions: Dict[int, str],
+        fallback_prompt: str,
+        metadata: PaperMetaData,
+        memory: Optional[SessionMemory] = None,
+    ) -> Optional[str]:
+        """
+        Revise selected paragraphs, then reassemble the section.
+        - **Description**:
+            - Applies targeted paragraph-level revision prompts
+            - Falls back to whole-section revision if paragraph pass fails
+        """
+        paragraphs = self._split_section_paragraphs(current_content)
+        if not paragraphs:
+            return await self._revise_section(
+                section_type=section_type,
+                current_content=current_content,
+                revision_prompt=fallback_prompt,
+                metadata=metadata,
+                memory=memory,
+            )
+
+        revised_any = False
+        for pidx in sorted(set(target_paragraphs)):
+            if pidx < 0 or pidx >= len(paragraphs):
+                continue
+            instruction = paragraph_instructions.get(
+                pidx,
+                "Improve this paragraph according to reviewer feedback while preserving factual correctness.",
+            )
+            revised_paragraph = await self._revise_paragraph(
+                section_type=section_type,
+                paragraph_index=pidx,
+                paragraph_text=paragraphs[pidx],
+                instruction=instruction,
+                memory=memory,
+            )
+            if revised_paragraph and revised_paragraph.strip():
+                paragraphs[pidx] = revised_paragraph.strip()
+                revised_any = True
+
+        if revised_any:
+            return self._join_section_paragraphs(paragraphs)
+
+        # Fallback to section-level rewrite if paragraph-level pass yields no change.
+        return await self._revise_section(
+            section_type=section_type,
+            current_content=current_content,
+            revision_prompt=fallback_prompt,
+            metadata=metadata,
+            memory=memory,
+        )
     
     def _get_sections_fingerprint(self, sections: Dict[str, str]) -> str:
         """
@@ -3777,11 +3901,89 @@ class MetaDataAgent(ReActAgent):
                     section_fb_dict[sf.section_type] = {
                         "action": sf.action,
                         "delta_words": sf.delta_words,
+                        "target_paragraphs": sf.target_paragraphs,
+                        "paragraph_instructions": sf.paragraph_instructions,
                         "paragraph_feedbacks": [
                             pf.model_dump() if hasattr(pf, "model_dump") else pf
                             for pf in (sf.paragraph_feedbacks if hasattr(sf, "paragraph_feedbacks") else [])
                         ],
                     }
+                agent_feedbacks: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+                for fb in review_result.feedbacks:
+                    agent_name = str(fb.checker_name or "reviewer")
+                    if agent_name not in agent_feedbacks:
+                        agent_feedbacks[agent_name] = {
+                            "document_feedbacks": [],
+                            "section_feedbacks": [],
+                            "paragraph_feedbacks": [],
+                            "sentence_feedbacks": [],
+                        }
+                    agent_feedbacks[agent_name]["document_feedbacks"].append({
+                        "level": "document",
+                        "agent": agent_name,
+                        "checker": fb.checker_name,
+                        "target_id": "document",
+                        "severity": fb.severity.value if hasattr(fb.severity, "value") else str(fb.severity),
+                        "issue_type": fb.suggested_action or fb.checker_name,
+                        "message": fb.message,
+                        "details": fb.details,
+                    })
+                for hf in (review_result.hierarchical_feedbacks or []):
+                    item = hf.model_dump() if hasattr(hf, "model_dump") else hf
+                    agent_name = str(item.get("agent", "reviewer"))
+                    if agent_name not in agent_feedbacks:
+                        agent_feedbacks[agent_name] = {
+                            "document_feedbacks": [],
+                            "section_feedbacks": [],
+                            "paragraph_feedbacks": [],
+                            "sentence_feedbacks": [],
+                        }
+                    level = str(item.get("level", "section"))
+                    bucket = f"{level}_feedbacks"
+                    if bucket not in agent_feedbacks[agent_name]:
+                        bucket = "section_feedbacks"
+                    agent_feedbacks[agent_name][bucket].append(item)
+                for sf in review_result.section_feedbacks:
+                    source_agent = "reviewer"
+                    if sf.action == "fix_latex":
+                        source_agent = "typesetter"
+                    elif sf.structural_actions:
+                        source_agent = "vlm_review"
+                    elif "VLM" in (sf.revision_prompt or "") or "page limit" in (sf.revision_prompt or "").lower():
+                        source_agent = "vlm_review"
+                    if source_agent not in agent_feedbacks:
+                        agent_feedbacks[source_agent] = {
+                            "document_feedbacks": [],
+                            "section_feedbacks": [],
+                            "paragraph_feedbacks": [],
+                            "sentence_feedbacks": [],
+                        }
+                    sec_item = {
+                        "level": "section",
+                        "agent": source_agent,
+                        "checker": source_agent,
+                        "target_id": sf.target_id or sf.section_type,
+                        "section_type": sf.section_type,
+                        "severity": "warning",
+                        "issue_type": sf.action,
+                        "message": sf.revision_prompt[:400],
+                        "target_paragraphs": sf.target_paragraphs,
+                    }
+                    agent_feedbacks[source_agent]["section_feedbacks"].append(sec_item)
+                    for pf in sf.paragraph_feedbacks or []:
+                        pf_item = pf.model_dump() if hasattr(pf, "model_dump") else pf
+                        agent_feedbacks[source_agent]["paragraph_feedbacks"].append({
+                            "level": "paragraph",
+                            "agent": source_agent,
+                            "checker": source_agent,
+                            "target_id": f"{sf.section_type}.p{pf_item.get('paragraph_index', 0)}",
+                            "section_type": sf.section_type,
+                            "paragraph_index": pf_item.get("paragraph_index", 0),
+                            "severity": str(pf_item.get("severity", "warning")),
+                            "issue_type": sf.action,
+                            "message": "; ".join(pf_item.get("issues", []))[:400],
+                            "suggestion": pf_item.get("suggestion", ""),
+                        })
                 actions_taken = sorted(
                     reviewer_revised_sections | post_compile_revised
                 )
@@ -3797,6 +3999,11 @@ class MetaDataAgent(ReActAgent):
                         f.message for f in review_result.feedbacks if not f.passed
                     )[:500],
                     section_feedbacks=section_fb_dict,
+                    hierarchical_feedbacks=[
+                        hf.model_dump() if hasattr(hf, "model_dump") else hf
+                        for hf in (review_result.hierarchical_feedbacks or [])
+                    ],
+                    agent_feedbacks=agent_feedbacks,
                     actions_taken=[f"revised:{s}" for s in actions_taken],
                     result_snapshot=word_snapshot,
                 )
@@ -3993,4 +4200,53 @@ class MetaDataAgent(ReActAgent):
 
         except Exception as e:
             print(f"[MetaDataAgent] Revision error for {section_type}: {e}")
+            return None
+
+    async def _revise_paragraph(
+        self,
+        section_type: str,
+        paragraph_index: int,
+        paragraph_text: str,
+        instruction: str,
+        memory: Optional[SessionMemory] = None,
+    ) -> Optional[str]:
+        """
+        Revise a single paragraph using WriterAgent.
+        - **Description**:
+            - Uses a focused prompt to avoid unnecessary edits to other paragraphs
+            - Returns revised paragraph text only
+        """
+        try:
+            system_prompt = (
+                "You are an expert academic editor revising one paragraph.\n"
+                "Keep the same scientific meaning and preserve LaTeX correctness.\n"
+                "Return ONLY the revised paragraph text."
+            )
+            revision_ctx = ""
+            if memory:
+                revision_ctx = memory.get_revision_context(section_type)
+
+            user_message = (
+                f"Section: {section_type}\n"
+                f"Paragraph index: {paragraph_index}\n"
+                f"Instruction: {instruction}\n\n"
+                f"Current paragraph:\n{paragraph_text}"
+            )
+            if revision_ctx:
+                user_message = f"{revision_ctx}\n\n{user_message}"
+
+            result = await self._writer.run(
+                system_prompt=system_prompt,
+                user_prompt=user_message,
+                section_type=section_type,
+                enable_review=False,
+                memory=memory,
+                peers={"planner": self._planner, "reviewer": self._reviewer},
+            )
+            revised = result.get("generated_content", "")
+            return revised if revised else None
+        except Exception as e:
+            print(
+                f"[MetaDataAgent] Paragraph revision error for {section_type}.p{paragraph_index}: {e}"
+            )
             return None

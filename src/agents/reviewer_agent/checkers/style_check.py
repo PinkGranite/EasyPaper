@@ -275,11 +275,43 @@ class StyleChecker(FeedbackChecker):
 
         # Collect paragraph feedbacks across all sections
         paragraph_feedbacks: Dict[str, List[Dict]] = {}
+        section_feedbacks: List[Dict] = []
         for entry in all_issues:
             sec = entry.get("section", "")
             pfb = entry.get("paragraph_feedbacks", [])
             if pfb:
                 paragraph_feedbacks[sec] = pfb
+            para_indices = []
+            para_instructions: Dict[int, str] = {}
+            for pf in pfb:
+                pidx = int(pf.get("paragraph_index", 0))
+                para_indices.append(pidx)
+                para_instructions[pidx] = (
+                    "Rewrite this paragraph to remove AI-style expressions, expand contractions, "
+                    "and improve formal academic style while preserving technical meaning."
+                )
+            section_feedbacks.append({
+                "section_type": sec,
+                "current_word_count": context.word_counts.get(sec, 0),
+                "target_word_count": context.get_section_target(sec) or context.word_counts.get(sec, 0),
+                "action": "refine_paragraphs" if para_indices else "style_fix",
+                "delta_words": 0,
+                "target_paragraphs": sorted(list(set(para_indices))),
+                "paragraph_instructions": para_instructions,
+            })
+
+        document_feedbacks = []
+        if not passed:
+            document_feedbacks.append({
+                "level": "document",
+                "agent": "reviewer",
+                "checker": self.name,
+                "target_id": "document",
+                "severity": severity.value,
+                "issue_type": "style_consistency",
+                "message": message,
+                "suggested_action": "style_fix",
+            })
 
         return FeedbackResult(
             checker_name=self.name,
@@ -291,6 +323,8 @@ class StyleChecker(FeedbackChecker):
                 "section_issues": all_issues,
                 "sections_to_revise": sections_to_revise,
                 "paragraph_feedbacks": paragraph_feedbacks,
+                "section_feedbacks": section_feedbacks,
+                "document_feedbacks": document_feedbacks,
             },
         )
 

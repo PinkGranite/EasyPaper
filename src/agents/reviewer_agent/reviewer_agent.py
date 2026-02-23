@@ -17,6 +17,10 @@ from .models import (
     ReviewResult,
     FeedbackResult,
     Severity,
+    SectionFeedback,
+    ParagraphFeedback,
+    HierarchicalFeedbackItem,
+    FeedbackLevel,
 )
 from .checkers.base import FeedbackChecker
 from .checkers.word_count import WordCountChecker
@@ -302,7 +306,26 @@ class ReviewerAgent(BaseAgent):
                 
                 # Extract sections needing revision
                 if not feedback.passed:
+                    for df in feedback.details.get("document_feedbacks", []):
+                        try:
+                            result.add_hierarchical_feedback(HierarchicalFeedbackItem(
+                                level=FeedbackLevel.DOCUMENT,
+                                agent=str(df.get("agent", "reviewer")),
+                                checker=str(df.get("checker", checker.name)),
+                                target_id=str(df.get("target_id", "document")),
+                                severity=Severity(str(df.get("severity", feedback.severity))),
+                                issue_type=str(df.get("issue_type", "document_issue")),
+                                message=str(df.get("message", feedback.message)),
+                                suggested_action=df.get("suggested_action"),
+                                evidence=df if isinstance(df, dict) else {},
+                            ))
+                        except Exception:
+                            # Keep review loop resilient even with malformed checker payloads.
+                            pass
+
                     sections_to_revise = feedback.details.get("sections_to_revise", {})
+                    section_paragraph_feedbacks = feedback.details.get("paragraph_feedbacks", {})
+                    raw_section_feedbacks = feedback.details.get("section_feedbacks", []) or []
                     for section_type, reason in sections_to_revise.items():
                         result.add_section_revision(section_type, reason)
                         
@@ -315,9 +338,27 @@ class ReviewerAgent(BaseAgent):
                         )
                         
                         # Find and update section feedback
-                        for sf in feedback.details.get("section_feedbacks", []):
+                        matched_section_feedback = False
+                        for sf in raw_section_feedbacks:
                             if sf.get("section_type") == section_type:
-                                from .models import SectionFeedback
+                                matched_section_feedback = True
+                                raw_para = section_paragraph_feedbacks.get(section_type, []) or []
+                                para_feedbacks: List[ParagraphFeedback] = []
+                                for p in raw_para:
+                                    raw_sev = str(p.get("severity", "warning")).lower()
+                                    sev = Severity.WARNING
+                                    if raw_sev in ("error", "high", "critical"):
+                                        sev = Severity.ERROR
+                                    elif raw_sev in ("info", "low"):
+                                        sev = Severity.INFO
+                                    para_feedbacks.append(ParagraphFeedback(
+                                        paragraph_index=int(p.get("paragraph_index", 0)),
+                                        paragraph_preview=str(p.get("paragraph_preview", "")),
+                                        issues=[str(x) for x in p.get("issues", [])],
+                                        severity=sev,
+                                        suggestion=str(p.get("suggestion", "")),
+                                    ))
+
                                 section_fb = SectionFeedback(
                                     section_type=section_type,
                                     current_word_count=sf.get("current_word_count", 0),
@@ -325,8 +366,85 @@ class ReviewerAgent(BaseAgent):
                                     action=sf.get("action", "ok"),
                                     delta_words=sf.get("delta_words", 0),
                                     revision_prompt=revision_prompt,
+                                    paragraph_feedbacks=para_feedbacks,
+                                    target_paragraphs=sf.get(
+                                        "target_paragraphs",
+                                        [pf.paragraph_index for pf in para_feedbacks],
+                                    ),
+                                    paragraph_instructions=sf.get("paragraph_instructions", {}),
+                                    feedback_level=FeedbackLevel.SECTION,
+                                    target_id=sf.get("target_id", section_type),
                                 )
                                 result.section_feedbacks.append(section_fb)
+                                result.add_hierarchical_feedback(HierarchicalFeedbackItem(
+                                    level=FeedbackLevel.SECTION,
+                                    agent="reviewer",
+                                    checker=checker.name,
+                                    target_id=section_fb.target_id or section_type,
+                                    section_type=section_type,
+                                    severity=feedback.severity,
+                                    issue_type=checker.name,
+                                    message=reason,
+                                    suggested_action=sf.get("action", "revise"),
+                                    revision_instruction=revision_prompt,
+                                    evidence={
+                                        "target_paragraphs": section_fb.target_paragraphs,
+                                        "paragraph_feedbacks": [
+                                            pf.model_dump() for pf in section_fb.paragraph_feedbacks
+                                        ],
+                                    },
+                                ))
+                                for pf in section_fb.paragraph_feedbacks:
+                                    result.add_hierarchical_feedback(HierarchicalFeedbackItem(
+                                        level=FeedbackLevel.PARAGRAPH,
+                                        agent="reviewer",
+                                        checker=checker.name,
+                                        target_id=f"{section_type}.p{pf.paragraph_index}",
+                                        section_type=section_type,
+                                        paragraph_index=pf.paragraph_index,
+                                        severity=pf.severity,
+                                        issue_type=checker.name,
+                                        message="; ".join(pf.issues)[:500],
+                                        suggested_action="refine_paragraph",
+                                        revision_instruction=pf.suggestion,
+                                        evidence=pf.model_dump(),
+                                    ))
+                        if not matched_section_feedback:
+                            para_feedbacks: List[ParagraphFeedback] = []
+                            raw_para = section_paragraph_feedbacks.get(section_type, []) or []
+                            para_indices: List[int] = []
+                            para_instructions: Dict[int, str] = {}
+                            for p in raw_para:
+                                pidx = int(p.get("paragraph_index", 0))
+                                para_indices.append(pidx)
+                                raw_sev = str(p.get("severity", "warning")).lower()
+                                sev = Severity.WARNING
+                                if raw_sev in ("error", "high", "critical"):
+                                    sev = Severity.ERROR
+                                elif raw_sev in ("info", "low"):
+                                    sev = Severity.INFO
+                                para_feedbacks.append(ParagraphFeedback(
+                                    paragraph_index=pidx,
+                                    paragraph_preview=str(p.get("paragraph_preview", "")),
+                                    issues=[str(x) for x in p.get("issues", [])],
+                                    severity=sev,
+                                    suggestion=str(p.get("suggestion", "")),
+                                ))
+                                para_instructions[pidx] = str(p.get("suggestion", "")) or reason
+                            section_fb = SectionFeedback(
+                                section_type=section_type,
+                                current_word_count=context.word_counts.get(section_type, 0),
+                                target_word_count=context.get_section_target(section_type) or context.word_counts.get(section_type, 0),
+                                action="refine_paragraphs" if para_indices else "revise",
+                                delta_words=0,
+                                revision_prompt=revision_prompt,
+                                paragraph_feedbacks=para_feedbacks,
+                                target_paragraphs=sorted(list(set(para_indices))),
+                                paragraph_instructions=para_instructions,
+                                feedback_level=FeedbackLevel.SECTION,
+                                target_id=section_type,
+                            )
+                            result.section_feedbacks.append(section_fb)
                         
             except Exception as e:
                 logger.error("reviewer.checker_error name=%s error=%s", checker.name, str(e))

@@ -227,7 +227,7 @@ def _format_figure_placement_guidance(section_plan: Any, figures: List[Any]) -> 
         parts.append(f"  Position: {fp.position_hint} in the section")
         parts.append(f"  **Required LaTeX:**")
         parts.append(f"  ```latex")
-        parts.append(f"  \\\\begin{{{env_name}}}[t]")
+        parts.append(f"  \\\\begin{{{env_name}}}[htbp]")
         parts.append(f"  \\\\centering")
         parts.append(f"  \\\\includegraphics[width={width}]{{figures/{filename}}}")
         parts.append(f"  \\\\caption{{{caption}}}\\\\label{{{fig_id}}}")

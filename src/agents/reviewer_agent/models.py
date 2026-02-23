@@ -18,6 +18,14 @@ class Severity(str, Enum):
     INFO = "info"        # Informational only
 
 
+class FeedbackLevel(str, Enum):
+    """Hierarchical feedback granularity."""
+    DOCUMENT = "document"
+    SECTION = "section"
+    PARAGRAPH = "paragraph"
+    SENTENCE = "sentence"
+
+
 class FeedbackResult(BaseModel):
     """
     Result from a single feedback checker
@@ -38,6 +46,29 @@ class FeedbackResult(BaseModel):
     message: str
     details: Dict[str, Any] = Field(default_factory=dict)
     suggested_action: Optional[str] = None
+
+
+class HierarchicalFeedbackItem(BaseModel):
+    """
+    Unified hierarchical feedback item.
+    - **Description**:
+        - Carries review feedback across document/section/paragraph/sentence levels
+        - Supports multi-agent aggregation in one structure
+    """
+    level: FeedbackLevel = FeedbackLevel.SECTION
+    agent: str = "reviewer"
+    checker: str = ""
+    target_id: str = ""  # e.g. "document", "method", "method.p3", "method.p3.s2"
+    section_type: Optional[str] = None
+    paragraph_index: Optional[int] = None
+    sentence_index: Optional[int] = None
+    severity: Severity = Severity.INFO
+    issue_type: str = ""
+    message: str = ""
+    suggested_action: Optional[str] = None
+    revision_instruction: str = ""
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+    confidence: float = 0.0
 
 
 class ParagraphFeedback(BaseModel):
@@ -72,6 +103,11 @@ class SectionFeedback(BaseModel):
     revision_prompt: str = ""
     structural_actions: List[str] = Field(default_factory=list)
     paragraph_feedbacks: List[ParagraphFeedback] = Field(default_factory=list)
+    # Paragraph-addressable revision support
+    target_paragraphs: List[int] = Field(default_factory=list)
+    paragraph_instructions: Dict[int, str] = Field(default_factory=dict)
+    feedback_level: FeedbackLevel = FeedbackLevel.SECTION
+    target_id: str = ""  # e.g. "method" or "method.p3"
 
 
 class ReviewContext(BaseModel):
@@ -129,6 +165,7 @@ class ReviewResult(BaseModel):
     iteration: int = 0
     requires_revision: Dict[str, List[str]] = Field(default_factory=dict)
     section_feedbacks: List[SectionFeedback] = Field(default_factory=list)
+    hierarchical_feedbacks: List[HierarchicalFeedbackItem] = Field(default_factory=list)
     
     def add_feedback(self, feedback: FeedbackResult):
         """Add a feedback result and update passed status"""
@@ -142,6 +179,10 @@ class ReviewResult(BaseModel):
             self.requires_revision[section_type] = []
         self.requires_revision[section_type].append(reason)
         self.passed = False
+
+    def add_hierarchical_feedback(self, item: HierarchicalFeedbackItem):
+        """Append hierarchical feedback item."""
+        self.hierarchical_feedbacks.append(item)
 
 
 class ReviewRequest(BaseModel):

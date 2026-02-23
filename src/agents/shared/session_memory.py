@@ -36,6 +36,8 @@ class ReviewRecord(BaseModel):
     passed: bool = False
     feedback_summary: str = ""
     section_feedbacks: Dict[str, Any] = Field(default_factory=dict)
+    hierarchical_feedbacks: List[Dict[str, Any]] = Field(default_factory=list)
+    agent_feedbacks: Dict[str, Dict[str, List[Dict[str, Any]]]] = Field(default_factory=dict)
     actions_taken: List[str] = Field(default_factory=list)
     result_snapshot: Dict[str, int] = Field(default_factory=dict)
 
@@ -77,6 +79,43 @@ class ReviewRecord(BaseModel):
                 feedback="passed" if self.passed else "issues found",
             ))
         return entries
+
+    def to_iteration_export(self) -> Dict[str, Any]:
+        """
+        Build iteration-centric hierarchical export payload.
+        - **Description**:
+            - Groups feedback by agent and level for downstream analysis
+            - Preserves actions and a compact result snapshot
+        """
+        # Build level buckets from flat hierarchical feedback if explicit
+        # per-agent buckets are unavailable.
+        agent_feedbacks = self.agent_feedbacks or {}
+        if not agent_feedbacks and self.hierarchical_feedbacks:
+            for item in self.hierarchical_feedbacks:
+                agent = str(item.get("agent", "reviewer"))
+                level = str(item.get("level", "section"))
+                if agent not in agent_feedbacks:
+                    agent_feedbacks[agent] = {
+                        "document_feedbacks": [],
+                        "section_feedbacks": [],
+                        "paragraph_feedbacks": [],
+                        "sentence_feedbacks": [],
+                    }
+                bucket = f"{level}_feedbacks"
+                if bucket not in agent_feedbacks[agent]:
+                    bucket = "section_feedbacks"
+                agent_feedbacks[agent][bucket].append(item)
+
+        return {
+            "iteration": self.iteration,
+            "reviewer": self.reviewer,
+            "timestamp": self.timestamp,
+            "passed": self.passed,
+            "summary": self.feedback_summary,
+            "agents": agent_feedbacks,
+            "actions_taken": self.actions_taken,
+            "result_snapshot": self.result_snapshot,
+        }
 
 
 class AgentLogEntry(BaseModel):
@@ -548,11 +587,10 @@ class SessionMemory:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / "review_history.json"
-        entries: list = []
-        for record in self.review_history:
-            entries.extend(e.model_dump() for e in record.to_review_entries())
-        path.write_text(json.dumps(entries, indent=2, ensure_ascii=False), encoding="utf-8")
-        logger.info("session_memory.persisted_reviews path=%s entries=%d", path, len(entries))
+        iterations: list = [record.to_iteration_export() for record in self.review_history]
+        payload = {"iterations": iterations}
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        logger.info("session_memory.persisted_reviews path=%s iterations=%d", path, len(iterations))
 
     def persist_logs(self, output_dir: Path) -> None:
         """
