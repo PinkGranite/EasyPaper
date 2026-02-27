@@ -131,17 +131,3 @@ class ParseAgent(BaseAgent):
                 "output_model": "ParseResult"
             }
         ]
-
-async def main():
-    config = ModelConfig(
-        model_name="openai/gpt-4o-mini",
-        api_key = "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",
-        base_url = "https://openrouter.ai/api/v1",
-    )
-    agent = ParseAgent(config)
-    result = await agent.run(file_path="./test_pdf.pdf")
-    print(result)
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
