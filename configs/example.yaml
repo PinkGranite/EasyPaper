@@ -15,9 +15,13 @@ tools:
     - search_papers
   max_react_iterations: 3
   paper_search:
-    # serpapi_api_key: null  # Optional: required for Google Scholar via SerpAPI
     # semantic_scholar_api_key: null  # Optional: set for higher rate limits
     timeout: 15
+    search_results_per_round: 5  # Papers to return per search round
+  research_context:
+    enabled: true  # Generate research context summary
+    detailed: true  # Detailed mode with trends and gaps
+    top_k_key_papers: 10  # Number of key papers to include
 
 agents:
   - name: paper_parser

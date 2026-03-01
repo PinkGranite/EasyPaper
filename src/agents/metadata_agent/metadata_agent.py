@@ -442,6 +442,25 @@ class MetaDataAgent(ReActAgent):
                     for sp in paper_plan.sections:
                         if sp.assigned_refs:
                             print(f"  [{sp.section_type}] {len(sp.assigned_refs)} refs assigned")
+
+                    # Phase 0d: Generate research context (if enabled)
+                    research_context = None
+                    rc_enabled = (
+                        self.tools_config and
+                        self.tools_config.research_context and
+                        self.tools_config.research_context.enabled
+                    )
+                    if rc_enabled and discovered:
+                        print("[MetaDataAgent] Phase 0d: Generating research context...")
+                        try:
+                            research_context = await self._planner._generate_research_context(
+                                plan=paper_plan,
+                                discovered=discovered,
+                            )
+                            if research_context:
+                                print(f"[MetaDataAgent] Research context generated: {research_context.get('research_area', 'N/A')}")
+                        except Exception as e:
+                            print(f"[MetaDataAgent] Warning: Failed to generate research context: {e}")
                 else:
                     print(f"[MetaDataAgent] Planning skipped or failed, using defaults")
             
@@ -675,7 +694,19 @@ class MetaDataAgent(ReActAgent):
                     json.dumps(metadata.model_dump(), indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
-                
+
+                # Save research_context.json (if generated)
+                if research_context:
+                    rc_path = paper_dir / "research_context.json"
+                    # Add generated timestamp
+                    context_output = dict(research_context)
+                    context_output["generated_at"] = datetime.now().isoformat()
+                    rc_path.write_text(
+                        json.dumps(context_output, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Research context saved to: {rc_path}")
+
                 # Persist session memory (review history + agent logs)
                 memory.log("metadata", "final", "paper_assembled",
                            narrative=f"Paper assembled successfully with {total_words} total words.",

@@ -24,6 +24,14 @@ class PaperSearchConfig(BaseModel):
     serpapi_api_key: Optional[str] = None
     semantic_scholar_api_key: Optional[str] = None
     timeout: int = 10
+    search_results_per_round: int = 5  # Number of papers to return per search round
+
+
+class ResearchContextConfig(BaseModel):
+    """Configuration for research context generation."""
+    enabled: bool = True  # Whether to generate Research Context
+    detailed: bool = True  # Whether to use detailed mode
+    top_k_key_papers: int = 10  # Number of key papers to include
 
 
 class ToolsConfig(BaseModel):
@@ -39,6 +47,7 @@ class ToolsConfig(BaseModel):
     )
     max_react_iterations: int = 3
     paper_search: Optional[PaperSearchConfig] = None
+    research_context: Optional[ResearchContextConfig] = None
 
 
 class MetadataConfig(BaseModel):

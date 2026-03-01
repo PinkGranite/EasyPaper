@@ -446,7 +446,8 @@ class PlannerAgent(BaseAgent):
         Discover additional references for each section based on the plan.
         - **Description**:
             - Analyzes each section's key points and generates search queries.
-            - Executes searches via PaperSearchTool.
+            - Executes multi-round searches via PaperSearchTool.
+            - Supports loop searching until target count is reached or no more queries.
             - Returns discovered papers grouped by section_type.
             - Called once during planning, replacing per-section search judgment.
 
@@ -469,33 +470,55 @@ class PlannerAgent(BaseAgent):
             timeout=cfg.get("timeout", 10),
         )
 
-        # Build search queries from plan — one per section that needs citations
+        # Read configuration for multi-round search
+        results_per_round = cfg.get("search_results_per_round", 5)
+
+        # Build search queries from plan — multiple per section for multi-round search
         section_queries: Dict[str, List[str]] = {}
+        section_targets: Dict[str, int] = {}  # Target paper count per section
+
         for sp in plan.sections:
             if sp.section_type in ("abstract", "conclusion"):
                 continue
             key_points = sp.get_key_points()
             if not key_points:
                 continue
+
+            # Generate multiple search queries for this section
             queries = await self._generate_search_queries(
                 sp.section_type, key_points, existing_ref_keys, plan.title,
             )
+
+            # Store up to 5 queries per section for multi-round search
             if queries:
-                section_queries[sp.section_type] = queries[:2]
+                section_queries[sp.section_type] = queries[:5]
+                # Target: at least 1 paper per paragraph, or minimum 3
+                n_paras = len(sp.paragraphs) if sp.paragraphs else 0
+                section_targets[sp.section_type] = max(n_paras, 3)
 
         discovered: Dict[str, List[Dict[str, Any]]] = {}
         seen_keys: set = set(existing_ref_keys)
 
         for section_type, queries in section_queries.items():
             section_papers: List[Dict[str, Any]] = []
-            for i, query in enumerate(queries):
-                if i > 0:
-                    await asyncio.sleep(1.5)
+            target_count = section_targets.get(section_type, 3)
+            round_num = 0
+
+            # Multi-round search: continue until target is reached or no more queries
+            while len(section_papers) < target_count and round_num < len(queries):
+                query = queries[round_num]
+
+                if round_num > 0:
+                    await asyncio.sleep(1.5)  # Rate limiting between rounds
+
                 try:
-                    result = await tool.execute(query=query, max_results=3)
+                    result = await tool.execute(query=query, max_results=results_per_round)
                     if not result.success:
+                        round_num += 1
                         continue
+
                     papers = result.data.get("papers", []) if result.data else []
+
                     for paper in papers:
                         bkey = paper.get("bibtex_key", "")
                         bibtex = paper.get("bibtex", "")
@@ -506,16 +529,43 @@ class PlannerAgent(BaseAgent):
                                 "bibtex": bibtex,
                                 "title": paper.get("title", ""),
                                 "year": paper.get("year"),
+                                "abstract": paper.get("abstract", ""),
+                                "venue": paper.get("venue", ""),
+                                "citation_count": paper.get("citation_count"),
                             })
+
+                    logger.info(
+                        "planner.search_round section=%s round=%d query='%s' found=%d total=%d",
+                        section_type, round_num, query[:50], len(papers), len(section_papers),
+                    )
                 except Exception as e:
                     logger.warning("planner.search_error query='%s': %s", query, e)
 
+                round_num += 1
+
+            # Filter papers by relevance before storing
             if section_papers:
-                discovered[section_type] = section_papers
-                logger.info(
-                    "planner.discovered_refs section=%s count=%d",
-                    section_type, len(section_papers),
+                # Get key points for this section from the plan
+                section_key_points = []
+                for sp in plan.sections:
+                    if sp.section_type == section_type:
+                        section_key_points = sp.get_key_points()
+                        break
+
+                # Filter by relevance using LLM
+                filtered_papers = await self._filter_papers_by_relevance(
+                    papers=section_papers,
+                    section_type=section_type,
+                    key_points=section_key_points,
+                    paper_title=plan.title,
                 )
+
+                if filtered_papers:
+                    discovered[section_type] = filtered_papers
+                    logger.info(
+                        "planner.discovered_refs section=%s count=%d (filtered from %d)",
+                        section_type, len(filtered_papers), len(section_papers),
+                    )
 
         total = sum(len(v) for v in discovered.values())
         logger.info("planner.reference_discovery_complete total=%d", total)
@@ -614,6 +664,239 @@ class PlannerAgent(BaseAgent):
         except Exception as e:
             logger.warning("planner.query_generation_error section=%s: %s", section_type, e)
             return []
+
+    async def _filter_papers_by_relevance(
+        self,
+        papers: List[Dict[str, Any]],
+        section_type: str,
+        key_points: List[str],
+        paper_title: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Filter discovered papers by relevance to a specific section.
+
+        - **Description**:
+            - Uses LLM to evaluate each paper's relevance, quality, and timeliness.
+            - Scores papers on relevance (0-10), quality, and recency.
+            - Returns filtered list with relevance scores.
+
+        - **Args**:
+            - `papers` (List[Dict]): List of discovered papers.
+            - `section_type` (str): The section type.
+            - `key_points` (List[str]): Key points from the plan.
+            - `paper_title` (str): Paper title for context.
+
+        - **Returns**:
+            - `List[Dict]`: Filtered papers with relevance scores.
+        """
+        if not papers:
+            return []
+
+        # Prepare paper information for LLM evaluation
+        paper_list = []
+        for i, p in enumerate(papers):
+            paper_list.append({
+                "index": i,
+                "title": p.get("title", ""),
+                "year": p.get("year", ""),
+                "venue": p.get("venue", ""),
+                "abstract": p.get("abstract", "")[:300] if p.get("abstract") else "",
+            })
+
+        kp_text = "; ".join(key_points[:4])
+        papers_json = json.dumps(paper_list, ensure_ascii=False)
+
+        prompt = (
+            f"Paper: {paper_title}\n"
+            f"Section: {section_type}\n"
+            f"Key points: {kp_text}\n\n"
+            f"Discovered papers:\n{papers_json}\n\n"
+            "Evaluate each paper's relevance to this section on a scale of 0-10. "
+            "Consider: (1) relevance to key points, (2) paper quality (venue, citations), "
+            "(3) recency (prefer papers from the last 5 years). "
+            "Output JSON array with format: "
+            "[{\"index\": 0, \"relevance_score\": 8, \"reason\": \"brief justification\"}]"
+        )
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": "You are an academic research assistant. Respond with JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=500,
+            )
+            raw = response.choices[0].message.content or ""
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+            evaluations = json.loads(raw.strip())
+
+            # Build score lookup
+            score_map: Dict[int, Dict[str, Any]] = {}
+            for ev in evaluations:
+                idx = ev.get("index")
+                if idx is not None and 0 <= idx < len(papers):
+                    score_map[idx] = {
+                        "relevance_score": ev.get("relevance_score", 0),
+                        "reason": ev.get("reason", ""),
+                    }
+
+            # Filter papers with score >= 5
+            filtered = []
+            for i, paper in enumerate(papers):
+                score_info = score_map.get(i, {})
+                score = score_info.get("relevance_score", 0)
+                if score >= 5:
+                    paper["relevance_score"] = score
+                    paper["relevance_reason"] = score_info.get("reason", "")
+                    filtered.append(paper)
+
+            logger.info(
+                "planner.filter_papers section=%s input=%d output=%d",
+                section_type, len(papers), len(filtered),
+            )
+            return filtered
+
+        except Exception as e:
+            logger.warning("planner.filter_error section=%s: %s", section_type, e)
+            # Return all papers if filtering fails
+            return papers
+
+    async def _generate_research_context(
+        self,
+        plan: "PaperPlan",
+        discovered: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        """
+        Generate a research context summary from discovered papers.
+
+        - **Description**:
+            - Analyzes all discovered papers to generate a research overview.
+            - Identifies key papers, research trends, and gaps.
+            - Assigns papers to appropriate sections.
+            - Returns a structured context dictionary.
+
+        - **Args**:
+            - `plan` (PaperPlan): The paper plan.
+            - `discovered` (Dict[str, List[Dict]]): section_type -> papers.
+
+        - **Returns**:
+            - `Dict`: Research context with summary, key_papers, paper_assignments, etc.
+        """
+        # Collect all discovered papers
+        all_papers: List[Dict[str, Any]] = []
+        for section_papers in discovered.values():
+            all_papers.extend(section_papers)
+
+        if not all_papers:
+            return {
+                "research_area": "",
+                "summary": "No papers discovered.",
+                "key_papers": [],
+                "research_trends": [],
+                "gaps": [],
+                "paper_assignments": {},
+            }
+
+        # Prepare paper information for LLM
+        paper_summaries = []
+        for p in all_papers:
+            paper_summaries.append({
+                "title": p.get("title", ""),
+                "year": p.get("year"),
+                "venue": p.get("venue", ""),
+                "citation_count": p.get("citation_count"),
+                "abstract": p.get("abstract", "")[:200] if p.get("abstract") else "",
+            })
+
+        papers_json = json.dumps(paper_summaries, ensure_ascii=False)
+
+        prompt = (
+            f"Paper title: {plan.title}\n\n"
+            f"Discovered papers:\n{papers_json}\n\n"
+            "Analyze these papers and provide a JSON response with:\n"
+            "1. research_area: Main research area/topic (brief)\n"
+            "2. summary: Overview of the research landscape (2-3 sentences)\n"
+            "3. key_papers: Top 5 most important papers with their contributions\n"
+            "4. research_trends: 2-3 key research trends identified\n"
+            "5. gaps: 2-3 research gaps or opportunities\n"
+            "Output ONLY JSON with this structure:\n"
+            "{\"research_area\": \"...\", \"summary\": \"...\", "
+            "\"key_papers\": [{\"title\": \"...\", \"contribution\": \"...\"}], "
+            "\"research_trends\": [\"...\"], \"gaps\": [\"...\"]}"
+        )
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": "You are an academic research analyst. Respond with JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=800,
+            )
+            raw = response.choices[0].message.content or ""
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
+            if raw.endswith("```"):
+                raw = raw[:-3]
+
+            context = json.loads(raw.strip())
+
+            # Generate paper assignments
+            paper_assignments = self._assign_papers_to_sections(plan, discovered)
+
+            return {
+                "research_area": context.get("research_area", ""),
+                "summary": context.get("summary", ""),
+                "key_papers": context.get("key_papers", [])[:10],
+                "research_trends": context.get("research_trends", []),
+                "gaps": context.get("gaps", []),
+                "paper_assignments": paper_assignments,
+            }
+
+        except Exception as e:
+            logger.warning("planner.context_generation_error: %s", e)
+            # Return basic context without LLM analysis
+            paper_assignments = self._assign_papers_to_sections(plan, discovered)
+            return {
+                "research_area": "Research area analysis",
+                "summary": f"Found {len(all_papers)} relevant papers across {len(discovered)} sections.",
+                "key_papers": [],
+                "research_trends": [],
+                "gaps": [],
+                "paper_assignments": paper_assignments,
+            }
+
+    def _assign_papers_to_sections(
+        self,
+        plan: "PaperPlan",
+        discovered: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, List[str]]:
+        """
+        Assign papers to sections based on where they were discovered.
+
+        - **Args**:
+            - `plan` (PaperPlan): The paper plan.
+            - `discovered` (Dict[str, List[Dict]]): section_type -> papers.
+
+        - **Returns**:
+            - `Dict[str, List[str]]`: section_type -> citation keys.
+        """
+        assignments: Dict[str, List[str]] = {}
+
+        for section_type, papers in discovered.items():
+            citation_keys = [p.get("ref_id", "") for p in papers if p.get("ref_id")]
+            assignments[section_type] = citation_keys
+
+        return assignments
 
     # =====================================================================
     # VLM analysis
