@@ -15,6 +15,7 @@ tools:
     - search_papers
   max_react_iterations: 3
   paper_search:
+    # serpapi_api_key: null  # Optional: required for Google Scholar via SerpAPI
     # semantic_scholar_api_key: null  # Optional: set for higher rate limits
     timeout: 15
 

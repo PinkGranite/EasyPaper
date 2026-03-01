@@ -64,6 +64,7 @@ class ReferencePool:
 
         cfg = paper_search_config or {}
         tool = PaperSearchTool(
+            serpapi_api_key=cfg.get("serpapi_api_key"),
             semantic_scholar_api_key=cfg.get("semantic_scholar_api_key"),
             timeout=cfg.get("timeout", 10),
         )

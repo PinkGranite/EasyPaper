@@ -318,6 +318,7 @@ class MetaDataAgent(ReActAgent):
         if self.tools_config and self.tools_config.paper_search:
             ps = self.tools_config.paper_search
             search_cfg_for_pool = {
+                "serpapi_api_key": ps.serpapi_api_key,
                 "semantic_scholar_api_key": ps.semantic_scholar_api_key,
                 "timeout": ps.timeout,
             }
@@ -407,6 +408,7 @@ class MetaDataAgent(ReActAgent):
                     if self.tools_config and self.tools_config.paper_search:
                         ps = self.tools_config.paper_search
                         search_cfg = {
+                            "serpapi_api_key": ps.serpapi_api_key,
                             "semantic_scholar_api_key": ps.semantic_scholar_api_key,
                             "timeout": ps.timeout,
                         }
@@ -1922,6 +1924,9 @@ class MetaDataAgent(ReActAgent):
 
         paper_search_cfg = self.tools_config.paper_search if self.tools_config else None
         tool = PaperSearchTool(
+            serpapi_api_key=(
+                paper_search_cfg.serpapi_api_key if paper_search_cfg else None
+            ),
             semantic_scholar_api_key=(
                 paper_search_cfg.semantic_scholar_api_key if paper_search_cfg else None
             ),
