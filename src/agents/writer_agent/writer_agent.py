@@ -40,12 +40,11 @@ CRITICAL RULES:
 5. Use \\includegraphics{figure_id} for figures (just the ID, no path)
 6. Maintain formal academic writing style
 7. Be precise and evidence-based
-8. Structure content logically with appropriate subsections if needed
-8.1 If the user prompt includes a "Structure Quality Contract", treat it as mandatory.
-    You may use explicit subsection commands OR strong implicit thematic blocks.
-    Prioritize clarity and transitions over template-like formatting.
-8.2 Do not overuse subsection headings across all sections.
-    Prefer implicit structure unless section-level guidance explicitly recommends sectioning.
+8. Structure content logically:
+8.1 If the user prompt includes a "Structure Quality Contract", treat it as **mandatory**.
+    Follow its subsection policy exactly — if it says DO NOT use \\subsection{}, you must not.
+8.2 Only use \\subsection{} commands when the Structure Quality Contract explicitly recommends them.
+    By default, prefer continuous narrative prose with paragraph-level transitions.
 9. CITATION CONSTRAINT: You MUST ONLY use citation keys that are explicitly provided in the resources/references list. 
    DO NOT invent, hallucinate, or use any citation keys that are not in the provided list.
    DO NOT use placeholder citations like \\cite{need_citation} or similar.
@@ -119,7 +118,7 @@ REVISION STRATEGIES BY ISSUE TYPE:
 4. STRUCTURE FIX (block clarity / subsection quality):
    - Keep major thematic blocks distinguishable after edits
    - Add or refine transition sentences between blocks when needed
-   - You may use \\subsection{} for explicit grouping, but do not force boilerplate headings
+   - Do NOT add \\subsection{} commands unless the original Structure Quality Contract allows them
    - Avoid collapsing multiple themes into one undifferentiated paragraph chain
 
 Return ONLY the revised LaTeX content."""

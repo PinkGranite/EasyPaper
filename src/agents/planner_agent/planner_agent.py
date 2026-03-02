@@ -26,12 +26,12 @@ from .models import (
     TablePlacement,
     PaperType,
     NarrativeStyle,
-    SECTION_RATIOS_BY_TYPE,
     DEFAULT_EMPIRICAL_SECTIONS,
-    VENUE_WORD_LIMITS,
     ELEMENT_PAGE_COST,
     WORDS_PER_SENTENCE,
+    WORDS_PER_PARAGRAPH,
     calculate_total_words,
+    estimate_target_paragraphs,
 )
 
 
@@ -42,129 +42,143 @@ logger = logging.getLogger("uvicorn.error")
 # LLM Prompts
 # =========================================================================
 
-PLANNING_SYSTEM_PROMPT = """You are an expert academic paper planner. Your job is to analyze paper metadata and create a detailed paragraph-level writing plan.
+# =========================================================================
+# Multi-Step Planner Prompts
+# =========================================================================
 
-Given the paper's idea/hypothesis, method, data, experiments, references, figures, and tables, you must:
-1. Determine the paper type (empirical, theoretical, survey, position, system, benchmark)
-2. Identify the key contributions (usually 2-4)
-3. Design the section structure (you choose which sections to include)
-   - "abstract" and "conclusion" are REQUIRED
-   - For the body, use standard sections or merge/rename as needed
-4. For EACH section, plan INDIVIDUAL PARAGRAPHS:
-   - Each paragraph has a key_point, supporting_points, approximate sentence count, and a role
-   - Roles: "motivation", "problem_statement", "definition", "evidence", "comparison", "transition", "summary"
-5. Assign figures and tables to sections with placement hints
-6. Suggest which references to cite in each paragraph
+# --- STEP 1: Structure Decision ---
+STEP1_STRUCTURE_SYSTEM = """You are an expert academic paper planner.
+Given a paper's metadata and target venue, decide the high-level structure.
+Output ONLY a JSON object. No markdown, no explanation."""
 
-Output a JSON object with this structure:
-{
-    "paper_type": "empirical",
-    "contributions": ["Contribution 1", "Contribution 2"],
-    "narrative_style": "technical",
-    "terminology": {"key_term": "definition"},
-    "structure_rationale": "Why this structure works",
-    "abstract_focus": "What the abstract should emphasize",
-    "sections": [
-        {
-            "section_type": "introduction",
-            "section_title": "Introduction",
-            "paragraphs": [
-                {
-                    "key_point": "Research context and motivation",
-                    "supporting_points": ["Background info", "Why this matters"],
-                    "approx_sentences": 5,
-                    "role": "motivation",
-                    "references_to_cite": ["ref_key1"],
-                    "figures_to_reference": [],
-                    "tables_to_reference": []
-                },
-                {
-                    "key_point": "Problem statement and gap",
-                    "supporting_points": ["Current limitations"],
-                    "approx_sentences": 4,
-                    "role": "problem_statement",
-                    "references_to_cite": ["ref_key2"]
-                }
-            ],
-            "figures": [
-                {
-                    "figure_id": "fig:architecture",
-                    "position_hint": "early",
-                    "caption_guidance": "Show overall framework"
-                }
-            ],
-            "tables": [],
-            "content_sources": ["idea_hypothesis", "method"],
-            "citation_budget": {
-                "min_refs": 6,
-                "target_refs": 10,
-                "max_refs": 14,
-                "rationale": "Why this section needs this citation depth"
-            },
-            "topic_clusters": ["Theme A", "Theme B"],
-            "transition_intents": ["Move from context to gap", "Bridge method to evidence"],
-            "sectioning_recommended": true,
-            "writing_guidance": "Specific guidance"
-        }
-    ]
-}
-
-IMPORTANT:
-- Each paragraph should have 3-8 sentences (approx_sentences)
-- Sections with figures/tables need FEWER text paragraphs (visuals take space)
-- "abstract" typically needs 1-2 paragraphs; "conclusion" needs 2-3 paragraphs
-- Assign each figure/table to exactly ONE section for definition
-- Decide citation budgets per section based on section goals, evidence needs,
-  and venue rigor. Do not use a global fixed number.
-- Add soft structure signals for each body section:
-  - topic_clusters: 1-4 thematic blocks
-  - transition_intents: 1-3 intended transitions across blocks
-  - sectioning_recommended: whether explicit sub-structure may improve readability
-- Be specific and actionable"""
-
-
-PLANNING_USER_PROMPT_TEMPLATE = """Create a detailed paragraph-level paper plan for:
+STEP1_STRUCTURE_USER = """Decide the structure for this paper:
 
 **Title**: {title}
+**Idea/Hypothesis**: {idea_hypothesis}
+**Method summary**: {method}
+**Data**: {data}
+**Experiments summary**: {experiments}
+**Target venue/style**: {style_guide}
+**Target pages**: {target_pages}
+**Research Context**: {research_context_summary}
+**Code Assets**: {code_writing_assets_summary}
 
-**Idea/Hypothesis**:
-{idea_hypothesis}
+Output JSON:
+{{
+  "paper_type": "empirical|theoretical|survey|position|system|benchmark",
+  "contributions": ["Contribution 1", "Contribution 2", ...],
+  "narrative_style": "technical|tutorial|concise|comprehensive",
+  "sections": [
+    {{"section_type": "abstract", "section_title": "Abstract"}},
+    {{"section_type": "introduction", "section_title": "Introduction"}},
+    ...
+  ],
+  "structure_rationale": "Why this structure suits the venue and content",
+  "abstract_focus": "What the abstract should emphasize"
+}}
 
-**Method**:
-{method}
+IMPORTANT:
+- "abstract" is always required.
+- Choose sections appropriate for {style_guide}. Use your knowledge of venue norms.
+- Each section needs section_type (lowercase, e.g. "method", "result") and section_title.
+- For empirical studies, consider whether a dedicated Method section is needed.
+- Conclusion is optional; for Nature-style, it may be integrated into Discussion.
+Output valid JSON only."""
 
-**Data**:
-{data}
+# --- STEP 2: Citation Strategy ---
+STEP2_CITATION_SYSTEM = """You are an expert academic citation strategist.
+Given a paper's structure and venue, decide the total citation count and
+per-section allocation. Output ONLY a JSON object."""
 
-**Experiments**:
-{experiments}
+STEP2_CITATION_USER = """Decide the citation strategy for this paper:
 
-**Research Context (use this to decide emphasis, trade-offs, and style)**:
-{research_context_summary}
+**Title**: {title}
+**Venue**: {style_guide}
+**Target pages**: {target_pages}
+**Sections**: {section_list}
+**Available reference keys**: {reference_keys}
 
-**Available References** (BibTeX keys):
-{reference_keys}
+Output JSON:
+{{
+  "total_target": <int>,
+  "rationale": "Why this total is appropriate for the venue and paper scope",
+  "section_allocation": {{
+    "<section_type>": {{
+      "target_refs": <int>,
+      "rationale": "Why this section needs this many"
+    }},
+    ...
+  }}
+}}
 
-**Available Figures**:
-{figure_info}
+Use your knowledge of academic publishing norms to decide appropriate totals.
+Sections that carry literature-review duties need more citations.
+Abstract and conclusion typically need 0 citations.
+Output valid JSON only."""
 
-**Available Tables**:
-{table_info}
+# --- STEP 3: Section Planning (called per section) ---
+STEP3_SECTION_SYSTEM = """You are an expert academic section planner.
+Given a section's role in the paper, plan its paragraphs in detail.
+Output ONLY a JSON object."""
 
-**Space Budget**:
-- Target: {target_pages} pages for {style_guide}
-- Estimated total paragraphs: ~{total_paragraphs}
-- Effective word budget: ~{total_words} words
+STEP3_SECTION_USER = """Plan the **{section_title}** ({section_type}) section:
 
-Plan each section with specific paragraphs. Each paragraph should have:
-- A clear key_point (the main argument)
-- Supporting points (evidence, examples)
-- Approximate sentence count (3-8)
-- A role (motivation, problem_statement, definition, evidence, comparison, transition, summary)
-- Which references to cite
-- Also provide soft structure signals (topic_clusters, transition_intents,
-  sectioning_recommended) for Writer and Reviewer coordination.
+**Paper title**: {title}
+**Paper type**: {paper_type}
+**Venue**: {style_guide}
+**Space budget for this section**: ~{section_words} words (~{section_paragraphs} paragraphs)
+**Contributions**: {contributions}
 
+**Available figures**: {figure_info}
+**Available tables**: {table_info}
+**Available references**: {reference_keys}
+**Code assets**: {code_writing_assets_summary}
+
+**Content sources**:
+- Idea/Hypothesis: {idea_hypothesis}
+- Method: {method}
+- Data: {data}
+- Experiments: {experiments}
+
+Output JSON:
+{{
+  "paragraphs": [
+    {{
+      "key_point": "The main argument of this paragraph",
+      "supporting_points": ["Evidence 1", "Evidence 2"],
+      "approx_sentences": 5,
+      "role": "motivation|problem_statement|definition|evidence|comparison|transition|summary",
+      "references_to_cite": ["ref_key1"],
+      "figures_to_reference": [],
+      "tables_to_reference": []
+    }}
+  ],
+  "figures": [
+    {{"figure_id": "fig:X", "position_hint": "early|middle|late", "caption_guidance": "..."}}
+  ],
+  "tables": [],
+  "topic_clusters": ["Theme A", "Theme B"],
+  "transition_intents": ["From X to Y"],
+  "sectioning_recommended": false,
+  "code_focus": {{
+    "must_use_evidence_ids": [],
+    "key_assets": [],
+    "allowed_claim_scope": "",
+    "notes": ""
+  }},
+  "writing_guidance": "Specific guidance for the writer"
+}}
+
+IMPORTANT:
+- Plan enough paragraphs to fill ~{section_words} words. Each paragraph is ~150-250 words.
+- Each paragraph should have 3-8 sentences.
+- For narrative sections (introduction, discussion), plan **4-8 cohesive paragraphs**
+  with substantial depth each, rather than 10+ short fragmented paragraphs.
+  An academic paragraph should develop a complete idea, not a single bullet point.
+- Use sectioning_recommended sparingly; prefer false for narrative sections
+  like introduction or discussion where continuous prose flow is expected.
+- Do NOT set sectioning_recommended to true for introduction or discussion
+  unless the section is exceptionally long and structurally complex.
 Output valid JSON only."""
 
 
@@ -235,6 +249,21 @@ class PlannerAgent(BaseAgent):
     def _create_router(self) -> APIRouter:
         from .router import create_planner_router
         return create_planner_router(self)
+
+    @staticmethod
+    def _normalize_section_type_name(section_type: str) -> str:
+        """
+        Normalize common plural/alias section names.
+        """
+        st = (section_type or "").strip().lower()
+        alias_map = {
+            "methods": "method",
+            "methodology": "method",
+            "experiments": "experiment",
+            "results": "result",
+            "intro": "introduction",
+        }
+        return alias_map.get(st, st)
 
     # =====================================================================
     # AskTool consultation interface
@@ -400,6 +429,80 @@ class PlannerAgent(BaseAgent):
 
         return "\n".join(lines) if lines else "Not available."
 
+    def _format_code_assets_for_planning(
+        self,
+        code_context: Optional[Dict[str, Any]],
+        code_writing_assets: Optional[Dict[str, Any]],
+    ) -> str:
+        """
+        Format compact code-driven writing assets for planner decisions.
+        """
+        assets = code_writing_assets or {}
+        if not assets and code_context:
+            assets = code_context.get("writing_assets", {}) or {}
+
+        section_packs = {}
+        if code_context:
+            section_packs = code_context.get("section_asset_packs", {}) or {}
+        evidence_graph = (code_context or {}).get("code_evidence_graph", []) or []
+
+        if not assets and not section_packs and not evidence_graph:
+            return "Not available."
+
+        lines: List[str] = [f"- Evidence nodes extracted: {len(evidence_graph)}"]
+        planner_brief = str(assets.get("planner_brief", "")).strip() if isinstance(assets, dict) else ""
+        if planner_brief:
+            lines.append("- Planner brief:")
+            for chunk in planner_brief.splitlines()[:10]:
+                lines.append(f"  {chunk}")
+        for key, label in (
+            ("method_pipeline", "Method assets"),
+            ("experiment_protocol", "Experiment assets"),
+            ("result_readouts", "Result assets"),
+            ("risk_limitations", "Risk assets"),
+        ):
+            rows = assets.get(key, []) or []
+            if not rows:
+                continue
+            lines.append(f"- {label}:")
+            for row in rows[:4]:
+                title = str(row.get("title", "")).strip()
+                if title:
+                    lines.append(f"  - {title}")
+        for sec in ("introduction", "method", "experiment", "result", "discussion"):
+            pack = section_packs.get(sec, {}) or {}
+            evidence_ids = [str(x).strip() for x in (pack.get("evidence_ids", []) or []) if str(x).strip()]
+            if evidence_ids:
+                lines.append(f"- Suggested evidence IDs for {sec}: {', '.join(evidence_ids[:6])}")
+            guardrails = [str(x).strip() for x in (pack.get("claim_guardrails", []) or []) if str(x).strip()]
+            if guardrails:
+                lines.append(f"- Claim guardrails for {sec}:")
+                for guardrail in guardrails[:2]:
+                    lines.append(f"  - {guardrail}")
+        return "\n".join(lines) if lines else "Not available."
+
+    @staticmethod
+    def _normalize_code_focus(raw: Any) -> Dict[str, Any]:
+        """
+        Normalize LLM-provided code_focus object for each section.
+        """
+        if not isinstance(raw, dict):
+            return {}
+        must_use = [str(x).strip() for x in (raw.get("must_use_evidence_ids", []) or []) if str(x).strip()]
+        key_assets = [str(x).strip() for x in (raw.get("key_assets", []) or []) if str(x).strip()]
+        allowed_scope = str(raw.get("allowed_claim_scope", "")).strip()
+        notes = str(raw.get("notes", "")).strip()
+        out: Dict[str, Any] = {}
+        if must_use:
+            out["must_use_evidence_ids"] = must_use[:10]
+        if key_assets:
+            out["key_assets"] = key_assets[:8]
+        if allowed_scope:
+            out["allowed_claim_scope"] = allowed_scope[:320]
+        if notes:
+            out["notes"] = notes[:320]
+        return out
+
     @staticmethod
     def _strip_code_fence(text: str) -> str:
         """
@@ -477,15 +580,73 @@ class PlannerAgent(BaseAgent):
                 continue
         return None
 
-    async def create_plan(self, request: PlanRequest) -> PaperPlan:
+    # -----------------------------------------------------------------
+    # LLM call helper with retry
+    # -----------------------------------------------------------------
+
+    async def _llm_json_call(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        label: str,
+        max_retries: int = 2,
+        temperature: float = 0.3,
+    ) -> Dict[str, Any]:
         """
-        Create a paper plan from metadata.
+        Call LLM and parse the result as JSON, with retry on parse failure.
 
         - **Args**:
-            - `request` (PlanRequest): Planning request with metadata
+          - `label` (str): Log label for this call (e.g. "step1_structure").
+          - `max_retries` (int): Number of retry attempts on JSON parse failure.
 
         - **Returns**:
-            - `PaperPlan`: Complete paragraph-level paper plan
+          - `Dict[str, Any]`: Parsed JSON object, or empty dict on total failure.
+        """
+        for attempt in range(1 + max_retries):
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    temperature=temperature,
+                )
+                text = response.choices[0].message.content.strip()
+                parsed = self._safe_load_json(text, expected=dict)
+                if parsed:
+                    logger.info("planner.%s ok (attempt=%d)", label, attempt)
+                    return parsed
+                logger.warning(
+                    "planner.%s json_parse_failed attempt=%d", label, attempt,
+                )
+            except Exception as e:
+                logger.warning(
+                    "planner.%s error attempt=%d: %s", label, attempt, e,
+                )
+        logger.error("planner.%s all_attempts_failed", label)
+        return {}
+
+    # -----------------------------------------------------------------
+    # Main entry point — multi-step planning
+    # -----------------------------------------------------------------
+
+    async def create_plan(self, request: PlanRequest) -> PaperPlan:
+        """
+        Create a paper plan from metadata using a multi-step approach.
+
+        - **Description**:
+          - Step 1: Structure decision (paper_type, sections, contributions)
+          - Step 2: Citation strategy (total target + per-section allocation)
+          - Step 3: Per-section paragraph planning
+          - Each step produces a small, simple JSON output that is easy for
+            the LLM to generate correctly, reducing parse failures.
+
+        - **Args**:
+          - `request` (PlanRequest): Planning request with metadata.
+
+        - **Returns**:
+          - `PaperPlan`: Complete paragraph-level paper plan.
         """
         n_figures = len(request.figures) if request.figures else 0
         n_tables = len(request.tables) if request.tables else 0
@@ -504,11 +665,11 @@ class PlannerAgent(BaseAgent):
             n_wide_figures=n_wide_figures,
             n_wide_tables=n_wide_tables,
         )
-        target_pages = request.target_pages or 8
+        target_pages = request.target_pages or 10
         style_guide = request.style_guide or "DEFAULT"
-        total_paragraphs = max(1, total_words // 100)
+        total_paragraphs = estimate_target_paragraphs(total_words)
 
-        # VLM analysis for figures and tables (if service available)
+        # VLM analysis for figures and tables
         figure_analyses: Dict[str, Any] = {}
         table_analyses: Dict[str, Any] = {}
         if self.vlm_service:
@@ -516,26 +677,12 @@ class PlannerAgent(BaseAgent):
             table_analyses = await self._analyze_tables(request.tables or [])
 
         reference_keys = self._extract_reference_keys(request.references)
-
         figure_info = self._format_figure_info(request.figures or [], figure_analyses)
         table_info = self._format_table_info(request.tables or [], table_analyses)
-
-        user_prompt = PLANNING_USER_PROMPT_TEMPLATE.format(
-            title=request.title,
-            idea_hypothesis=request.idea_hypothesis[:2000],
-            method=request.method[:2000],
-            data=request.data[:1500],
-            experiments=request.experiments[:2000],
-            research_context_summary=self._format_research_context_for_planning(
-                request.research_context
-            ),
-            reference_keys=", ".join(reference_keys) if reference_keys else "None provided",
-            figure_info=figure_info,
-            table_info=table_info,
-            target_pages=target_pages,
-            total_words=total_words,
-            total_paragraphs=total_paragraphs,
-            style_guide=style_guide,
+        rc_summary = self._format_research_context_for_planning(request.research_context)
+        code_summary = self._format_code_assets_for_planning(
+            code_context=request.code_context,
+            code_writing_assets=request.code_writing_assets,
         )
 
         logger.info(
@@ -544,39 +691,264 @@ class PlannerAgent(BaseAgent):
             bool(figure_analyses or table_analyses),
         )
 
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": PLANNING_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.3,
-            )
-            plan_text = response.choices[0].message.content.strip()
-            plan_data = self._parse_plan_json(plan_text)
+        # =============================================================
+        # STEP 1: Structure Decision
+        # =============================================================
+        step1_prompt = STEP1_STRUCTURE_USER.format(
+            title=request.title,
+            idea_hypothesis=request.idea_hypothesis[:2000],
+            method=request.method[:1500],
+            data=request.data[:1000],
+            experiments=request.experiments[:1500],
+            style_guide=style_guide,
+            target_pages=target_pages,
+            research_context_summary=rc_summary,
+            code_writing_assets_summary=code_summary,
+        )
+        structure = await self._llm_json_call(
+            STEP1_STRUCTURE_SYSTEM, step1_prompt, "step1_structure",
+        )
 
-            paper_plan = self._build_paper_plan(
-                plan_data=plan_data,
-                request=request,
-                total_words=total_words,
-                figure_analyses=figure_analyses,
-                table_analyses=table_analyses,
+        # Extract structure decisions
+        paper_type_str = structure.get("paper_type", "empirical")
+        try:
+            paper_type = PaperType(paper_type_str.lower())
+        except ValueError:
+            paper_type = PaperType.EMPIRICAL
+
+        style_str = structure.get("narrative_style", "technical")
+        try:
+            narrative_style = NarrativeStyle(style_str.lower())
+        except ValueError:
+            narrative_style = NarrativeStyle.TECHNICAL
+
+        contributions = structure.get("contributions", [])
+        structure_rationale = structure.get("structure_rationale", "")
+        abstract_focus = structure.get("abstract_focus", "")
+
+        raw_sections = structure.get("sections", [])
+        section_order: List[Dict[str, str]] = []
+        for s in raw_sections:
+            if isinstance(s, dict) and s.get("section_type"):
+                st = self._normalize_section_type_name(str(s["section_type"]))
+                section_order.append({
+                    "section_type": st,
+                    "section_title": s.get("section_title", self._get_section_title(st)),
+                })
+
+        if not section_order or len(section_order) < 3:
+            section_order = [
+                {"section_type": st, "section_title": self._get_section_title(st)}
+                for st in DEFAULT_EMPIRICAL_SECTIONS
+            ]
+            logger.warning("planner.step1_fallback using default sections")
+
+        if not any(s["section_type"] == "abstract" for s in section_order):
+            section_order.insert(0, {"section_type": "abstract", "section_title": "Abstract"})
+
+        # Deduplicate section_types: if the LLM produces multiple sections
+        # with the same type (e.g. 3 "result" sections), append _2, _3, etc.
+        # to create unique keys while preserving semantic meaning.
+        type_counts: Dict[str, int] = {}
+        for sec in section_order:
+            st = sec["section_type"]
+            type_counts[st] = type_counts.get(st, 0) + 1
+            if type_counts[st] > 1:
+                sec["section_type"] = f"{st}_{type_counts[st]}"
+
+        section_types_str = ", ".join(s["section_type"] for s in section_order)
+        logger.info(
+            "planner.step1_done paper_type=%s sections=[%s]",
+            paper_type.value, section_types_str,
+        )
+
+        # =============================================================
+        # STEP 2: Citation Strategy
+        # =============================================================
+        step2_prompt = STEP2_CITATION_USER.format(
+            title=request.title,
+            style_guide=style_guide,
+            target_pages=target_pages,
+            section_list=section_types_str,
+            reference_keys=", ".join(reference_keys) if reference_keys else "None",
+        )
+        citation_strategy = await self._llm_json_call(
+            STEP2_CITATION_SYSTEM, step2_prompt, "step2_citation",
+        )
+
+        if not citation_strategy.get("total_target"):
+            total_paras = total_paragraphs
+            body_count = sum(
+                1 for s in section_order
+                if s["section_type"] not in ("abstract", "conclusion")
             )
+            citation_strategy = {
+                "total_target": self._estimate_total_citations(
+                    style_guide, body_count, total_paras,
+                ),
+                "rationale": "Fallback estimation",
+                "section_allocation": {},
+            }
+        logger.info(
+            "planner.step2_done total_target=%s",
+            citation_strategy.get("total_target"),
+        )
+
+        # =============================================================
+        # STEP 3: Per-Section Planning
+        # =============================================================
+        n_body = sum(
+            1 for s in section_order
+            if s["section_type"] not in ("abstract", "conclusion")
+        )
+        sections: List[SectionPlan] = []
+
+        for order, sec_info in enumerate(section_order):
+            section_type = sec_info["section_type"]
+            section_title = sec_info["section_title"]
+
+            # Allocate word budget per section proportionally
+            if section_type == "abstract":
+                section_words = min(300, total_words // 10)
+            elif section_type == "conclusion":
+                section_words = min(500, total_words // 8)
+            else:
+                alloc = (citation_strategy.get("section_allocation") or {}).get(section_type, {})
+                if isinstance(alloc, dict) and alloc.get("target_refs"):
+                    # Use citation weight as a proxy for section importance
+                    total_target = int(citation_strategy.get("total_target", 1) or 1)
+                    share = int(alloc.get("target_refs", 0)) / max(1, total_target)
+                    section_words = max(400, int(total_words * max(share, 0.1)))
+                else:
+                    section_words = max(400, total_words // max(1, n_body))
+
+            section_paragraphs = max(1, section_words // WORDS_PER_PARAGRAPH)
+
+            step3_prompt = STEP3_SECTION_USER.format(
+                section_type=section_type,
+                section_title=section_title,
+                title=request.title,
+                paper_type=paper_type.value,
+                style_guide=style_guide,
+                section_words=section_words,
+                section_paragraphs=section_paragraphs,
+                contributions=", ".join(contributions) if contributions else "Not specified",
+                figure_info=figure_info,
+                table_info=table_info,
+                reference_keys=", ".join(reference_keys) if reference_keys else "None",
+                code_writing_assets_summary=code_summary,
+                idea_hypothesis=request.idea_hypothesis[:1500],
+                method=request.method[:1500],
+                data=request.data[:1000],
+                experiments=request.experiments[:1500],
+            )
+            section_data = await self._llm_json_call(
+                STEP3_SECTION_SYSTEM, step3_prompt,
+                f"step3_{section_type}",
+            )
+
+            # Parse paragraphs
+            raw_paragraphs = section_data.get("paragraphs", [])
+            paragraphs = self._parse_paragraph_plans(raw_paragraphs)
+            if not paragraphs:
+                default_sents = max(3, section_words // WORDS_PER_SENTENCE)
+                paragraphs = self._generate_default_paragraphs(
+                    section_type, default_sents, section_data,
+                )
+
+            # Parse figure/table placements
+            figure_placements = self._build_figure_placements(
+                section_data.get("figures", []), figure_analyses or {},
+            )
+            table_placements = self._build_table_placements(
+                section_data.get("tables", []), table_analyses or {},
+            )
+
+            # Citation budget from Step 2
+            alloc = (citation_strategy.get("section_allocation") or {}).get(section_type, {})
+            if isinstance(alloc, dict):
+                citation_budget = {
+                    "target_refs": int(alloc.get("target_refs", 0) or 0),
+                    "rationale": alloc.get("rationale", ""),
+                }
+            else:
+                citation_budget = {}
+
+            sections.append(SectionPlan(
+                section_type=section_type,
+                section_title=section_title,
+                paragraphs=paragraphs,
+                figures=figure_placements,
+                tables=table_placements,
+                figures_to_reference=section_data.get("figures_to_reference", []),
+                tables_to_reference=section_data.get("tables_to_reference", []),
+                content_sources=section_data.get(
+                    "content_sources", self._get_default_sources(section_type),
+                ),
+                depends_on=self._get_dependencies(section_type),
+                citation_budget=citation_budget,
+                topic_clusters=self._normalize_string_list(
+                    section_data.get("topic_clusters", []), max_items=4,
+                ),
+                transition_intents=self._normalize_string_list(
+                    section_data.get("transition_intents", []), max_items=3,
+                ),
+                sectioning_recommended=self._coerce_bool(
+                    section_data.get("sectioning_recommended", False),
+                ),
+                code_focus=self._normalize_code_focus(
+                    section_data.get("code_focus", {}),
+                ),
+                writing_guidance=section_data.get("writing_guidance", ""),
+                order=order,
+            ))
 
             logger.info(
-                "planner.plan_created sections=%d sentences=%d",
-                len(paper_plan.sections),
-                paper_plan.get_total_sentences(),
+                "planner.step3_section section=%s paragraphs=%d sentences=%d",
+                section_type, len(paragraphs),
+                sum(p.approx_sentences for p in paragraphs),
             )
-            self._last_plan = paper_plan
-            return paper_plan
 
-        except Exception as e:
-            logger.error("planner.llm_error: %s", str(e))
-            fallback = self._create_default_plan(request, total_words)
-            self._last_plan = fallback
-            return fallback
+        # Whole-plan paragraph budget validation
+        target_paras = estimate_target_paragraphs(total_words)
+        llm_total_paras = sum(len(sp.paragraphs) for sp in sections)
+        if llm_total_paras > 0 and llm_total_paras < target_paras * 0.5:
+            scale = target_paras / max(1, llm_total_paras)
+            for sp in sections:
+                if sp.section_type in ("abstract", "conclusion"):
+                    continue
+                section_target_sents = int(
+                    sum(p.approx_sentences for p in sp.paragraphs) * scale
+                )
+                sp.paragraphs = self._expand_paragraph_plan(
+                    sp.paragraphs, section_target_sents, sp.section_type,
+                )
+            expanded_total = sum(len(sp.paragraphs) for sp in sections)
+            logger.info(
+                "planner.plan_budget_expansion llm_paras=%d target=%d expanded=%d",
+                llm_total_paras, target_paras, expanded_total,
+            )
+
+        paper_plan = PaperPlan(
+            title=request.title,
+            paper_type=paper_type,
+            sections=sections,
+            contributions=contributions,
+            narrative_style=narrative_style,
+            terminology=structure.get("terminology", {}),
+            structure_rationale=structure_rationale,
+            abstract_focus=abstract_focus,
+            citation_strategy=citation_strategy,
+        )
+
+        self._assign_figure_table_definitions(paper_plan, request, figure_analyses, table_analyses)
+
+        logger.info(
+            "planner.plan_created sections=%d sentences=%d",
+            len(paper_plan.sections), paper_plan.get_total_sentences(),
+        )
+        self._last_plan = paper_plan
+        return paper_plan
 
     async def discover_seed_references(
         self,
@@ -715,6 +1087,46 @@ class PlannerAgent(BaseAgent):
         section_queries: Dict[str, List[str]] = {}
         section_targets: Dict[str, int] = {}  # Target paper count per section
 
+        # --- Top-down citation target computation ---
+        # Priority: 1) per-section citation_budget from Planner
+        #           2) global citation_strategy from Planner
+        #           3) venue-aware estimation + proportional distribution
+        body_sections = [
+            sp for sp in plan.sections
+            if sp.section_type not in ("abstract", "conclusion")
+        ]
+
+        strategy = plan.citation_strategy if isinstance(plan.citation_strategy, dict) else {}
+        global_total = int(strategy.get("total_target", 0) or 0)
+        section_allocation = strategy.get("section_allocation")
+
+        if global_total <= 0:
+            # Planner did not provide global strategy; estimate from venue + scale
+            total_paras = sum(len(sp.paragraphs) for sp in body_sections)
+            global_total = self._estimate_total_citations(
+                style_guide=cfg.get("style_guide"),
+                n_body_sections=len(body_sections),
+                total_paragraphs=total_paras,
+            )
+            section_allocation = None
+            logger.info(
+                "planner.citation_strategy fallback: estimated total_target=%d "
+                "(venue=%s, body_sections=%d, paragraphs=%d)",
+                global_total, cfg.get("style_guide", "unknown"),
+                len(body_sections), total_paras,
+            )
+        else:
+            logger.info(
+                "planner.citation_strategy from_planner: total_target=%d",
+                global_total,
+            )
+
+        topdown_targets = self._distribute_citations_topdown(
+            total_target=global_total,
+            body_sections=body_sections,
+            section_allocation=section_allocation,
+        )
+
         for sp in plan.sections:
             if sp.section_type in ("abstract", "conclusion"):
                 continue
@@ -730,20 +1142,20 @@ class PlannerAgent(BaseAgent):
             # Store up to N queries per section for multi-round search
             if queries:
                 section_queries[sp.section_type] = queries[:max_queries_per_section]
-                # Target priority:
-                # 1) planner-provided section citation budget
-                # 2) fallback to paragraph-derived heuristic
+                # Priority: 1) planner per-section budget, 2) top-down allocation
                 planner_budget = sp.citation_budget if isinstance(sp.citation_budget, dict) else {}
                 planner_target = planner_budget.get("target_refs")
                 if planner_target is not None:
                     try:
                         section_targets[sp.section_type] = max(1, int(planner_target))
                     except Exception:
-                        n_paras = len(sp.paragraphs) if sp.paragraphs else 0
-                        section_targets[sp.section_type] = max(n_paras, min_target_papers)
+                        section_targets[sp.section_type] = topdown_targets.get(
+                            sp.section_type, min_target_papers,
+                        )
                 else:
-                    n_paras = len(sp.paragraphs) if sp.paragraphs else 0
-                    section_targets[sp.section_type] = max(n_paras, min_target_papers)
+                    section_targets[sp.section_type] = topdown_targets.get(
+                        sp.section_type, min_target_papers,
+                    )
 
         discovered: Dict[str, List[Dict[str, Any]]] = {}
         seen_keys: set = set(existing_ref_keys)
@@ -865,6 +1277,31 @@ class PlannerAgent(BaseAgent):
         reserve_size = max(1, int(cfg.get("citation_budget_reserve_size", 4)))
 
         no_cite_sections = {"abstract", "conclusion"}
+
+        # Compute top-down allocation for fallback
+        body_sections = [
+            sp for sp in plan.sections
+            if sp.section_type not in no_cite_sections
+        ]
+        strategy = plan.citation_strategy if isinstance(plan.citation_strategy, dict) else {}
+        global_total = int(strategy.get("total_target", 0) or 0)
+        section_allocation = strategy.get("section_allocation")
+
+        if global_total <= 0:
+            total_paras = sum(len(sp.paragraphs) for sp in body_sections)
+            global_total = self._estimate_total_citations(
+                style_guide=cfg.get("style_guide"),
+                n_body_sections=len(body_sections),
+                total_paragraphs=total_paras,
+            )
+            section_allocation = None
+
+        topdown_targets = self._distribute_citations_topdown(
+            total_target=global_total,
+            body_sections=body_sections,
+            section_allocation=section_allocation,
+        )
+
         for sp in plan.sections:
             if sp.section_type in no_cite_sections:
                 sp.assigned_refs = []
@@ -892,6 +1329,7 @@ class PlannerAgent(BaseAgent):
                 planner_hint_refs=planner_hint_refs,
                 core_ref_keys=core_ref_keys,
                 planner_budget=sp.citation_budget if isinstance(sp.citation_budget, dict) else {},
+                topdown_target=topdown_targets.get(sp.section_type),
             )
 
             if not budget_enabled:
@@ -931,6 +1369,97 @@ class PlannerAgent(BaseAgent):
         }
         logger.info("planner.assign_references result=%s", assigned_counts)
 
+    @staticmethod
+    def _estimate_total_citations(
+        style_guide: Optional[str],
+        n_body_sections: int,
+        total_paragraphs: int,
+    ) -> int:
+        """
+        Estimate total citations for the paper when Planner omits
+        citation_strategy, using venue conventions and paper scale.
+
+        - **Args**:
+          - `style_guide` (str | None): Venue hint (e.g. "Nature", "NeurIPS").
+          - `n_body_sections` (int): Number of body sections (excl abstract/conclusion).
+          - `total_paragraphs` (int): Total paragraph count across body sections.
+
+        - **Returns**:
+          - `int`: Estimated total citation target.
+        """
+        sg = (style_guide or "").lower()
+
+        # Venue-aware base range (mid-point used as default)
+        if any(v in sg for v in ("nature", "science", "cell", "lancet", "nejm")):
+            base = 35
+        elif any(v in sg for v in ("neurips", "icml", "iclr", "aaai", "cvpr", "acl", "emnlp")):
+            base = 30
+        elif any(v in sg for v in ("journal", "tpami", "jmlr", "tkde", "tac")):
+            base = 45
+        elif "workshop" in sg:
+            base = 18
+        else:
+            base = 30
+
+        # Scale by paper complexity
+        scale_factor = max(1.0, total_paragraphs / 15.0)
+        return max(15, int(base * min(scale_factor, 2.0)))
+
+    @staticmethod
+    def _distribute_citations_topdown(
+        total_target: int,
+        body_sections: List["SectionPlan"],
+        section_allocation: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, int]:
+        """
+        Distribute total citation target across body sections by weight.
+
+        - **Description**:
+          - If `section_allocation` is available (from Planner's citation_strategy),
+            use share_pct to derive per-section targets.
+          - Otherwise, distribute proportionally by paragraph count, giving
+            each section a fair share of the total.
+
+        - **Args**:
+          - `total_target` (int): Total citation target for the paper.
+          - `body_sections` (List[SectionPlan]): Body section plans.
+          - `section_allocation` (dict | None): Planner-provided share_pct map.
+
+        - **Returns**:
+          - `Dict[str, int]`: section_type -> target citation count.
+        """
+        targets: Dict[str, int] = {}
+
+        if section_allocation:
+            allocated = 0
+            for sp in body_sections:
+                alloc = section_allocation.get(sp.section_type, {})
+                if not isinstance(alloc, dict):
+                    alloc = {}
+                # Prefer explicit target_refs, fall back to share_pct
+                direct_target = alloc.get("target_refs")
+                if direct_target is not None:
+                    t = max(2, int(direct_target))
+                else:
+                    pct = float(alloc.get("share_pct", 0))
+                    t = max(2, int(total_target * pct / 100.0))
+                targets[sp.section_type] = t
+                allocated += t
+            remainder = total_target - allocated
+            for sp in body_sections:
+                if sp.section_type not in targets or targets[sp.section_type] <= 2:
+                    bonus = max(0, remainder // max(1, len(body_sections)))
+                    targets[sp.section_type] = targets.get(sp.section_type, 2) + bonus
+        else:
+            # Proportional distribution by paragraph count
+            total_paras = sum(len(sp.paragraphs) for sp in body_sections) or 1
+            for sp in body_sections:
+                n_paras = max(1, len(sp.paragraphs))
+                share = n_paras / total_paras
+                targets[sp.section_type] = max(2, int(total_target * share))
+
+        return targets
+
     def _rank_references_for_section(
         self,
         papers: List[Dict[str, Any]],
@@ -956,9 +1485,15 @@ class PlannerAgent(BaseAgent):
         planner_hint_refs: List[str],
         core_ref_keys: List[str],
         planner_budget: Optional[Dict[str, Any]] = None,
+        topdown_target: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Infer per-section citation budget, prioritizing planner-provided budget.
+
+        - **Args**:
+          - `topdown_target` (int | None): Target derived from the global
+            citation_strategy (top-down distribution).  Used as fallback
+            when planner_budget is absent.
         """
         candidate_keys = [p.get("ref_id", "") for p in candidate_refs if p.get("ref_id")]
         allowed_key_set = set(candidate_keys) | set(core_ref_keys)
@@ -976,21 +1511,22 @@ class PlannerAgent(BaseAgent):
 
         if budget_target is not None:
             target_refs = max(0, int(budget_target))
+        elif topdown_target is not None and topdown_target > 0:
+            target_refs = topdown_target
         else:
-            # Fallback only when planner omitted budget: no section-specific hardcoding.
+            # Last-resort fallback: paragraph count + evidence signals
             complexity_signal = max(1, paragraph_count)
             evidence_signal = len(planner_hint_refs) + max(0, len(high_quality) // 2)
-            target_refs = max(1, complexity_signal + evidence_signal)
+            target_refs = max(3, complexity_signal + evidence_signal)
 
         if budget_min is not None:
             min_refs = max(0, int(budget_min))
         else:
-            min_refs = max(1, min(target_refs, paragraph_count))
+            min_refs = max(1, min(target_refs, max(paragraph_count, 3)))
 
         if budget_max is not None:
             max_refs = max(int(budget_max), target_refs, min_refs)
         else:
-            # No fixed cap; upper bound is naturally candidate pool size.
             max_refs = max(target_refs, min_refs, candidate_count)
 
         must_use_refs: List[str] = []
@@ -1530,47 +2066,39 @@ class PlannerAgent(BaseAgent):
         except ValueError:
             narrative_style = NarrativeStyle.TECHNICAL
 
-        ratios = SECTION_RATIOS_BY_TYPE.get(
-            paper_type, SECTION_RATIOS_BY_TYPE[PaperType.EMPIRICAL],
-        )
-
         # Determine section ordering from LLM output
         llm_sections = plan_data.get("sections", [])
         section_map: Dict[str, Dict[str, Any]] = {}
         llm_section_order: List[str] = []
         for s in llm_sections:
-            st = s.get("section_type")
+            st = self._normalize_section_type_name(str(s.get("section_type", "")))
             if st and st not in section_map:
+                if st != s.get("section_type"):
+                    s = dict(s)
+                    s["section_type"] = st
                 section_map[st] = s
                 llm_section_order.append(st)
 
         if len(llm_section_order) >= 3 and "abstract" not in llm_section_order:
             llm_section_order.insert(0, "abstract")
-        if len(llm_section_order) >= 3 and "conclusion" not in llm_section_order:
-            llm_section_order.append("conclusion")
 
         use_llm_structure = len(llm_section_order) >= 3
         section_type_order = llm_section_order if use_llm_structure else list(DEFAULT_EMPIRICAL_SECTIONS)
 
-        # Distribute sentence budget across sections
-        total_sentences = total_words // WORDS_PER_SENTENCE
-        known_ratio_sum = sum(ratios.get(st, 0) for st in section_type_order if st in ratios)
-        unknown_sections = [st for st in section_type_order if st not in ratios]
-        remaining_ratio = max(0.0, 1.0 - known_ratio_sum)
-        per_unknown_ratio = (remaining_ratio / len(unknown_sections)) if unknown_sections else 0.0
+        target_paragraphs = estimate_target_paragraphs(total_words)
 
         sections: List[SectionPlan] = []
         for order, section_type in enumerate(section_type_order):
-            ratio = ratios.get(section_type, per_unknown_ratio)
-            section_sentences = max(3, int(total_sentences * ratio))
             llm_section = section_map.get(section_type, {})
 
             # Parse paragraphs from LLM output
             raw_paragraphs = llm_section.get("paragraphs", [])
             paragraphs = self._parse_paragraph_plans(raw_paragraphs)
             if not paragraphs:
+                n_sections = max(1, len(section_type_order))
+                default_sents = max(3, (total_words // WORDS_PER_SENTENCE) // n_sections)
                 paragraphs = self._generate_default_paragraphs(
-                    section_type, section_sentences, llm_section,
+                    section_type, default_sents, llm_section,
                 )
 
             # Parse figure/table placements
@@ -1615,9 +2143,43 @@ class PlannerAgent(BaseAgent):
                 sectioning_recommended=self._coerce_bool(
                     llm_section.get("sectioning_recommended", False),
                 ),
+                code_focus=self._normalize_code_focus(
+                    llm_section.get("code_focus", {}),
+                ),
                 writing_guidance=llm_section.get("writing_guidance", ""),
                 order=order,
             ))
+
+        # Whole-plan paragraph budget validation: if LLM planned far fewer
+        # paragraphs than the target, scale up body sections proportionally.
+        llm_total_paras = sum(len(sp.paragraphs) for sp in sections)
+        if llm_total_paras > 0 and llm_total_paras < target_paragraphs * 0.5:
+            scale = target_paragraphs / max(1, llm_total_paras)
+            for sp in sections:
+                if sp.section_type in ("abstract", "conclusion"):
+                    continue
+                section_target_sents = int(
+                    sum(p.approx_sentences for p in sp.paragraphs) * scale
+                )
+                sp.paragraphs = self._expand_paragraph_plan(
+                    sp.paragraphs, section_target_sents, sp.section_type,
+                )
+            expanded_total = sum(len(sp.paragraphs) for sp in sections)
+            logger.info(
+                "planner.plan_budget_expansion llm_paras=%d target=%d expanded=%d",
+                llm_total_paras, target_paragraphs, expanded_total,
+            )
+
+        # Parse top-level citation strategy
+        raw_strategy = plan_data.get("citation_strategy", {})
+        if isinstance(raw_strategy, dict):
+            citation_strategy = {
+                "total_target": int(raw_strategy.get("total_target", 0) or 0),
+                "rationale": str(raw_strategy.get("rationale", "")),
+                "section_allocation": raw_strategy.get("section_allocation", {}),
+            }
+        else:
+            citation_strategy = {}
 
         paper_plan = PaperPlan(
             title=request.title,
@@ -1628,6 +2190,7 @@ class PlannerAgent(BaseAgent):
             terminology=plan_data.get("terminology", {}),
             structure_rationale=plan_data.get("structure_rationale", ""),
             abstract_focus=plan_data.get("abstract_focus", ""),
+            citation_strategy=citation_strategy,
         )
 
         # Assign any unassigned figures/tables to sections
@@ -1754,6 +2317,74 @@ class PlannerAgent(BaseAgent):
             )
             for kp, role, sents in structure
         ]
+
+    @staticmethod
+    def _expand_paragraph_plan(
+        existing: List[ParagraphPlan],
+        target_sentences: int,
+        section_type: str,
+    ) -> List[ParagraphPlan]:
+        """
+        Expand an under-planned paragraph list to meet the section sentence budget.
+
+        - **Description**:
+          - When the Planner LLM generates far fewer paragraphs/sentences than
+            the budget requires, this method proportionally scales up the plan.
+          - Strategy: first increase approx_sentences on existing paragraphs
+            (up to 8 each), then duplicate paragraphs with split sub-topics
+            to fill the remaining gap.
+
+        - **Args**:
+          - `existing` (List[ParagraphPlan]): LLM-provided paragraphs.
+          - `target_sentences` (int): Section sentence budget from word budget.
+          - `section_type` (str): Section type for context.
+
+        - **Returns**:
+          - `List[ParagraphPlan]`: Expanded paragraph list.
+        """
+        if not existing:
+            return existing
+
+        current_total = sum(p.approx_sentences for p in existing)
+        if current_total >= target_sentences * 0.7:
+            return existing
+
+        expanded = [
+            ParagraphPlan(
+                key_point=p.key_point,
+                supporting_points=list(p.supporting_points),
+                approx_sentences=p.approx_sentences,
+                role=p.role,
+                references_to_cite=list(p.references_to_cite),
+                figures_to_reference=list(p.figures_to_reference),
+                tables_to_reference=list(p.tables_to_reference),
+            )
+            for p in existing
+        ]
+
+        # Phase 1: Increase sentence counts on existing paragraphs (up to 8)
+        for para in expanded:
+            if sum(p.approx_sentences for p in expanded) >= target_sentences:
+                break
+            para.approx_sentences = min(8, para.approx_sentences + 3)
+
+        # Phase 2: If still under budget, add elaboration paragraphs
+        round_idx = 0
+        while sum(p.approx_sentences for p in expanded) < target_sentences * 0.75:
+            source = existing[round_idx % len(existing)]
+            elaboration = ParagraphPlan(
+                key_point=f"Further analysis of: {source.key_point}",
+                supporting_points=["Additional evidence", "Extended discussion"],
+                approx_sentences=min(6, max(3, (target_sentences - sum(p.approx_sentences for p in expanded)) // 3)),
+                role=source.role if source.role != "motivation" else "evidence",
+                references_to_cite=[],
+            )
+            expanded.append(elaboration)
+            round_idx += 1
+            if round_idx > len(existing) * 3:
+                break
+
+        return expanded
 
     def _build_figure_placements(
         self,
@@ -1966,15 +2597,14 @@ class PlannerAgent(BaseAgent):
         self, request: PlanRequest, total_words: int,
     ) -> PaperPlan:
         """Create a default plan when LLM fails."""
-        ratios = SECTION_RATIOS_BY_TYPE[PaperType.EMPIRICAL]
         total_sentences = total_words // WORDS_PER_SENTENCE
+        n_sections = len(DEFAULT_EMPIRICAL_SECTIONS)
+        per_section_sents = max(3, total_sentences // max(1, n_sections))
 
         sections = []
         for order, section_type in enumerate(DEFAULT_EMPIRICAL_SECTIONS):
-            ratio = ratios.get(section_type, 0.1)
-            section_sentences = max(3, int(total_sentences * ratio))
             paragraphs = self._generate_default_paragraphs(
-                section_type, section_sentences, {},
+                section_type, per_section_sents, {},
             )
             sections.append(SectionPlan(
                 section_type=section_type,

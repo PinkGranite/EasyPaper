@@ -111,6 +111,7 @@ class SectionPlan(BaseModel):
     topic_clusters: List[str] = Field(default_factory=list)
     transition_intents: List[str] = Field(default_factory=list)
     sectioning_recommended: bool = False
+    code_focus: Dict[str, Any] = Field(default_factory=dict)
     writing_guidance: str = ""
     order: int = 0
 
@@ -162,6 +163,7 @@ class PaperPlan(BaseModel):
     abstract_focus: str = ""
     wide_figures: List[str] = Field(default_factory=list)
     wide_tables: List[str] = Field(default_factory=list)
+    citation_strategy: Dict[str, Any] = Field(default_factory=dict)
 
     def get_section(self, section_type: str) -> Optional[SectionPlan]:
         """Get section plan by type."""
@@ -236,6 +238,8 @@ class PlanRequest(BaseModel):
     experiments: str
     references: List[str] = Field(default_factory=list)
     research_context: Optional[Dict[str, Any]] = None
+    code_context: Optional[Dict[str, Any]] = None
+    code_writing_assets: Optional[Dict[str, Any]] = None
     figures: List[FigureInfo] = Field(default_factory=list)
     tables: List[TableInfo] = Field(default_factory=list)
     target_pages: Optional[int] = None
@@ -263,49 +267,7 @@ DEFAULT_EMPIRICAL_SECTIONS = [
     "conclusion",
 ]
 
-SECTION_RATIOS_BY_TYPE = {
-    PaperType.EMPIRICAL: {
-        "abstract": 0.025,
-        "introduction": 0.12,
-        "related_work": 0.10,
-        "method": 0.22,
-        "experiment": 0.20,
-        "result": 0.20,
-        "conclusion": 0.035,
-    },
-    PaperType.THEORETICAL: {
-        "abstract": 0.025,
-        "introduction": 0.12,
-        "related_work": 0.08,
-        "method": 0.35,
-        "experiment": 0.10,
-        "result": 0.15,
-        "conclusion": 0.06,
-    },
-    PaperType.SURVEY: {
-        "abstract": 0.025,
-        "introduction": 0.10,
-        "related_work": 0.50,
-        "method": 0.05,
-        "experiment": 0.05,
-        "result": 0.10,
-        "conclusion": 0.08,
-    },
-}
-
-VENUE_WORD_LIMITS = {
-    "ICML": {"pages": 8, "words_per_page": 850},
-    "NEURIPS": {"pages": 8, "words_per_page": 700},
-    "NIPS": {"pages": 8, "words_per_page": 700},
-    "ICLR": {"pages": 8, "words_per_page": 750},
-    "ACL": {"pages": 8, "words_per_page": 750},
-    "EMNLP": {"pages": 8, "words_per_page": 750},
-    "AAAI": {"pages": 7, "words_per_page": 800},
-    "IJCAI": {"pages": 7, "words_per_page": 800},
-    "CVPR": {"pages": 8, "words_per_page": 800},
-    "ICCV": {"pages": 8, "words_per_page": 800},
-    "DEFAULT": {"pages": 8, "words_per_page": 750},
-}
+WORDS_PER_PAGE_DEFAULT = 600
 
 ELEMENT_PAGE_COST = {
     "figure*": 0.4,
@@ -314,37 +276,37 @@ ELEMENT_PAGE_COST = {
     "table": 0.15,
 }
 
+WORDS_PER_PARAGRAPH = 200
+
 
 def calculate_total_words(
     target_pages: Optional[int],
-    style_guide: Optional[str],
+    style_guide: Optional[str] = None,
     n_figures: int = 0,
     n_tables: int = 0,
     n_wide_figures: int = 0,
     n_wide_tables: int = 0,
 ) -> int:
     """
-    Calculate total word budget from pages, venue, and non-text elements.
+    Estimate total word budget from target pages and non-text element count.
+
     - **Description**:
-        - Estimates the page space consumed by figures and tables
-        - Subtracts that from total pages to get effective text pages
-        - Ensures at least 40% of pages are reserved for text
+      - Uses a single reasonable words-per-page estimate (~600) rather than
+        a large venue-specific lookup table, since the user's target_pages
+        is the authoritative length signal and the LLM + skills system
+        handle venue-specific style.
+      - Subtracts estimated page space consumed by figures/tables.
 
     - **Args**:
-        - `target_pages` (Optional[int]): Target page count
-        - `style_guide` (Optional[str]): Venue name
-        - `n_figures` (int): Total number of figures
-        - `n_tables` (int): Total number of tables
-        - `n_wide_figures` (int): Number of wide figures
-        - `n_wide_tables` (int): Number of wide tables
+      - `target_pages` (Optional[int]): User-specified target page count.
+      - `style_guide` (Optional[str]): Venue hint (unused for word calc,
+        kept for API compatibility).
+      - `n_figures` / `n_tables` / `n_wide_*`: Visual element counts.
 
     - **Returns**:
-        - `int`: Effective word budget for text content
+      - `int`: Effective word budget for text content.
     """
-    venue_key = (style_guide or "DEFAULT").upper().split()[0]
-    config = VENUE_WORD_LIMITS.get(venue_key, VENUE_WORD_LIMITS["DEFAULT"])
-    pages = target_pages or config["pages"]
-    words_per_page = config["words_per_page"]
+    pages = target_pages or 10
 
     n_narrow_figures = max(0, n_figures - n_wide_figures)
     n_narrow_tables = max(0, n_tables - n_wide_tables)
@@ -357,18 +319,15 @@ def calculate_total_words(
         + n_narrow_tables * ELEMENT_PAGE_COST["table"]
     )
     non_text_pages = figure_pages + table_pages
-
     text_pages = max(pages - non_text_pages, pages * 0.4)
-    return int(text_pages * words_per_page)
+    return int(text_pages * WORDS_PER_PAGE_DEFAULT)
 
 
 def estimate_target_paragraphs(total_words: int) -> int:
     """
     Estimate total paragraph count from word budget.
-    - **Args**:
-        - `total_words` (int): Word budget
 
     - **Returns**:
-        - `int`: Estimated paragraph count (avg ~100 words/paragraph)
+      - `int`: Estimated paragraph count (~200 words/paragraph for academic text).
     """
-    return max(1, total_words // 100)
+    return max(1, total_words // WORDS_PER_PARAGRAPH)

@@ -44,6 +44,20 @@ def _truncate_text(text: Optional[str], limit: int) -> str:
     return clipped + " ..."
 
 
+def _format_code_guidance_block(code_context: Optional[str]) -> str:
+    """
+    Build a structured code-guidance block for writer prompts.
+    """
+    if not code_context:
+        return ""
+    trimmed = _truncate_text(code_context, PROMPT_BUDGETS["code_context_chars"])
+    return (
+        "## Repository-Derived Writing Guidance\n"
+        "Use this as grounding evidence for implementation claims.\n\n"
+        f"{trimmed}"
+    )
+
+
 def _normalize_reference_entry(ref: Any) -> Optional[Dict[str, Any]]:
     """
     Normalize dict/object reference to a unified schema.
@@ -335,14 +349,6 @@ def _format_structure_quality_contract(section_type: str, section_plan: Any) -> 
     lines.append(
         "- Organize this section into clear thematic blocks with explicit transitions."
     )
-    lines.append("- Two valid implementations are acceptable:")
-    lines.append(
-        "  1) Explicit structure: use \\subsection{} / \\subsubsection{} where helpful."
-    )
-    lines.append(
-        "  2) Implicit structure: keep strong block boundaries and transition sentences."
-    )
-    lines.append("- Do NOT force subsection commands if they hurt readability; prioritize coherent flow.")
     lines.append(
         "- Every major claim cluster must map to at least one paragraph block."
     )
@@ -357,24 +363,29 @@ def _format_structure_quality_contract(section_type: str, section_plan: Any) -> 
         for intent in transition_intents[:3]:
             lines.append(f"  - {intent}")
 
-    if sectioning_recommended or paragraph_count >= 5:
-        lines.append(
-            "- This section is structurally dense; ensure block boundaries are unmistakable."
-        )
     if sectioning_recommended:
         lines.append(
-            "- For this section, explicit `\\subsection{}` headings are strongly recommended."
+            "- This section is structurally dense; explicit `\\subsection{}` headings are recommended."
         )
         lines.append(
-            "- Reviewer expects either explicit subsection headings OR unmistakable implicit blocks with clear transition language."
+            "- Ensure block boundaries are unmistakable with clear transition language."
         )
     else:
         lines.append(
-            "- For this section, prefer implicit thematic blocks; avoid explicit `\\subsection{}` unless absolutely necessary."
+            "- **DO NOT use `\\subsection{}` commands in this section.**"
         )
         lines.append(
-            "- If explicit subsection headings are used, keep them minimal and justified by major topic shifts."
+            "- Use continuous prose with strong paragraph-level transitions instead."
         )
+        lines.append(
+            "- Organize content through thematic paragraph blocks, topic sentences, "
+            "and transition phrases — not through explicit heading commands."
+        )
+        if section_type in {"introduction", "discussion"}:
+            lines.append(
+                "- Introduction and Discussion sections in top venues use flowing "
+                "narrative prose without subsection headings. This is mandatory."
+            )
 
     if section_type in {"abstract", "conclusion"}:
         lines.append(
@@ -813,7 +824,7 @@ The Introduction is the LEADER section that:
             prompt += f"\n### Available Tables\n" + "\n".join(tables_info)
 
     if code_context:
-        prompt += f"\n\n{_truncate_text(code_context, PROMPT_BUDGETS['code_context_chars'])}"
+        prompt += f"\n\n{_format_code_guidance_block(code_context)}"
 
     if research_context:
         prompt += f"\n\n{_truncate_text(research_context, PROMPT_BUDGETS['research_context_chars'])}"
@@ -840,6 +851,7 @@ The Introduction is the LEADER section that:
 ## Subsection Policy
 - Unless the plan explicitly recommends sectioning for Introduction, prefer implicit structure.
 - Do NOT add multiple \\subsection{} blocks by default.
+- Do NOT create a single placeholder subsection mirroring the parent title (e.g., \\subsection{Introduction}).
 
 ## Important
 At the end, clearly state the contributions using:
@@ -910,7 +922,7 @@ def compile_body_section_prompt(
         )
 
     if code_context:
-        prompt += f"\n{_truncate_text(code_context, PROMPT_BUDGETS['code_context_chars'])}\n"
+        prompt += f"\n{_format_code_guidance_block(code_context)}\n"
 
     if research_context:
         prompt += f"\n{_truncate_text(research_context, PROMPT_BUDGETS['research_context_chars'])}\n"
@@ -1074,6 +1086,8 @@ def compile_body_section_prompt(
 ## Subsection Policy
 - Use explicit \\subsection{} headings only when section-level structure signals recommend it or when block separation would otherwise be unclear.
 - Avoid boilerplate subsection proliferation in every section.
+- If only one subsection would be created, do not use subsection; keep a clean paragraph-only structure.
+- Never use a subsection title identical to the parent section title.
 """
 
     return prompt

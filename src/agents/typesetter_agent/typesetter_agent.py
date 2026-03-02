@@ -770,6 +770,7 @@ class TypesetterAgent(BaseAgent):
         section_order: Optional[List[str]] = None,
         section_titles: Optional[Dict[str, str]] = None,
         citation_style: str = "cite",
+        use_appendices_env: bool = False,
     ) -> Dict[str, str]:
         """
         Write each section to an independent .tex file under work_dir/sections/.
@@ -779,6 +780,9 @@ class TypesetterAgent(BaseAgent):
             - Body sections get a \\section{Title} command prepended
             - Abstract does not get a \\section{} command
             - Applies citation style conversion to each section
+            - When use_appendices_env is True, wraps appendix in
+              \\begin{appendices}...\\end{appendices} (required by templates
+              that load the `appendix` package, e.g. Springer Nature).
 
         - **Args**:
             - `work_dir` (str): The LaTeX compilation working directory
@@ -786,6 +790,7 @@ class TypesetterAgent(BaseAgent):
             - `section_order` (List[str], optional): Order of body sections
             - `section_titles` (Dict[str, str], optional): section_type -> display title
             - `citation_style` (str): Citation command style to apply
+            - `use_appendices_env` (bool): Use \\begin{appendices} environment format
 
         - **Returns**:
             - `section_file_map` (Dict[str, str]): section_type -> relative path from work_dir
@@ -816,9 +821,15 @@ class TypesetterAgent(BaseAgent):
 
             title = titles.get(section_type, section_type.replace("_", " ").title())
 
-            # Appendix sections get \appendix prefix instead of plain \section
             if section_type == "appendix":
-                file_content = f"\\appendix\n\\section{{{title}}}\n\n{content}\n"
+                if use_appendices_env:
+                    file_content = (
+                        f"\\begin{{appendices}}\n"
+                        f"\\section{{{title}}}\\label{{secA1}}\n\n{content}\n"
+                        f"\\end{{appendices}}\n"
+                    )
+                else:
+                    file_content = f"\\appendix\n\\section{{{title}}}\n\n{content}\n"
             else:
                 file_content = f"\\section{{{title}}}\n\n{content}\n"
 
@@ -843,9 +854,15 @@ class TypesetterAgent(BaseAgent):
 
             title = titles.get(section_type, section_type.replace("_", " ").title())
 
-            # Appendix sections get \appendix prefix
             if section_type == "appendix":
-                file_content = f"\\appendix\n\\section{{{title}}}\n\n{content}\n"
+                if use_appendices_env:
+                    file_content = (
+                        f"\\begin{{appendices}}\n"
+                        f"\\section{{{title}}}\\label{{secA1}}\n\n{content}\n"
+                        f"\\end{{appendices}}\n"
+                    )
+                else:
+                    file_content = f"\\appendix\n\\section{{{title}}}\n\n{content}\n"
             else:
                 file_content = f"\\section{{{title}}}\n\n{content}\n"
 
@@ -1428,6 +1445,19 @@ class TypesetterAgent(BaseAgent):
                     id_to_rel_path=id_to_rel_path,
                 )
             
+            # Detect whether the template uses the appendix package's
+            # \begin{appendices} environment (e.g. Springer Nature templates).
+            _use_appendices_env = False
+            if main_tex_path and os.path.exists(main_tex_path):
+                with open(main_tex_path, "r", encoding="utf-8", errors="ignore") as _tf:
+                    _tpl_src = _tf.read()
+                _use_appendices_env = bool(
+                    re.search(r'\\usepackage(?:\[.*?\])?\{appendix\}', _tpl_src)
+                    or r'\begin{appendices}' in _tpl_src
+                )
+                if _use_appendices_env:
+                    logger.info("typesetter.appendix_format detected=appendices_env")
+
             # Write individual section files
             section_file_map = self._write_section_files(
                 work_dir=work_dir,
@@ -1435,6 +1465,7 @@ class TypesetterAgent(BaseAgent):
                 section_order=section_order,
                 section_titles=section_titles,
                 citation_style=template_config.citation_style,
+                use_appendices_env=_use_appendices_env,
             )
             
             # Build \input{} commands for body sections

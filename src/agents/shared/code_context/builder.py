@@ -1,5 +1,5 @@
 """
-Code repository ingestion and section-aware context builder.
+Code repository ingestion and writing-driven context builder.
 """
 
 from __future__ import annotations
@@ -19,6 +19,8 @@ from ...metadata_agent.models import CodeRepositorySpec
 
 DEFAULT_INCLUDE_GLOBS = [
     "**/*.py",
+    "**/*.ipynb",
+    "**/*.jl",
     "**/*.c",
     "**/*.cc",
     "**/*.cpp",
@@ -30,6 +32,8 @@ DEFAULT_INCLUDE_GLOBS = [
     "**/*.yml",
     "**/*.json",
     "**/*.toml",
+    "**/*.r",
+    "**/*.R",
 ]
 
 DEFAULT_EXCLUDE_GLOBS = [
@@ -46,22 +50,24 @@ DEFAULT_EXCLUDE_GLOBS = [
 
 METHOD_KEYWORDS = (
     "model", "algorithm", "architecture", "module", "class ", "def ",
-    "forward", "inference", "encode", "decode", "optimizer",
+    "forward", "inference", "encode", "decode", "optimizer", "pipeline",
 )
 EXPERIMENT_KEYWORDS = (
     "train", "eval", "experiment", "ablation", "metric", "dataset",
-    "benchmark", "config", "seed", "reproduce", "hyperparameter",
+    "benchmark", "config", "seed", "reproduce", "hyperparameter", "validation",
 )
 RESULT_KEYWORDS = (
     "result", "analysis", "plot", "table", "figure", "report",
-    "compare", "improvement", "error", "accuracy",
+    "compare", "improvement", "error", "accuracy", "f1", "auc",
 )
+CONFIG_HINTS = ("config", "yaml", "yml", "json", "toml", "args", "setting")
+SCRIPT_HINTS = ("train", "eval", "run", "experiment", "benchmark", "test")
 
 
 @dataclass
 class FileSummary:
     """
-    Summarized file record used for section evidence retrieval.
+    Summarized file record used for writing-oriented evidence retrieval.
     """
     path: str
     extension: str
@@ -73,23 +79,20 @@ class FileSummary:
     method_score: int
     experiment_score: int
     result_score: int
+    role_tags: List[str]
+    evidence_strength: int
 
 
 def _score_by_keywords(text: str, keywords: Tuple[str, ...]) -> int:
-    """
-    Score relevance by simple keyword hit counting.
-    """
     return sum(text.count(k) for k in keywords)
 
 
 def _extract_symbols(text: str, ext: str, max_items: int = 12) -> List[str]:
-    """
-    Extract rough symbol names from code/doc text.
-    """
     symbols: List[str] = []
-    if ext in {".py"}:
+    if ext in {".py", ".r"}:
         symbols.extend(re.findall(r"^\s*def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", text, flags=re.M))
         symbols.extend(re.findall(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\s*[\(:]", text, flags=re.M))
+        symbols.extend(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*<-\s*function\s*\(", text, flags=re.M))
     elif ext in {".c", ".cc", ".cpp", ".h", ".hpp"}:
         symbols.extend(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\([^;{}]*\)\s*\{", text))
     elif ext in {".md", ".markdown"}:
@@ -97,10 +100,42 @@ def _extract_symbols(text: str, ext: str, max_items: int = 12) -> List[str]:
     return symbols[:max_items]
 
 
-def _build_summary(path: str, symbols: List[str], text: str) -> str:
+def _infer_role_tags(path: str, lower_text: str, ext: str) -> List[str]:
+    text = f"{path.lower()} {lower_text[:2000]}"
+    tags: List[str] = []
+    if any(h in text for h in CONFIG_HINTS) or ext in {".yaml", ".yml", ".json", ".toml"}:
+        tags.append("config")
+    if any(h in text for h in SCRIPT_HINTS):
+        tags.append("experiment_script")
+    if "metric" in text or "accuracy" in text or "f1" in text or "auc" in text:
+        tags.append("metric_logic")
+    if "dataset" in text or "dataloader" in text or "preprocess" in text:
+        tags.append("data_pipeline")
+    if "model" in text or "forward" in text or "architecture" in text:
+        tags.append("core_method")
+    if "result" in text or "analysis" in text or "plot" in text:
+        tags.append("result_analysis")
+    if "limitation" in text or "todo" in text or "warning" in text:
+        tags.append("risk_signal")
+    base_name = os.path.basename(path).lower()
+    if base_name in {"readme.md", "readme.markdown", "readme"}:
+        tags.append("project_overview")
+    return list(dict.fromkeys(tags))
+
+
+def _readme_priority_boost(path: str) -> int:
     """
-    Build a concise, deterministic per-file summary.
+    Give README-like files a strong ranking boost for writing context.
     """
+    name = os.path.basename(path).lower()
+    if name in {"readme.md", "readme.markdown", "readme"}:
+        return 12
+    if "readme" in name:
+        return 6
+    return 0
+
+
+def _build_summary(path: str, symbols: List[str], text: str, role_tags: List[str]) -> str:
     first_non_empty = ""
     for line in text.splitlines():
         stripped = line.strip()
@@ -109,15 +144,14 @@ def _build_summary(path: str, symbols: List[str], text: str) -> str:
             break
     if symbols:
         return f"{path}: defines/contains {', '.join(symbols[:4])}"
+    if role_tags:
+        return f"{path}: likely {'/'.join(role_tags[:2])} implementation surface"
     if first_non_empty:
         return f"{path}: {first_non_empty[:120]}"
     return f"{path}: content available"
 
 
 def _safe_read_text(path: Path, max_bytes: int = 256_000) -> Optional[str]:
-    """
-    Read text safely and skip likely-binary content.
-    """
     try:
         raw = path.read_bytes()
     except Exception:
@@ -129,14 +163,7 @@ def _safe_read_text(path: Path, max_bytes: int = 256_000) -> Optional[str]:
     return raw.decode("utf-8", errors="ignore")
 
 
-def _apply_glob_filters(
-    rel_path: str,
-    include_globs: List[str],
-    exclude_globs: List[str],
-) -> bool:
-    """
-    Return True if path should be included.
-    """
+def _apply_glob_filters(rel_path: str, include_globs: List[str], exclude_globs: List[str]) -> bool:
     normalized = rel_path.replace("\\", "/")
     if include_globs and not any(fnmatch.fnmatch(normalized, g) for g in include_globs):
         return False
@@ -146,29 +173,40 @@ def _apply_glob_filters(
 
 
 def _pick_top(files: List[FileSummary], attr: str, top_k: int = 8) -> List[FileSummary]:
-    """
-    Select top files by section score with stable fallback.
-    """
-    ranked = sorted(files, key=lambda x: (getattr(x, attr), x.size), reverse=True)
+    ranked = sorted(files, key=lambda x: (getattr(x, attr), x.evidence_strength, x.size), reverse=True)
     return [f for f in ranked if getattr(f, attr) > 0][:top_k]
+
+
+def _evidence_confidence(score: int) -> float:
+    return round(min(0.95, 0.45 + 0.06 * max(score, 1)), 2)
+
+
+def _section_alias(section_type: str) -> str:
+    mapping = {
+        "method": "method",
+        "methods": "method",
+        "experiment": "experiment",
+        "experiments": "experiment",
+        "result": "result",
+        "results": "result",
+        "introduction": "introduction",
+        "related_work": "introduction",
+        "discussion": "discussion",
+        "conclusion": "discussion",
+        "abstract": "introduction",
+    }
+    return mapping.get(section_type, "method")
 
 
 class CodeContextBuilder:
     """
-    Build section-aware writing context from an optional code repository.
+    Build writing-oriented context assets from an optional code repository.
     """
 
     def __init__(self, workspace_root: Optional[str] = None):
         self.workspace_root = Path(workspace_root or os.getcwd())
 
-    async def build(
-        self,
-        code_repo: CodeRepositorySpec,
-        paper_title: str = "",
-    ) -> Dict[str, Any]:
-        """
-        Build context packs and lightweight index from repository contents.
-        """
+    async def build(self, code_repo: CodeRepositorySpec, paper_title: str = "") -> Dict[str, Any]:
         source_path, cleanup_dir = self._resolve_source(code_repo)
         try:
             scoped_path = source_path
@@ -193,8 +231,12 @@ class CodeContextBuilder:
             method_files = _pick_top(files, "method_score")
             experiment_files = _pick_top(files, "experiment_score")
             result_files = _pick_top(files, "result_score")
+            evidence_graph = self._build_code_evidence_graph(files)
+            writing_assets = self._build_writing_assets(method_files, experiment_files, result_files)
+            section_asset_packs = self._build_section_asset_packs(evidence_graph, writing_assets)
+            claim_support_candidates = self._build_claim_support_candidates(evidence_graph)
 
-            context = {
+            return {
                 "repository_info": {
                     "type": code_repo.type.value,
                     "source": str(scoped_path),
@@ -203,9 +245,15 @@ class CodeContextBuilder:
                 },
                 "scan_stats": stats,
                 "repo_overview": [f.summary for f in files[:16]],
+                # Legacy fields (kept for backward compatibility)
                 "method_pack": self._to_evidence_pack(method_files, "method"),
                 "experiment_pack": self._to_evidence_pack(experiment_files, "experiment"),
                 "result_pack": self._to_evidence_pack(result_files, "result"),
+                # New writing-driven fields
+                "code_evidence_graph": evidence_graph,
+                "writing_assets": writing_assets,
+                "section_asset_packs": section_asset_packs,
+                "claim_support_candidates": claim_support_candidates,
                 "index": [
                     {
                         "path": f.path,
@@ -213,11 +261,11 @@ class CodeContextBuilder:
                         "symbols": f.symbols,
                         "snippet": f.snippet,
                         "lower_text": f.lower_text,
+                        "role_tags": f.role_tags,
                     }
                     for f in files
                 ],
             }
-            return context
         finally:
             if cleanup_dir and cleanup_dir.exists():
                 shutil.rmtree(cleanup_dir, ignore_errors=True)
@@ -229,52 +277,73 @@ class CodeContextBuilder:
         query_bundle: List[str],
         top_k: int = 4,
     ) -> List[Dict[str, Any]]:
-        """
-        Retrieve additional evidence snippets by query for a section.
-        """
         if not context or not context.get("index"):
             return []
+        alias = _section_alias(section_type)
         queries = [q.strip().lower() for q in query_bundle if q and q.strip()]
-        if not queries:
-            return []
+        selected: List[Dict[str, Any]] = []
+        seen_paths = set()
+
+        section_pack = (context.get("section_asset_packs", {}) or {}).get(alias, {})
+        evidence_by_id = {
+            e.get("evidence_id", ""): e
+            for e in (context.get("code_evidence_graph", []) or [])
+            if e.get("evidence_id")
+        }
+        for ev_id in section_pack.get("evidence_ids", [])[:top_k]:
+            ev = evidence_by_id.get(ev_id)
+            if not ev:
+                continue
+            path = ev.get("path", "")
+            if not path or path in seen_paths:
+                continue
+            selected.append(
+                {
+                    "evidence_id": ev_id,
+                    "path": path,
+                    "symbol": ", ".join((ev.get("symbols") or [])[:3]),
+                    "snippet": ev.get("snippet", ""),
+                    "why_relevant": ev.get("purpose", f"Supports {alias} writing"),
+                    "confidence": ev.get("confidence", 0.7),
+                }
+            )
+            seen_paths.add(path)
 
         ranked: List[Tuple[int, Dict[str, Any]]] = []
         for item in context["index"]:
+            path = item.get("path", "")
+            if path in seen_paths:
+                continue
             text = f"{item.get('summary', '')}\n{item.get('lower_text', '')}"
             score = 0
             for q in queries:
                 score += text.count(q)
-            if section_type == "method":
-                score += text.count("method")
-                score += text.count("algorithm")
-            elif section_type == "experiment":
-                score += text.count("experiment")
-                score += text.count("dataset")
-                score += text.count("metric")
-            elif section_type == "result":
-                score += text.count("result")
-                score += text.count("analysis")
+            if alias == "method":
+                score += text.count("method") + text.count("algorithm")
+            elif alias == "experiment":
+                score += text.count("experiment") + text.count("dataset") + text.count("metric")
+            elif alias == "result":
+                score += text.count("result") + text.count("analysis")
             if score > 0:
                 ranked.append((score, item))
 
         ranked.sort(key=lambda x: x[0], reverse=True)
-        output: List[Dict[str, Any]] = []
-        for score, item in ranked[:top_k]:
-            output.append(
+        for score, item in ranked:
+            if len(selected) >= top_k:
+                break
+            selected.append(
                 {
                     "path": item.get("path", ""),
                     "symbol": ", ".join(item.get("symbols", [])[:3]),
                     "snippet": item.get("snippet", ""),
-                    "why_relevant": f"Matched runtime query bundle for {section_type} (score={score})",
-                    "confidence": round(min(0.95, 0.5 + 0.08 * score), 2),
+                    "why_relevant": f"Matched runtime writing query for {alias} (score={score})",
+                    "confidence": _evidence_confidence(score),
                 }
             )
-        return output
+
+        return selected
 
     def _resolve_source(self, code_repo: CodeRepositorySpec) -> Tuple[Path, Optional[Path]]:
-        """
-        Resolve repository source and optional temporary cleanup path.
-        """
         if code_repo.type.value == "local_dir":
             source = Path(code_repo.path or "").expanduser()
             if not source.is_absolute():
@@ -302,9 +371,6 @@ class CodeContextBuilder:
         max_files: int,
         max_total_bytes: int,
     ) -> Tuple[List[FileSummary], Dict[str, Any]]:
-        """
-        Scan and summarize matching files under resource limits.
-        """
         files: List[FileSummary] = []
         total_bytes = 0
         skipped_binary = 0
@@ -318,22 +384,30 @@ class CodeContextBuilder:
             rel_path = path.relative_to(root).as_posix()
             if not _apply_glob_filters(rel_path, include_globs, exclude_globs):
                 continue
-
             size = path.stat().st_size
             if len(files) >= max_files or total_bytes + size > max_total_bytes:
                 skipped_limits += 1
                 continue
-
             text = _safe_read_text(path)
             if not text:
                 skipped_binary += 1
                 continue
-
             ext = path.suffix.lower()
             symbols = _extract_symbols(text, ext)
             snippet = "\n".join(text.splitlines()[:16])[:1200]
             lower_text = text.lower()
-            summary = _build_summary(rel_path, symbols, text)
+            role_tags = _infer_role_tags(rel_path, lower_text, ext)
+            method_score = _score_by_keywords(lower_text, METHOD_KEYWORDS)
+            experiment_score = _score_by_keywords(lower_text, EXPERIMENT_KEYWORDS)
+            result_score = _score_by_keywords(lower_text, RESULT_KEYWORDS)
+            evidence_strength = (
+                method_score
+                + experiment_score
+                + result_score
+                + len(role_tags)
+                + _readme_priority_boost(rel_path)
+            )
+            summary = _build_summary(rel_path, symbols, text, role_tags)
             files.append(
                 FileSummary(
                     path=rel_path,
@@ -343,40 +417,176 @@ class CodeContextBuilder:
                     summary=summary,
                     snippet=snippet,
                     lower_text=lower_text,
-                    method_score=_score_by_keywords(lower_text, METHOD_KEYWORDS),
-                    experiment_score=_score_by_keywords(lower_text, EXPERIMENT_KEYWORDS),
-                    result_score=_score_by_keywords(lower_text, RESULT_KEYWORDS),
+                    method_score=method_score,
+                    experiment_score=experiment_score,
+                    result_score=result_score,
+                    role_tags=role_tags,
+                    evidence_strength=evidence_strength,
                 )
             )
             total_bytes += size
 
-        files.sort(key=lambda x: x.size, reverse=True)
-        stats = {
+        files.sort(key=lambda x: (x.evidence_strength, x.size), reverse=True)
+        return files, {
             "scanned_files": scanned,
             "indexed_files": len(files),
             "indexed_total_bytes": total_bytes,
             "skipped_binary_or_unreadable": skipped_binary,
             "skipped_by_limits": skipped_limits,
         }
-        return files, stats
 
     def _to_evidence_pack(self, files: List[FileSummary], section_type: str) -> List[Dict[str, Any]]:
-        """
-        Convert file summaries to prompt-friendly evidence records.
-        """
         output: List[Dict[str, Any]] = []
-        for f in files:
-            top_symbols = ", ".join(f.symbols[:3]) if f.symbols else ""
+        for idx, file_summary in enumerate(files, start=1):
             output.append(
                 {
-                    "path": f.path,
-                    "symbol": top_symbols,
-                    "snippet": f.snippet,
-                    "why_relevant": f"Likely supports {section_type} based on code/doc keyword coverage",
-                    "confidence": 0.7 if top_symbols else 0.6,
+                    "evidence_id": f"{section_type[:3].upper()}_{idx:03d}",
+                    "path": file_summary.path,
+                    "symbol": ", ".join(file_summary.symbols[:3]),
+                    "snippet": file_summary.snippet,
+                    "why_relevant": f"Likely supports {section_type} writing objectives",
+                    "confidence": _evidence_confidence(file_summary.evidence_strength),
                 }
             )
         return output
+
+    def _build_code_evidence_graph(self, files: List[FileSummary], max_nodes: int = 40) -> List[Dict[str, Any]]:
+        graph: List[Dict[str, Any]] = []
+        for idx, file_summary in enumerate(files[:max_nodes], start=1):
+            dominant = max(
+                [("method", file_summary.method_score), ("experiment", file_summary.experiment_score), ("result", file_summary.result_score)],
+                key=lambda x: x[1],
+            )[0]
+            graph.append(
+                {
+                    "evidence_id": f"EV{idx:03d}",
+                    "path": file_summary.path,
+                    "symbols": file_summary.symbols[:6],
+                    "role_tags": file_summary.role_tags,
+                    "dominant_role": dominant,
+                    "purpose": file_summary.summary,
+                    "snippet": file_summary.snippet[:800],
+                    "confidence": _evidence_confidence(file_summary.evidence_strength),
+                }
+            )
+        return graph
+
+    def _build_writing_assets(
+        self,
+        method_files: List[FileSummary],
+        experiment_files: List[FileSummary],
+        result_files: List[FileSummary],
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        def _asset_rows(files: List[FileSummary], prefix: str, max_items: int) -> List[Dict[str, Any]]:
+            rows: List[Dict[str, Any]] = []
+            for idx, file_summary in enumerate(files[:max_items], start=1):
+                rows.append(
+                    {
+                        "asset_id": f"{prefix}_{idx:02d}",
+                        "title": file_summary.summary,
+                        "details": f"Use {file_summary.path} as implementation evidence.",
+                        "paths": [file_summary.path],
+                        "symbols": file_summary.symbols[:4],
+                    }
+                )
+            return rows
+
+        limitations: List[Dict[str, Any]] = []
+        for file_summary in (method_files + experiment_files + result_files)[:8]:
+            if "risk_signal" in file_summary.role_tags:
+                limitations.append(
+                    {
+                        "asset_id": f"RISK_{len(limitations)+1:02d}",
+                        "title": f"Potential limitation in {file_summary.path}",
+                        "details": "Contains TODO/warning/limitation signals that should be discussed carefully.",
+                        "paths": [file_summary.path],
+                    }
+                )
+        return {
+            "method_pipeline": _asset_rows(method_files, "METHOD", 8),
+            "experiment_protocol": _asset_rows(experiment_files, "EXP", 8),
+            "result_readouts": _asset_rows(result_files, "RESULT", 8),
+            "risk_limitations": limitations[:5],
+        }
+
+    def _build_section_asset_packs(
+        self,
+        evidence_graph: List[Dict[str, Any]],
+        writing_assets: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, Dict[str, Any]]:
+        evidence_ids_by_role: Dict[str, List[str]] = {"method": [], "experiment": [], "result": []}
+        overview_ids: List[str] = []
+        for ev in evidence_graph:
+            role = ev.get("dominant_role", "method")
+            if role not in evidence_ids_by_role:
+                continue
+            evidence_ids_by_role[role].append(ev.get("evidence_id", ""))
+            role_tags = ev.get("role_tags", []) or []
+            if "project_overview" in role_tags and ev.get("evidence_id"):
+                overview_ids.append(ev.get("evidence_id", ""))
+
+        packs: Dict[str, Dict[str, Any]] = {
+            "introduction": {
+                "evidence_ids": overview_ids[:2] + evidence_ids_by_role["method"][:2] + evidence_ids_by_role["experiment"][:2],
+                "writing_assets": [a.get("title", "") for a in writing_assets.get("method_pipeline", [])[:2]],
+                "claim_guardrails": [
+                    "Only describe capabilities that are traceable to code evidence IDs.",
+                    "Do not claim benchmark superiority unless result evidence supports it.",
+                ],
+            },
+            "method": {
+                "evidence_ids": evidence_ids_by_role["method"][:8],
+                "writing_assets": [a.get("title", "") for a in writing_assets.get("method_pipeline", [])[:6]],
+                "claim_guardrails": [
+                    "Method claims must be grounded in implementation details from listed evidence.",
+                ],
+            },
+            "experiment": {
+                "evidence_ids": evidence_ids_by_role["experiment"][:8],
+                "writing_assets": [a.get("title", "") for a in writing_assets.get("experiment_protocol", [])[:6]],
+                "claim_guardrails": [
+                    "Experiment protocol claims must map to scripts/config-related evidence.",
+                ],
+            },
+            "result": {
+                "evidence_ids": evidence_ids_by_role["result"][:8],
+                "writing_assets": [a.get("title", "") for a in writing_assets.get("result_readouts", [])[:6]],
+                "claim_guardrails": [
+                    "Result interpretation must be tied to metric/result evidence.",
+                ],
+            },
+            "discussion": {
+                "evidence_ids": evidence_ids_by_role["result"][:4] + evidence_ids_by_role["experiment"][:2],
+                "writing_assets": [a.get("title", "") for a in writing_assets.get("risk_limitations", [])[:4]],
+                "claim_guardrails": [
+                    "Discuss limitations if risk signals exist; avoid unsupported causal language.",
+                ],
+            },
+        }
+        packs["related_work"] = packs["introduction"]
+        packs["conclusion"] = packs["discussion"]
+        packs["abstract"] = packs["introduction"]
+        return packs
+
+    def _build_claim_support_candidates(self, evidence_graph: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        for ev in evidence_graph[:18]:
+            role = ev.get("dominant_role", "method")
+            evidence_id = ev.get("evidence_id", "")
+            if role == "method":
+                claim = "Implementation details support the proposed method pipeline."
+            elif role == "experiment":
+                claim = "Experimental setup is reproducible via configuration and scripts."
+            else:
+                claim = "Reported outcomes are supported by in-repo metric/analysis logic."
+            candidates.append(
+                {
+                    "claim": claim,
+                    "support_evidence_ids": [evidence_id] if evidence_id else [],
+                    "reason": ev.get("purpose", ""),
+                }
+            )
+        return candidates
 
 
 def format_code_context_for_prompt(
@@ -385,62 +595,134 @@ def format_code_context_for_prompt(
     retrieved_evidence: Optional[List[Dict[str, Any]]] = None,
     top_k: int = 6,
 ) -> str:
-    """
-    Format section-scoped code context for writer prompts.
-    """
     if not context:
         return ""
+    alias = _section_alias(section_type)
+    packs = context.get("section_asset_packs", {}) or {}
+    pack = packs.get(alias, {})
+    graph = context.get("code_evidence_graph", []) or []
+    graph_lookup = {x.get("evidence_id", ""): x for x in graph if x.get("evidence_id")}
 
-    pack_key = f"{section_type}_pack"
-    if pack_key not in context:
-        # Map common section names to available packs.
-        if section_type in {"related_work", "introduction"}:
-            pack_key = "method_pack"
-        elif section_type == "experiment":
-            pack_key = "experiment_pack"
-        elif section_type == "result":
-            pack_key = "result_pack"
-        else:
-            pack_key = "method_pack"
+    chosen: List[Dict[str, Any]] = []
+    seen_paths = set()
+    for ev_id in pack.get("evidence_ids", [])[:top_k]:
+        ev = graph_lookup.get(ev_id)
+        if not ev:
+            continue
+        path = ev.get("path", "")
+        if not path or path in seen_paths:
+            continue
+        chosen.append(
+            {
+                "evidence_id": ev_id,
+                "path": path,
+                "symbol": ", ".join((ev.get("symbols") or [])[:3]),
+                "snippet": ev.get("snippet", ""),
+                "why_relevant": ev.get("purpose", ""),
+            }
+        )
+        seen_paths.add(path)
+    for ev in retrieved_evidence or []:
+        if len(chosen) >= top_k:
+            break
+        path = ev.get("path", "")
+        if not path or path in seen_paths:
+            continue
+        chosen.append(ev)
+        seen_paths.add(path)
 
-    pack = list(context.get(pack_key, []))[:top_k]
-    if retrieved_evidence:
-        pack.extend(retrieved_evidence[:max(0, top_k - len(pack))])
-
-    if not pack:
+    writing_assets = [str(x).strip() for x in (pack.get("writing_assets", []) or []) if str(x).strip()]
+    guardrails = [str(x).strip() for x in (pack.get("claim_guardrails", []) or []) if str(x).strip()]
+    if not chosen and not writing_assets:
         return ""
 
-    lines = [
-        "## Code Repository Context",
-        "Use the following repository-derived evidence where relevant.",
-    ]
-    for idx, ev in enumerate(pack, start=1):
-        lines.append(f"- Evidence {idx}: {ev.get('path', '')}")
+    lines: List[str] = ["## Code Evidence Map"]
+    if not chosen:
+        lines.append("- No high-confidence evidence selected for this section.")
+    for idx, ev in enumerate(chosen, start=1):
+        ev_id = ev.get("evidence_id", f"runtime_{idx}")
+        lines.append(f"- `{ev_id}` -> `{ev.get('path', '')}`")
         symbol = ev.get("symbol", "")
         if symbol:
             lines.append(f"  - Symbols: {symbol}")
         why = ev.get("why_relevant", "")
         if why:
-            lines.append(f"  - Relevance: {why}")
+            lines.append(f"  - Purpose: {why}")
         snippet = (ev.get("snippet", "") or "").strip()
         if snippet:
             lines.append("  - Snippet:")
             lines.append("```text")
-            lines.append(snippet[:800])
+            lines.append(snippet[:700])
             lines.append("```")
+
+    lines.append("")
+    lines.append("## Section Writing Assets")
+    if writing_assets:
+        for item in writing_assets[:6]:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- No dedicated writing assets extracted for this section.")
+
+    lines.append("")
+    lines.append("## Claim Guardrails")
+    if guardrails:
+        for item in guardrails[:4]:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- Keep claims aligned with evidence IDs listed above.")
+    return "\n".join(lines)
+
+
+def format_code_context_for_planner(
+    context: Optional[Dict[str, Any]],
+    style_guide: Optional[str] = None,
+    max_items_per_section: int = 3,
+) -> str:
+    if not context:
+        return ""
+    writing_assets = context.get("writing_assets", {}) or {}
+    section_packs = context.get("section_asset_packs", {}) or {}
+    graph = context.get("code_evidence_graph", []) or []
+    lines: List[str] = ["## Code Writing Assets Brief (for Planning)"]
+    if style_guide:
+        lines.append(f"- Target style/venue: {style_guide}")
+    lines.append(f"- Extracted evidence nodes: {len(graph)}")
+
+    for key, label in (
+        ("method_pipeline", "Method"),
+        ("experiment_protocol", "Experiment"),
+        ("result_readouts", "Result"),
+        ("risk_limitations", "Risk/Limitations"),
+    ):
+        items = writing_assets.get(key, []) or []
+        if not items:
+            continue
+        lines.append(f"- {label} assets:")
+        for item in items[:max_items_per_section]:
+            title = str(item.get("title", "")).strip()
+            if title:
+                lines.append(f"  - {title}")
+
+    for sec in ("introduction", "method", "experiment", "result", "discussion"):
+        pack = section_packs.get(sec, {})
+        evidence_ids = pack.get("evidence_ids", []) or []
+        if not evidence_ids:
+            continue
+        lines.append(f"- Section `{sec}` suggested evidence IDs: {', '.join(evidence_ids[:6])}")
+
     return "\n".join(lines)
 
 
 def render_code_repository_summary_markdown(context: Dict[str, Any]) -> str:
-    """
-    Render a concise markdown summary for output directory export.
-    """
     repo_info = context.get("repository_info", {})
     stats = context.get("scan_stats", {})
     overview = context.get("repo_overview", [])
     method_pack = context.get("method_pack", [])
     experiment_pack = context.get("experiment_pack", [])
     result_pack = context.get("result_pack", [])
+    writing_assets = context.get("writing_assets", {}) or {}
+    evidence_graph = context.get("code_evidence_graph", []) or []
+    claims = context.get("claim_support_candidates", []) or []
 
     lines = [
         "# Code Repository Summary",
@@ -468,6 +750,25 @@ def render_code_repository_summary_markdown(context: Dict[str, Any]) -> str:
     for item in overview[:12]:
         lines.append(f"- {item}")
 
+    lines.extend(
+        [
+            "",
+            "## Writing-Oriented Assets",
+            f"- Evidence graph nodes: {len(evidence_graph)}",
+            f"- Claim support candidates: {len(claims)}",
+        ]
+    )
+    for key, label in (
+        ("method_pipeline", "Method"),
+        ("experiment_protocol", "Experiment"),
+        ("result_readouts", "Result"),
+        ("risk_limitations", "Risk/Limitations"),
+    ):
+        rows = writing_assets.get(key, []) or []
+        lines.append(f"- {label} assets: {len(rows)}")
+        for row in rows[:4]:
+            lines.append(f"  - {row.get('title', '')}")
+
     def _add_pack(title: str, pack: List[Dict[str, Any]]) -> None:
         lines.append("")
         lines.append(f"## {title}")
@@ -492,10 +793,9 @@ def render_code_repository_summary_markdown(context: Dict[str, Any]) -> str:
         [
             "",
             "## Known Limitations",
-            "- Evidence ranking currently uses heuristic keyword scoring.",
+            "- Ranking remains heuristic and should be treated as guidance, not proof.",
             "- Extremely large repositories may be partially indexed due to configured limits.",
             "- Binary assets are ignored during text understanding.",
         ]
     )
-
     return "\n".join(lines).strip() + "\n"

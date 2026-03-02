@@ -72,6 +72,7 @@ from ..shared.session_memory import SessionMemory, ReviewRecord
 from ..shared.code_context import (
     CodeContextBuilder,
     format_code_context_for_prompt,
+    format_code_context_for_planner,
     render_code_repository_summary_markdown,
 )
 from ..reviewer_agent.models import (
@@ -1104,6 +1105,43 @@ class MetaDataAgent(ReActAgent):
         
         try:
             # =================================================================
+            # Phase 0e-pre: Code repository understanding (optional, pre-plan)
+            # =================================================================
+            if metadata.code_repository:
+                print("[MetaDataAgent] Phase 0e-pre: Building code repository context...")
+                try:
+                    code_context = await self._build_code_repository_context(metadata)
+                    if code_context:
+                        code_summary_markdown = render_code_repository_summary_markdown(code_context)
+                        stats = code_context.get("scan_stats", {})
+                        print(
+                            "[MetaDataAgent] Code context ready (pre-plan): "
+                            f"{stats.get('indexed_files', 0)} files indexed"
+                        )
+                except Exception as e:
+                    on_error = metadata.code_repository.on_error
+                    msg = f"Code repository ingestion failed: {e}"
+                    print(f"[MetaDataAgent] Warning: {msg}")
+                    if (
+                        metadata.code_repository.type.value == "local_dir"
+                        and isinstance(e, (FileNotFoundError, ValueError))
+                    ):
+                        return PaperGenerationResult(
+                            status="error",
+                            paper_title=metadata.title,
+                            errors=[msg],
+                        )
+                    if on_error == CodeRepoOnError.STRICT:
+                        return PaperGenerationResult(
+                            status="error",
+                            paper_title=metadata.title,
+                            errors=[msg],
+                        )
+                    errors.append(msg)
+                    code_context = None
+                    code_summary_markdown = None
+
+            # =================================================================
             # Phase 0: Planning (if enabled)
             # =================================================================
             if enable_planning:
@@ -1126,6 +1164,7 @@ class MetaDataAgent(ReActAgent):
                         "citation_budget_soft_cap": ps.citation_budget_soft_cap,
                         "citation_budget_export": ps.citation_budget_export,
                         "citation_budget_reserve_size": ps.citation_budget_reserve_size,
+                        "style_guide": metadata.style_guide,
                     }
 
                 rc_cfg = (
@@ -1194,6 +1233,7 @@ class MetaDataAgent(ReActAgent):
                     target_pages=target_pages,
                     style_guide=metadata.style_guide,
                     research_context=research_context_v1,
+                    code_context=code_context,
                 )
                 if paper_plan:
                     memory.plan = paper_plan
@@ -1297,7 +1337,7 @@ class MetaDataAgent(ReActAgent):
             # =================================================================
             # Phase 0e: Code repository understanding (optional)
             # =================================================================
-            if metadata.code_repository:
+            if metadata.code_repository and not code_context:
                 print("[MetaDataAgent] Phase 0e: Building code repository context...")
                 try:
                     code_context = await self._build_code_repository_context(metadata)
@@ -1510,25 +1550,29 @@ class MetaDataAgent(ReActAgent):
             else:
                 errors.append(f"Abstract generation failed: {abstract_result.error}")
             
-            # Generate Conclusion
-            conclusion_result = await self._generate_synthesis_section(
-                section_type="conclusion",
-                paper_title=metadata.title,
-                prior_sections=generated_sections,
-                contributions=contributions,
-                style_guide=metadata.style_guide,
-                section_plan=paper_plan.get_section("conclusion") if paper_plan else None,
-                prompt_traces=prompt_traces,
-                memory=memory,
+            # Generate Conclusion only when planner includes it in the final structure.
+            should_generate_conclusion = bool(
+                paper_plan and paper_plan.get_section("conclusion") is not None
             )
-            sections_results.append(conclusion_result)
-            if conclusion_result.status == "ok":
-                generated_sections["conclusion"] = conclusion_result.latex_content
-                memory.log("metadata", "phase3", "conclusion_generated",
-                           narrative=f"Writer completed the conclusion ({conclusion_result.word_count} words).",
-                           word_count=conclusion_result.word_count)
-            else:
-                errors.append(f"Conclusion generation failed: {conclusion_result.error}")
+            if should_generate_conclusion:
+                conclusion_result = await self._generate_synthesis_section(
+                    section_type="conclusion",
+                    paper_title=metadata.title,
+                    prior_sections=generated_sections,
+                    contributions=contributions,
+                    style_guide=metadata.style_guide,
+                    section_plan=paper_plan.get_section("conclusion") if paper_plan else None,
+                    prompt_traces=prompt_traces,
+                    memory=memory,
+                )
+                sections_results.append(conclusion_result)
+                if conclusion_result.status == "ok":
+                    generated_sections["conclusion"] = conclusion_result.latex_content
+                    memory.log("metadata", "phase3", "conclusion_generated",
+                               narrative=f"Writer completed the conclusion ({conclusion_result.word_count} words).",
+                               word_count=conclusion_result.word_count)
+                else:
+                    errors.append(f"Conclusion generation failed: {conclusion_result.error}")
             
             # =================================================================
             # Reference Usage Validation
@@ -1767,15 +1811,13 @@ class MetaDataAgent(ReActAgent):
                             }
                         )
                     budget_plan_path = citation_dir / "citation_budget_plan.json"
+                    plan_export = {
+                        "citation_strategy": paper_plan.citation_strategy if paper_plan else {},
+                        "sections": budget_plan_rows,
+                        "generated_at": datetime.now().isoformat(),
+                    }
                     budget_plan_path.write_text(
-                        json.dumps(
-                            {
-                                "sections": budget_plan_rows,
-                                "generated_at": datetime.now().isoformat(),
-                            },
-                            indent=2,
-                            ensure_ascii=False,
-                        ),
+                        json.dumps(plan_export, indent=2, ensure_ascii=False),
                         encoding="utf-8",
                     )
                     print(f"[MetaDataAgent] Citation budget plan saved to: {budget_plan_path}")
@@ -1918,6 +1960,59 @@ class MetaDataAgent(ReActAgent):
                     print(f"[MetaDataAgent] Discovered papers analysis saved to: {analysis_path}")
 
                 # Save code repository summary markdown (if generated)
+                if code_context:
+                    graph_path = code_dir / "code_evidence_graph.json"
+                    graph_path.write_text(
+                        json.dumps(
+                            {
+                                "code_evidence_graph": code_context.get("code_evidence_graph", []),
+                                "generated_at": datetime.now().isoformat(),
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    assets_path = code_dir / "writing_assets.json"
+                    assets_path.write_text(
+                        json.dumps(
+                            {
+                                "writing_assets": code_context.get("writing_assets", {}),
+                                "section_asset_packs": code_context.get("section_asset_packs", {}),
+                                "claim_support_candidates": code_context.get("claim_support_candidates", []),
+                                "generated_at": datetime.now().isoformat(),
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    if paper_plan:
+                        focus_rows: List[Dict[str, Any]] = []
+                        for sp in paper_plan.sections:
+                            if not getattr(sp, "code_focus", None):
+                                continue
+                            focus_rows.append(
+                                {
+                                    "section_type": sp.section_type,
+                                    "section_title": sp.section_title,
+                                    "code_focus": sp.code_focus,
+                                }
+                            )
+                        focus_path = code_dir / "section_code_focus_plan.json"
+                        focus_path.write_text(
+                            json.dumps(
+                                {
+                                    "sections": focus_rows,
+                                    "generated_at": datetime.now().isoformat(),
+                                },
+                                indent=2,
+                                ensure_ascii=False,
+                            ),
+                            encoding="utf-8",
+                        )
+                    print(f"[MetaDataAgent] Code analysis artifacts saved to: {code_dir}")
+
                 if code_summary_markdown:
                     crs_path = code_dir / "code_repository_summary.md"
                     crs_path.write_text(code_summary_markdown, encoding="utf-8")
@@ -3652,7 +3747,7 @@ class MetaDataAgent(ReActAgent):
     @staticmethod
     def _validate_main_tex_structure(main_tex_path: Path) -> List[str]:
         """
-        Validate that compiled main.tex contains non-empty title/abstract/conclusion.
+        Validate that compiled main.tex contains non-empty title/abstract.
         - **Returns**:
             - `List[str]`: Validation errors; empty list means pass.
         """
@@ -3680,15 +3775,6 @@ class MetaDataAgent(ReActAgent):
             abstract_text = abstract_env.group(1)
         if not abstract_text.strip():
             errors.append("missing_or_empty_abstract")
-
-        # Conclusion section content
-        conclusion_match = re.search(
-            r'\\section\*?\{Conclusion\}(.*?)(\\section\*?\{|\\bibliography\{|\\printbibliography|\\end\{document\})',
-            text,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-        if not conclusion_match or not conclusion_match.group(1).strip():
-            errors.append("missing_or_empty_conclusion")
 
         return errors
     
@@ -3753,6 +3839,7 @@ class MetaDataAgent(ReActAgent):
         target_pages: Optional[int],
         style_guide: Optional[str],
         research_context: Optional[Dict[str, Any]] = None,
+        code_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[PaperPlan]:
         """
         Create a paper plan by calling the Planner Agent
@@ -3791,6 +3878,10 @@ class MetaDataAgent(ReActAgent):
                 })
             
             from ..planner_agent.models import PlanRequest, FigureInfo, TableInfo
+            planner_code_brief = format_code_context_for_planner(
+                context=code_context,
+                style_guide=style_guide,
+            ) if code_context else ""
 
             plan_request = PlanRequest(
                 title=metadata.title,
@@ -3800,6 +3891,11 @@ class MetaDataAgent(ReActAgent):
                 experiments=metadata.experiments,
                 references=metadata.references,
                 research_context=research_context,
+                code_context=code_context,
+                code_writing_assets={
+                    **((code_context or {}).get("writing_assets", {}) or {}),
+                    "planner_brief": planner_code_brief,
+                } if code_context else None,
                 figures=[FigureInfo(**fi) for fi in figures_info],
                 tables=[TableInfo(**ti) for ti in tables_info],
                 target_pages=target_pages,
@@ -4449,6 +4545,8 @@ class MetaDataAgent(ReActAgent):
 
         section_recommendations = vlm_result.get("section_recommendations", {}) or {}
         for section_type, advice in section_recommendations.items():
+            if section_type == "appendix":
+                continue
             recommended_action = getattr(advice, "recommended_action", None) or advice.get("recommended_action")
             target_change = getattr(advice, "target_change", None) or advice.get("target_change")
             guidance = getattr(advice, "specific_guidance", None) or advice.get("specific_guidance")
@@ -4880,6 +4978,11 @@ class MetaDataAgent(ReActAgent):
         if generated_sections["appendix"]:
             appendix_parts.append(generated_sections["appendix"])
 
+        # Track labels already in appendix to prevent duplicates
+        existing_labels = set(re.findall(
+            r'\\label\{([^}]+)\}', generated_sections["appendix"],
+        ))
+
         for act in actions:
             if act.action_type not in ("move_figure", "move_table"):
                 continue
@@ -4890,6 +4993,10 @@ class MetaDataAgent(ReActAgent):
                 continue
 
             target_label = act.target_id  # e.g. "fig:arch"
+
+            if target_label in existing_labels:
+                print(f"  [Structural] Skipping {target_label} — already in appendix")
+                continue
 
             # Determine environment type
             if act.action_type == "move_figure":
@@ -4914,6 +5021,7 @@ class MetaDataAgent(ReActAgent):
                     content = content[:m.start()] + replacement + content[m.end():]
                     generated_sections[sec] = content
                     appendix_parts.append(block)
+                    existing_labels.add(target_label)
                     extracted = True
                     print(f"  [Structural] Moved {target_label} from {sec} to appendix")
                     break
@@ -4932,6 +5040,7 @@ class MetaDataAgent(ReActAgent):
                             content = content[:m.start()] + replacement + content[m.end():]
                             generated_sections[sec] = content
                             appendix_parts.append(block)
+                            existing_labels.add(target_label)
                             extracted = True
                             print(f"  [Structural] Moved {target_label} from {sec} to appendix (alt)")
                             break
@@ -5230,6 +5339,8 @@ class MetaDataAgent(ReActAgent):
                 "Escape special characters (&, %, $, #, _, {, }) in regular text."
             )
             for section_type in generated_sections:
+                if section_type == "appendix":
+                    continue
                 section_feedbacks.append(SectionFeedback(
                     section_type=section_type,
                     current_word_count=len(generated_sections.get(section_type, "").split()),
@@ -5238,7 +5349,7 @@ class MetaDataAgent(ReActAgent):
                     delta_words=0,
                     revision_prompt=all_fix_prompt,
                 ))
-            print(f"[Typesetter] Broadcast fix to all {len(generated_sections)} sections")
+            print(f"[Typesetter] Broadcast fix to all {len(generated_sections)} sections (excl. appendix)")
         
         return feedbacks, section_feedbacks
     

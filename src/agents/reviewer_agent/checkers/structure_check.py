@@ -64,6 +64,21 @@ class StructureChecker(FeedbackChecker):
             explicit_count = len(
                 re.findall(r"\\subsection\{.+?\}|\\subsubsection\{.+?\}", content or "")
             )
+            subsection_titles = re.findall(
+                r"\\subsection\{(.+?)\}|\\subsubsection\{(.+?)\}",
+                content or "",
+            )
+            normalized_titles = [
+                (a or b or "").strip().lower()
+                for a, b in subsection_titles
+                if (a or b or "").strip()
+            ]
+            parent_like_single = False
+            if explicit_count == 1 and normalized_titles:
+                parent_like_single = (
+                    normalized_titles[0] == section_type.strip().lower()
+                    or normalized_titles[0] in {f"{section_type.strip().lower()} section", "discussion", "introduction", "results", "methods"}
+                )
 
             transition_markers = 0
             for para in paragraphs[1:]:
@@ -76,7 +91,7 @@ class StructureChecker(FeedbackChecker):
 
             # Quality gate: either explicit sectioning, or sufficiently clear implicit blocks.
             implicit_ok = paragraph_count >= 4 and transition_markers >= 1
-            explicit_ok = explicit_count >= 1
+            explicit_ok = explicit_count >= 1 and not parent_like_single
             # When planner recommends sectioning, we still allow implicit structure,
             # but with a stronger transition requirement to keep quality consistent.
             if recommended:
@@ -91,6 +106,7 @@ class StructureChecker(FeedbackChecker):
                     "section_type": section_type,
                     "paragraph_count": paragraph_count,
                     "subsection_count": explicit_count,
+                    "single_subsection_placeholder": parent_like_single,
                     "transition_markers": transition_markers,
                     "recommended": recommended,
                 }
@@ -109,6 +125,11 @@ class StructureChecker(FeedbackChecker):
                             if recommended else
                             "Use either explicit \\subsection{} grouping or clear implicit thematic blocks "
                             "with transition sentences between blocks. "
+                        )
+                        + (
+                            "If you keep explicit sectioning, avoid a single placeholder subsection that repeats the section title. "
+                            if parent_like_single else
+                            ""
                         )
                     ),
                     "issue_type": "structure_quality",
