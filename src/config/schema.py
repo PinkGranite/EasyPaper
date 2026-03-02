@@ -25,6 +25,16 @@ class PaperSearchConfig(BaseModel):
     semantic_scholar_api_key: Optional[str] = None
     timeout: int = 10
     search_results_per_round: int = 5  # Number of papers to return per search round
+    planner_max_queries_per_section: int = 5
+    planner_inter_round_delay_sec: float = 1.5
+    planner_min_target_papers_per_section: int = 3
+    semantic_scholar_min_results_before_fallback: int = 3
+    enable_query_cache: bool = True
+    cache_ttl_hours: int = 24
+    citation_budget_enabled: bool = True
+    citation_budget_soft_cap: bool = True
+    citation_budget_export: bool = True
+    citation_budget_reserve_size: int = 4
 
 
 class ResearchContextConfig(BaseModel):
@@ -32,6 +42,10 @@ class ResearchContextConfig(BaseModel):
     enabled: bool = True  # Whether to generate Research Context
     detailed: bool = True  # Whether to use detailed mode
     top_k_key_papers: int = 10  # Number of key papers to include
+    research_context_first_enabled: bool = True
+    claim_evidence_enabled: bool = True
+    contribution_ranking_enabled: bool = True
+    export_planning_decision_trace: bool = False
 
 
 class ToolsConfig(BaseModel):
@@ -46,6 +60,10 @@ class ToolsConfig(BaseModel):
         ]
     )
     max_react_iterations: int = 3
+    planner_structure_signals_enabled: bool = True
+    writer_structure_contract_enabled: bool = True
+    review_structure_gate_enabled: bool = True
+    structure_gate_min_paragraph_threshold: int = 5
     paper_search: Optional[PaperSearchConfig] = None
     research_context: Optional[ResearchContextConfig] = None
 

@@ -41,6 +41,11 @@ CRITICAL RULES:
 6. Maintain formal academic writing style
 7. Be precise and evidence-based
 8. Structure content logically with appropriate subsections if needed
+8.1 If the user prompt includes a "Structure Quality Contract", treat it as mandatory.
+    You may use explicit subsection commands OR strong implicit thematic blocks.
+    Prioritize clarity and transitions over template-like formatting.
+8.2 Do not overuse subsection headings across all sections.
+    Prefer implicit structure unless section-level guidance explicitly recommends sectioning.
 9. CITATION CONSTRAINT: You MUST ONLY use citation keys that are explicitly provided in the resources/references list. 
    DO NOT invent, hallucinate, or use any citation keys that are not in the provided list.
    DO NOT use placeholder citations like \\cite{need_citation} or similar.
@@ -85,6 +90,8 @@ IMPORTANT:
 - Preserve existing valid citations and citation density unless the feedback explicitly requires removal.
 - If citations were flagged as invalid, REMOVE them entirely (don't replace with other citations)
 - NEVER use Markdown formatting — this is LaTeX. Use \\textbf{}, \\textit{}, \\subsection{}, \\begin{itemize}, etc.
+- Preserve or improve structural clarity: thematic block boundaries, transitions, and subsection quality.
+- If the original request contains a Structure Quality Contract, revision MUST continue to satisfy it.
 
 REVISION STRATEGIES BY ISSUE TYPE:
 
@@ -108,6 +115,12 @@ REVISION STRATEGIES BY ISSUE TYPE:
    - Rewrite possessives on method names: "BERT's" → "the performance of BERT"
    - Break up stacked connective adverbs (Furthermore...Moreover...Additionally)
    - Move key results to sentence-final (stress) position
+
+4. STRUCTURE FIX (block clarity / subsection quality):
+   - Keep major thematic blocks distinguishable after edits
+   - Add or refine transition sentences between blocks when needed
+   - You may use \\subsection{} for explicit grouping, but do not force boilerplate headings
+   - Avoid collapsing multiple themes into one undifferentiated paragraph chain
 
 Return ONLY the revised LaTeX content."""
 
@@ -153,6 +166,8 @@ class WriterAgentState(TypedDict):
     # Shared memory + peer agents for AskTool (ReAct consultation)
     memory: Optional[Any]
     peers: Optional[Dict[str, Any]]
+    mode: Optional[str]
+    current_content: Optional[str]
 
 
 class WriterAgent(ReActAgent):
@@ -263,9 +278,47 @@ class WriterAgent(ReActAgent):
 
         system_prompt = state.get("system_prompt", "")
         user_prompt = state.get("user_prompt", "")
+        mode = (state.get("mode") or "draft").strip().lower()
         citation_format = state.get("citation_format", "cite")
         memory = state.get("memory")
         peers = state.get("peers") or {}
+        current_content = state.get("current_content", "") or ""
+        revision_plan = state.get("revision_plan") or {}
+
+        if mode == "revision":
+            messages = [
+                {"role": "system", "content": REVISION_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Original request:\n{user_prompt}"},
+                {"role": "assistant", "content": current_content},
+                {
+                    "role": "user",
+                    "content": (
+                        "Revise the section according to the instruction and constraints.\n"
+                        f"Structured revision plan:\n{revision_plan}"
+                    ),
+                },
+            ]
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.35,
+                    max_tokens=4000,
+                )
+                revised_content = response.choices[0].message.content or ""
+                revised_content = self._clean_latex_output(revised_content)
+                return {
+                    "generated_content": revised_content,
+                    "llm_calls": state.get("llm_calls", 0) + 1,
+                    "iteration": 1,
+                }
+            except Exception as e:
+                print(f"[WriterAgent] Error generating revision content: {e}")
+                return {
+                    "generated_content": current_content,
+                    "llm_calls": state.get("llm_calls", 0) + 1,
+                    "iteration": 1,
+                }
 
         full_system = f"{WRITER_SYSTEM_BASE}\n\n{system_prompt}"
 
@@ -686,6 +739,8 @@ class WriterAgent(ReActAgent):
         enable_review: bool = True,
         memory: Optional[Any] = None,
         peers: Optional[Dict[str, Any]] = None,
+        mode: str = "draft",
+        current_content: Optional[str] = None,
     ):
         """
         Run the Writer Agent with iterative review and ReAct consultation.
@@ -733,6 +788,8 @@ class WriterAgent(ReActAgent):
             "memory": memory,
             "peers": peers,
             "paragraph_units": [],
+            "mode": mode,
+            "current_content": current_content,
         }
 
         return await self.agent.ainvoke(initial_state)

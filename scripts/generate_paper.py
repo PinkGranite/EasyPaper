@@ -37,7 +37,7 @@ DEFAULT_API_URL = "http://localhost:8000"
 
 
 def load_metadata_from_file(filepath: str) -> dict:
-    """Load PaperMetaData from JSON file"""
+    """Load PaperMetaData from JSON file."""
     with open(filepath, encoding="utf-8") as f:
         return json.load(f)
 
@@ -298,6 +298,9 @@ Examples:
     print(f"Data: {metadata.get('data', '')[:100]}...")
     print(f"Experiments: {metadata.get('experiments', '')[:100]}...")
     print(f"References: {len(metadata.get('references', []))} entries")
+    if metadata.get("code_repository"):
+        repo_type = metadata.get("code_repository", {}).get("type", "unknown")
+        print(f"Code Repository: enabled ({repo_type})")
     if metadata.get('template_path'):
         print(f"Template: {metadata.get('template_path')}")
     if metadata.get('style_guide'):

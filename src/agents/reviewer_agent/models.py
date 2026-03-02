@@ -35,6 +35,7 @@ class IssueType(str, Enum):
     STYLE_NOISE = "style_noise"
     LATEX_FORMAT = "latex_format"
     LAYOUT_CONSTRAINT = "layout_constraint"
+    STRUCTURE_QUALITY = "structure_quality"
     OTHER = "other"
 
 

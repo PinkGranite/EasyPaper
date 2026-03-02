@@ -5,7 +5,7 @@ MetaData Agent Models
     - PaperMetaData: User's simplified input (5 strings + references)
     - PaperGenerationResult: Complete generation result
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List, Dict, Any
 from enum import Enum
 
@@ -14,6 +14,66 @@ class OutputFormat(str, Enum):
     """Output format options"""
     LATEX = "latex"
     PDF = "pdf"
+
+
+class CodeRepositoryType(str, Enum):
+    """Code repository source type."""
+    LOCAL_DIR = "local_dir"
+    GIT_REPO = "git_repo"
+
+
+class CodeRepoOnError(str, Enum):
+    """Error behavior when code repository ingestion fails."""
+    FALLBACK = "fallback"
+    STRICT = "strict"
+
+
+class CodeRepositorySpec(BaseModel):
+    """
+    Code repository input specification.
+    - **Description**:
+        - Defines where to load project code/docs from for writing support.
+        - Supports local directory or remote git repository.
+
+    - **Args**:
+        - `type` (CodeRepositoryType): Source type (`local_dir` or `git_repo`)
+        - `path` (str, optional): Local directory path (required for `local_dir`)
+        - `url` (str, optional): Git URL (required for `git_repo`)
+        - `ref` (str, optional): Git branch/tag/commit (default: "main")
+        - `subdir` (str, optional): Sub-directory inside repository to scope scanning
+        - `include_globs` (List[str], optional): Include patterns
+        - `exclude_globs` (List[str], optional): Exclude patterns
+        - `max_files` (int): Maximum files to ingest
+        - `max_total_bytes` (int): Maximum total bytes to ingest
+        - `on_error` (CodeRepoOnError): Error policy (`fallback` or `strict`)
+    """
+    type: CodeRepositoryType
+    path: Optional[str] = None
+    url: Optional[str] = None
+    ref: Optional[str] = "main"
+    subdir: Optional[str] = None
+    include_globs: List[str] = Field(default_factory=list)
+    exclude_globs: List[str] = Field(default_factory=list)
+    max_files: int = 5000
+    max_total_bytes: int = 200_000_000
+    on_error: CodeRepoOnError = CodeRepoOnError.FALLBACK
+
+    @model_validator(mode="after")
+    def validate_source_fields(self) -> "CodeRepositorySpec":
+        """
+        Validate source-specific required fields.
+        - **Description**:
+            - Ensures `path` is provided for local source.
+            - Ensures `url` is provided for git source.
+
+        - **Returns**:
+            - `CodeRepositorySpec`: Validated spec
+        """
+        if self.type == CodeRepositoryType.LOCAL_DIR and not self.path:
+            raise ValueError("code_repository.path is required when type='local_dir'")
+        if self.type == CodeRepositoryType.GIT_REPO and not self.url:
+            raise ValueError("code_repository.url is required when type='git_repo'")
+        return self
 
 
 class FigureSpec(BaseModel):
@@ -105,6 +165,8 @@ class PaperMetaData(BaseModel):
         - `target_pages` (int, optional): Target page count (uses venue default if not set)
         - `figures` (List[FigureSpec], optional): Figure specifications
         - `tables` (List[TableSpec], optional): Table specifications
+        - `code_repository` (CodeRepositorySpec, optional): External project code/docs source
+        - `export_prompt_traces` (bool): Whether to export prompt/evidence traces
     """
     title: str = "Untitled Paper"
     idea_hypothesis: str
@@ -119,6 +181,8 @@ class PaperMetaData(BaseModel):
     # Figures and tables (optional)
     figures: List[FigureSpec] = Field(default_factory=list)  # Optional figures
     tables: List[TableSpec] = Field(default_factory=list)    # Optional tables
+    code_repository: Optional[CodeRepositorySpec] = None
+    export_prompt_traces: bool = False
 
 
 class PaperGenerationRequest(BaseModel):
@@ -143,6 +207,8 @@ class PaperGenerationRequest(BaseModel):
         - `output_dir` (str, optional): Directory for output files
         - `enable_review` (bool): Whether to enable review loop
         - `max_review_iterations` (int): Maximum review iterations
+        - `code_repository` (CodeRepositorySpec, optional): External project code/docs source
+        - `export_prompt_traces` (bool): Whether to export prompt/evidence traces
     """
     # Metadata fields (can pass directly)
     title: str = "Untitled Paper"
@@ -155,6 +221,8 @@ class PaperGenerationRequest(BaseModel):
     # Figures and tables (optional)
     figures: List[FigureSpec] = Field(default_factory=list)
     tables: List[TableSpec] = Field(default_factory=list)
+    code_repository: Optional[CodeRepositorySpec] = None
+    export_prompt_traces: bool = False
     
     # Template and style
     template_path: Optional[str] = None      # Path to .zip template file
@@ -193,6 +261,8 @@ class PaperGenerationRequest(BaseModel):
             target_pages=self.target_pages,
             figures=self.figures,
             tables=self.tables,
+            code_repository=self.code_repository,
+            export_prompt_traces=self.export_prompt_traces,
         )
 
 

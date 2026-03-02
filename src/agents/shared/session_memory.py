@@ -919,11 +919,15 @@ class SessionMemory:
             - `output_dir` (Path): Paper output directory
         """
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        path = output_dir / "review_history.json"
+        reviews_dir = output_dir / "logs" / "review"
+        reviews_dir.mkdir(parents=True, exist_ok=True)
+        path = reviews_dir / "review_history.json"
         iterations: list = [record.to_iteration_export() for record in self.review_history]
         payload = {"iterations": iterations}
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        # Backward compatibility: keep legacy flat path for downstream tools.
+        legacy_path = output_dir / "review_history.json"
+        legacy_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         logger.info("session_memory.persisted_reviews path=%s iterations=%d", path, len(iterations))
 
     def persist_readable_reviews(self, output_dir: Path) -> None:
@@ -934,10 +938,14 @@ class SessionMemory:
             - `output_dir` (Path): Paper output directory
         """
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        path = output_dir / "review_history_readable.json"
+        reviews_dir = output_dir / "logs" / "review"
+        reviews_dir.mkdir(parents=True, exist_ok=True)
+        path = reviews_dir / "review_history_readable.json"
         payload = self._build_readable_review_payload()
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        # Backward compatibility: keep legacy flat path for downstream tools.
+        legacy_path = output_dir / "review_history_readable.json"
+        legacy_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         logger.info(
             "session_memory.persisted_readable_reviews path=%s iterations=%d",
             path,
@@ -946,14 +954,15 @@ class SessionMemory:
 
     def persist_logs(self, output_dir: Path) -> None:
         """
-        Save agent logs to output_dir/agent_logs.json.
+        Save agent logs to output_dir/logs/agent/agent_logs.json.
 
         - **Args**:
             - `output_dir` (Path): Paper output directory
         """
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        path = output_dir / "agent_logs.json"
+        logs_dir = output_dir / "logs" / "agent"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        path = logs_dir / "agent_logs.json"
         data = [e.model_dump() for e in self.agent_logs]
         path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         logger.info("session_memory.persisted_logs path=%s count=%d", path, len(data))

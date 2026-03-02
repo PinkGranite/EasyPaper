@@ -8,6 +8,7 @@ Planner Agent
 import json
 import logging
 import re
+import random
 from typing import List, Dict, Any, Optional
 
 from fastapi import APIRouter
@@ -94,6 +95,15 @@ Output a JSON object with this structure:
             ],
             "tables": [],
             "content_sources": ["idea_hypothesis", "method"],
+            "citation_budget": {
+                "min_refs": 6,
+                "target_refs": 10,
+                "max_refs": 14,
+                "rationale": "Why this section needs this citation depth"
+            },
+            "topic_clusters": ["Theme A", "Theme B"],
+            "transition_intents": ["Move from context to gap", "Bridge method to evidence"],
+            "sectioning_recommended": true,
             "writing_guidance": "Specific guidance"
         }
     ]
@@ -104,6 +114,12 @@ IMPORTANT:
 - Sections with figures/tables need FEWER text paragraphs (visuals take space)
 - "abstract" typically needs 1-2 paragraphs; "conclusion" needs 2-3 paragraphs
 - Assign each figure/table to exactly ONE section for definition
+- Decide citation budgets per section based on section goals, evidence needs,
+  and venue rigor. Do not use a global fixed number.
+- Add soft structure signals for each body section:
+  - topic_clusters: 1-4 thematic blocks
+  - transition_intents: 1-3 intended transitions across blocks
+  - sectioning_recommended: whether explicit sub-structure may improve readability
 - Be specific and actionable"""
 
 
@@ -122,6 +138,9 @@ PLANNING_USER_PROMPT_TEMPLATE = """Create a detailed paragraph-level paper plan 
 
 **Experiments**:
 {experiments}
+
+**Research Context (use this to decide emphasis, trade-offs, and style)**:
+{research_context_summary}
 
 **Available References** (BibTeX keys):
 {reference_keys}
@@ -143,6 +162,8 @@ Plan each section with specific paragraphs. Each paragraph should have:
 - Approximate sentence count (3-8)
 - A role (motivation, problem_statement, definition, evidence, comparison, transition, summary)
 - Which references to cite
+- Also provide soft structure signals (topic_clusters, transition_intents,
+  sectioning_recommended) for Writer and Reviewer coordination.
 
 Output valid JSON only."""
 
@@ -334,6 +355,128 @@ class PlannerAgent(BaseAgent):
     # Core planning
     # =====================================================================
 
+    def _format_research_context_for_planning(
+        self,
+        research_context: Optional[Dict[str, Any]],
+    ) -> str:
+        """
+        Format compact research context for planning input.
+        """
+        if not research_context:
+            return "Not available."
+
+        lines: List[str] = []
+        area = str(research_context.get("research_area", "")).strip()
+        summary = str(research_context.get("summary", "")).strip()
+        if area:
+            lines.append(f"- Research area: {area}")
+        if summary:
+            lines.append(f"- Landscape summary: {summary}")
+
+        trends = research_context.get("research_trends", []) or []
+        if trends:
+            lines.append("- Key trends:")
+            for t in trends[:3]:
+                lines.append(f"  - {t}")
+
+        gaps = research_context.get("gaps", []) or []
+        if gaps:
+            lines.append("- Key gaps/opportunities:")
+            for g in gaps[:3]:
+                lines.append(f"  - {g}")
+
+        ranking = research_context.get("contribution_ranking", {}) or {}
+        if ranking:
+            lines.append("- Contribution ranking hints:")
+            for band in ("P0", "P1", "P2"):
+                items = ranking.get(band, []) or []
+                if not items:
+                    continue
+                top_text = ", ".join(
+                    [str(x.get("contribution", "")).strip() for x in items[:3] if isinstance(x, dict)]
+                )
+                if top_text:
+                    lines.append(f"  - {band}: {top_text}")
+
+        return "\n".join(lines) if lines else "Not available."
+
+    @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        """
+        Strip common markdown code fences from model outputs.
+        """
+        raw = (text or "").strip()
+        if raw.startswith("```"):
+            raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
+        if raw.endswith("```"):
+            raw = raw[:-3]
+        return raw.strip()
+
+    @staticmethod
+    def _extract_balanced_json_block(text: str, start_char: str) -> Optional[str]:
+        """
+        Extract first balanced JSON object/array block from text.
+        """
+        end_char = "}" if start_char == "{" else "]"
+        start_idx = text.find(start_char)
+        if start_idx < 0:
+            return None
+
+        depth = 0
+        in_string = False
+        escaped = False
+        for i in range(start_idx, len(text)):
+            ch = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == "\"":
+                    in_string = False
+                continue
+
+            if ch == "\"":
+                in_string = True
+                continue
+            if ch == start_char:
+                depth += 1
+            elif ch == end_char:
+                depth -= 1
+                if depth == 0:
+                    return text[start_idx:i + 1]
+        return None
+
+    @classmethod
+    def _safe_load_json(
+        cls,
+        raw: str,
+        expected: Optional[type] = None,
+    ) -> Optional[Any]:
+        """
+        Parse JSON robustly from model outputs with optional type check.
+        """
+        cleaned = cls._strip_code_fence(raw)
+        candidates: List[str] = [cleaned]
+        obj_block = cls._extract_balanced_json_block(cleaned, "{")
+        arr_block = cls._extract_balanced_json_block(cleaned, "[")
+        if obj_block:
+            candidates.append(obj_block)
+        if arr_block:
+            candidates.append(arr_block)
+
+        for cand in candidates:
+            if not cand:
+                continue
+            try:
+                parsed = json.loads(cand)
+                if expected is not None and not isinstance(parsed, expected):
+                    continue
+                return parsed
+            except Exception:
+                continue
+        return None
+
     async def create_plan(self, request: PlanRequest) -> PaperPlan:
         """
         Create a paper plan from metadata.
@@ -383,6 +526,9 @@ class PlannerAgent(BaseAgent):
             method=request.method[:2000],
             data=request.data[:1500],
             experiments=request.experiments[:2000],
+            research_context_summary=self._format_research_context_for_planning(
+                request.research_context
+            ),
             reference_keys=", ".join(reference_keys) if reference_keys else "None provided",
             figure_info=figure_info,
             table_info=table_info,
@@ -432,6 +578,90 @@ class PlannerAgent(BaseAgent):
             self._last_plan = fallback
             return fallback
 
+    async def discover_seed_references(
+        self,
+        title: str,
+        idea_hypothesis: str,
+        method: str,
+        data: str,
+        experiments: str,
+        existing_ref_keys: List[str],
+        paper_search_config: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Discover global references before section-level planning.
+        """
+        import asyncio
+        from ..shared.tools.paper_search import PaperSearchTool
+
+        cfg = paper_search_config or {}
+        tool = PaperSearchTool(
+            serpapi_api_key=cfg.get("serpapi_api_key"),
+            semantic_scholar_api_key=cfg.get("semantic_scholar_api_key"),
+            timeout=cfg.get("timeout", 10),
+            semantic_scholar_min_results_before_fallback=cfg.get(
+                "semantic_scholar_min_results_before_fallback", 3
+            ),
+            enable_query_cache=cfg.get("enable_query_cache", True),
+            cache_ttl_hours=cfg.get("cache_ttl_hours", 24),
+        )
+
+        max_queries = max(3, min(6, int(cfg.get("planner_max_queries_per_section", 5))))
+        per_round = max(3, int(cfg.get("search_results_per_round", 5)))
+        delay_sec = max(0.5, float(cfg.get("planner_inter_round_delay_sec", 1.5)))
+
+        seeds = [
+            title,
+            f"{title} {idea_hypothesis[:160]}",
+            f"{title} {method[:180]}",
+            f"{title} {data[:160]}",
+            f"{title} {experiments[:180]}",
+            f"{method[:120]} {experiments[:120]}",
+        ]
+        queries: List[str] = []
+        seen_q = set()
+        for q in seeds:
+            qq = " ".join(str(q).split()).strip()
+            if len(qq) < 8 or qq in seen_q:
+                continue
+            seen_q.add(qq)
+            queries.append(qq)
+            if len(queries) >= max_queries:
+                break
+
+        discovered: List[Dict[str, Any]] = []
+        seen_keys = set(existing_ref_keys)
+        for i, query in enumerate(queries):
+            if i > 0:
+                await asyncio.sleep(delay_sec)
+            try:
+                result = await tool.execute(query=query, max_results=per_round)
+                if not result.success:
+                    continue
+                papers = result.data.get("papers", []) if result.data else []
+                for paper in papers:
+                    bkey = paper.get("bibtex_key", "")
+                    bibtex = paper.get("bibtex", "")
+                    if bkey and bibtex and bkey not in seen_keys:
+                        seen_keys.add(bkey)
+                        discovered.append(
+                            {
+                                "ref_id": bkey,
+                                "bibtex": bibtex,
+                                "title": paper.get("title", ""),
+                                "year": paper.get("year"),
+                                "abstract": paper.get("abstract", ""),
+                                "venue": paper.get("venue", ""),
+                                "citation_count": paper.get("citation_count"),
+                                "source": paper.get("source", ""),
+                            }
+                        )
+            except Exception as e:
+                logger.warning("planner.seed_search_error query='%s': %s", query[:80], e)
+
+        logger.info("planner.seed_reference_discovery count=%d", len(discovered))
+        return discovered
+
     # =====================================================================
     # Reference discovery
     # =====================================================================
@@ -468,10 +698,18 @@ class PlannerAgent(BaseAgent):
             serpapi_api_key=cfg.get("serpapi_api_key"),
             semantic_scholar_api_key=cfg.get("semantic_scholar_api_key"),
             timeout=cfg.get("timeout", 10),
+            semantic_scholar_min_results_before_fallback=cfg.get(
+                "semantic_scholar_min_results_before_fallback", 3
+            ),
+            enable_query_cache=cfg.get("enable_query_cache", True),
+            cache_ttl_hours=cfg.get("cache_ttl_hours", 24),
         )
 
         # Read configuration for multi-round search
         results_per_round = cfg.get("search_results_per_round", 5)
+        max_queries_per_section = cfg.get("planner_max_queries_per_section", 5)
+        inter_round_delay = cfg.get("planner_inter_round_delay_sec", 1.5)
+        min_target_papers = cfg.get("planner_min_target_papers_per_section", 3)
 
         # Build search queries from plan — multiple per section for multi-round search
         section_queries: Dict[str, List[str]] = {}
@@ -489,12 +727,23 @@ class PlannerAgent(BaseAgent):
                 sp.section_type, key_points, existing_ref_keys, plan.title,
             )
 
-            # Store up to 5 queries per section for multi-round search
+            # Store up to N queries per section for multi-round search
             if queries:
-                section_queries[sp.section_type] = queries[:5]
-                # Target: at least 1 paper per paragraph, or minimum 3
-                n_paras = len(sp.paragraphs) if sp.paragraphs else 0
-                section_targets[sp.section_type] = max(n_paras, 3)
+                section_queries[sp.section_type] = queries[:max_queries_per_section]
+                # Target priority:
+                # 1) planner-provided section citation budget
+                # 2) fallback to paragraph-derived heuristic
+                planner_budget = sp.citation_budget if isinstance(sp.citation_budget, dict) else {}
+                planner_target = planner_budget.get("target_refs")
+                if planner_target is not None:
+                    try:
+                        section_targets[sp.section_type] = max(1, int(planner_target))
+                    except Exception:
+                        n_paras = len(sp.paragraphs) if sp.paragraphs else 0
+                        section_targets[sp.section_type] = max(n_paras, min_target_papers)
+                else:
+                    n_paras = len(sp.paragraphs) if sp.paragraphs else 0
+                    section_targets[sp.section_type] = max(n_paras, min_target_papers)
 
         discovered: Dict[str, List[Dict[str, Any]]] = {}
         seen_keys: set = set(existing_ref_keys)
@@ -504,12 +753,14 @@ class PlannerAgent(BaseAgent):
             target_count = section_targets.get(section_type, 3)
             round_num = 0
 
-            # Multi-round search: continue until target is reached or no more queries
-            while len(section_papers) < target_count and round_num < len(queries):
+            # Collect candidates from all planned rounds, then filter/select to target_count.
+            while round_num < len(queries):
                 query = queries[round_num]
 
                 if round_num > 0:
-                    await asyncio.sleep(1.5)  # Rate limiting between rounds
+                    # Rate limiting between rounds with small jitter to reduce burst contention
+                    jitter = random.uniform(0, 0.4)
+                    await asyncio.sleep(max(0.0, inter_round_delay + jitter))
 
                 try:
                     result = await tool.execute(query=query, max_results=results_per_round)
@@ -545,6 +796,7 @@ class PlannerAgent(BaseAgent):
 
             # Filter papers by relevance before storing
             if section_papers:
+                raw_count = len(section_papers)
                 # Get key points for this section from the plan
                 section_key_points = []
                 for sp in plan.sections:
@@ -559,12 +811,25 @@ class PlannerAgent(BaseAgent):
                     key_points=section_key_points,
                     paper_title=plan.title,
                 )
+                filtered_count = len(filtered_papers)
 
-                if filtered_papers:
-                    discovered[section_type] = filtered_papers
+                # Keep exactly N when possible: select top target_count by quality.
+                filtered_sorted = sorted(
+                    filtered_papers,
+                    key=lambda p: (
+                        float(p.get("relevance_score") or 0.0),
+                        int(p.get("citation_count") or 0),
+                        int(p.get("year") or 0),
+                    ),
+                    reverse=True,
+                )
+                selected_papers = filtered_sorted[:target_count] if target_count > 0 else filtered_sorted
+
+                if selected_papers:
+                    discovered[section_type] = selected_papers
                     logger.info(
-                        "planner.discovered_refs section=%s count=%d (filtered from %d)",
-                        section_type, len(filtered_papers), len(section_papers),
+                        "planner.discovered_refs section=%s target=%d raw=%d filtered=%d selected=%d",
+                        section_type, target_count, raw_count, filtered_count, len(selected_papers),
                     )
 
         total = sum(len(v) for v in discovered.values())
@@ -576,6 +841,7 @@ class PlannerAgent(BaseAgent):
         plan: "PaperPlan",
         discovered: Dict[str, List[Dict[str, Any]]],
         core_ref_keys: List[str],
+        paper_search_config: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Distribute references to sections, populating SectionPlan.assigned_refs.
@@ -593,22 +859,264 @@ class PlannerAgent(BaseAgent):
               discover_references().
             - `core_ref_keys` (List[str]): Citation keys of user-provided refs.
         """
+        cfg = paper_search_config or {}
+        budget_enabled = cfg.get("citation_budget_enabled", True)
+        soft_cap = cfg.get("citation_budget_soft_cap", True)
+        reserve_size = max(1, int(cfg.get("citation_budget_reserve_size", 4)))
+
         no_cite_sections = {"abstract", "conclusion"}
         for sp in plan.sections:
             if sp.section_type in no_cite_sections:
                 sp.assigned_refs = []
+                sp.budget_selected_refs = []
+                sp.budget_reserve_refs = []
+                sp.budget_must_use_refs = []
+                sp.citation_budget = {
+                    "enabled": budget_enabled,
+                    "min_refs": 0,
+                    "target_refs": 0,
+                    "max_refs": 0,
+                    "candidate_count": 0,
+                    "selected_count": 0,
+                    "soft_cap": soft_cap,
+                }
                 continue
-            refs: List[str] = list(core_ref_keys)
-            for paper in discovered.get(sp.section_type, []):
-                rid = paper.get("ref_id", "")
-                if rid and rid not in refs:
-                    refs.append(rid)
-            sp.assigned_refs = refs
+
+            discovered_for_section = discovered.get(sp.section_type, [])
+            discovered_ranked = self._rank_references_for_section(discovered_for_section)
+            planner_hint_refs = [r for r in sp.get_all_references() if r]
+            budget = self._infer_section_citation_budget(
+                section_type=sp.section_type,
+                paragraph_count=len(sp.paragraphs),
+                candidate_refs=discovered_ranked,
+                planner_hint_refs=planner_hint_refs,
+                core_ref_keys=core_ref_keys,
+                planner_budget=sp.citation_budget if isinstance(sp.citation_budget, dict) else {},
+            )
+
+            if not budget_enabled:
+                refs: List[str] = list(core_ref_keys)
+                for paper in discovered_ranked:
+                    rid = paper.get("ref_id", "")
+                    if rid and rid not in refs:
+                        refs.append(rid)
+                sp.assigned_refs = refs
+                sp.budget_selected_refs = refs
+                sp.budget_reserve_refs = []
+                sp.budget_must_use_refs = planner_hint_refs[:3]
+                budget["enabled"] = False
+                budget["selected_count"] = len(refs)
+                sp.citation_budget = budget
+                continue
+
+            selected_refs = list(budget.get("selected_refs", []))
+            reserve_refs = list(budget.get("reserve_refs", []))
+            must_use_refs = list(budget.get("must_use_refs", []))
+
+            if not selected_refs:
+                fallback = [k for k in planner_hint_refs if k in core_ref_keys]
+                selected_refs = fallback[: max(1, budget.get("target_refs", 1))]
+            sp.assigned_refs = selected_refs
+            sp.budget_selected_refs = selected_refs
+            sp.budget_reserve_refs = reserve_refs[:reserve_size]
+            sp.budget_must_use_refs = must_use_refs
+            budget["enabled"] = True
+            budget["selected_count"] = len(selected_refs)
+            budget["soft_cap"] = soft_cap
+            sp.citation_budget = budget
+
         assigned_counts = {
             sp.section_type: len(sp.assigned_refs)
             for sp in plan.sections if sp.assigned_refs
         }
         logger.info("planner.assign_references result=%s", assigned_counts)
+
+    def _rank_references_for_section(
+        self,
+        papers: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Rank section candidate papers by relevance, quality and recency.
+        """
+        return sorted(
+            papers,
+            key=lambda p: (
+                float(p.get("relevance_score") or 0.0),
+                int(p.get("citation_count") or 0),
+                int(p.get("year") or 0),
+            ),
+            reverse=True,
+        )
+
+    def _infer_section_citation_budget(
+        self,
+        section_type: str,
+        paragraph_count: int,
+        candidate_refs: List[Dict[str, Any]],
+        planner_hint_refs: List[str],
+        core_ref_keys: List[str],
+        planner_budget: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Infer per-section citation budget, prioritizing planner-provided budget.
+        """
+        candidate_keys = [p.get("ref_id", "") for p in candidate_refs if p.get("ref_id")]
+        allowed_key_set = set(candidate_keys) | set(core_ref_keys)
+        planner_hint_refs = [r for r in planner_hint_refs if r in allowed_key_set]
+        high_quality = [
+            p for p in candidate_refs
+            if float(p.get("relevance_score") or 0.0) >= 8.0
+            or int(p.get("citation_count") or 0) >= 80
+        ]
+        candidate_count = len(candidate_keys) + len(core_ref_keys)
+        normalized_budget = planner_budget or {}
+        budget_min = normalized_budget.get("min_refs")
+        budget_target = normalized_budget.get("target_refs")
+        budget_max = normalized_budget.get("max_refs")
+
+        if budget_target is not None:
+            target_refs = max(0, int(budget_target))
+        else:
+            # Fallback only when planner omitted budget: no section-specific hardcoding.
+            complexity_signal = max(1, paragraph_count)
+            evidence_signal = len(planner_hint_refs) + max(0, len(high_quality) // 2)
+            target_refs = max(1, complexity_signal + evidence_signal)
+
+        if budget_min is not None:
+            min_refs = max(0, int(budget_min))
+        else:
+            min_refs = max(1, min(target_refs, paragraph_count))
+
+        if budget_max is not None:
+            max_refs = max(int(budget_max), target_refs, min_refs)
+        else:
+            # No fixed cap; upper bound is naturally candidate pool size.
+            max_refs = max(target_refs, min_refs, candidate_count)
+
+        must_use_refs: List[str] = []
+        for rid in planner_hint_refs:
+            if rid and rid not in must_use_refs:
+                must_use_refs.append(rid)
+            if len(must_use_refs) >= 3:
+                break
+        for p in high_quality:
+            rid = p.get("ref_id", "")
+            if rid and rid in allowed_key_set and rid not in must_use_refs:
+                must_use_refs.append(rid)
+            if len(must_use_refs) >= 4:
+                break
+
+        selected_refs: List[str] = []
+        for rid in must_use_refs:
+            if rid and rid not in selected_refs:
+                selected_refs.append(rid)
+
+        for rid in candidate_keys:
+            if len(selected_refs) >= target_refs:
+                break
+            if rid and rid not in selected_refs:
+                selected_refs.append(rid)
+
+        for rid in core_ref_keys:
+            if len(selected_refs) >= min_refs:
+                break
+            if rid and rid not in selected_refs:
+                selected_refs.append(rid)
+
+        reserve_refs: List[str] = []
+        for rid in candidate_keys:
+            if rid and rid not in selected_refs and rid not in reserve_refs:
+                reserve_refs.append(rid)
+            if len(reserve_refs) >= 8:
+                break
+
+        return {
+            "section_type": section_type,
+            "min_refs": min_refs,
+            "target_refs": target_refs,
+            "max_refs": max_refs,
+            "candidate_count": candidate_count,
+            "must_use_refs": must_use_refs,
+            "selected_refs": selected_refs[:max_refs] if max_refs > 0 else selected_refs,
+            "reserve_refs": reserve_refs,
+            "planner_hint_refs": planner_hint_refs[:8],
+            "planner_budget_used": bool(budget_target is not None),
+        }
+
+    def _build_context_fallback_payload(
+        self,
+        *,
+        plan: "PaperPlan",
+        discovered: Dict[str, List[Dict[str, Any]]],
+        all_papers: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Build non-empty fallback research context when LLM JSON parsing fails.
+        """
+        paper_assignments = self._assign_papers_to_sections(plan, discovered)
+        claim_evidence_matrix: List[Dict[str, Any]] = []
+        for section_type, refs in paper_assignments.items():
+            if section_type in {"abstract", "conclusion"}:
+                continue
+            if not refs:
+                continue
+            claim_evidence_matrix.append(
+                {
+                    "section_type": section_type,
+                    "claim": f"Key findings and arguments in {section_type} should be supported by assigned evidence.",
+                    "support_refs": refs[:4],
+                    "reason": "Fallback mapping from section assignment after context parsing failure.",
+                    "priority": "P1",
+                }
+            )
+
+        contribs = list(plan.contributions or [])
+        p0 = contribs[:2]
+        p1 = contribs[2:4]
+        p2 = contribs[4:6]
+        contribution_ranking = {
+            "P0": [
+                {
+                    "contribution": c,
+                    "why_it_matters": "Core contribution from planner output.",
+                    "suggested_sections": ["introduction", "methods", "results"],
+                    "suggested_result_focus": "Highlight primary quantitative gains.",
+                }
+                for c in p0
+            ],
+            "P1": [
+                {
+                    "contribution": c,
+                    "why_it_matters": "Important but secondary contribution.",
+                    "suggested_sections": ["discussion", "results"],
+                    "suggested_result_focus": "Position as supporting evidence.",
+                }
+                for c in p1
+            ],
+            "P2": [
+                {
+                    "contribution": c,
+                    "why_it_matters": "Optional or auxiliary contribution.",
+                    "suggested_sections": ["discussion"],
+                    "suggested_result_focus": "Mention briefly if space allows.",
+                }
+                for c in p2
+            ],
+        }
+
+        return {
+            "research_area": "Research area analysis",
+            "summary": f"Found {len(all_papers)} relevant papers across {len(discovered)} sections.",
+            "key_papers": [],
+            "research_trends": [],
+            "gaps": [],
+            "claim_evidence_matrix": claim_evidence_matrix,
+            "contribution_ranking": contribution_ranking,
+            "planning_decision_trace": [
+                "Used heuristic fallback context because structured JSON parsing failed."
+            ],
+            "paper_assignments": paper_assignments,
+        }
 
     async def _generate_search_queries(
         self,
@@ -653,12 +1161,9 @@ class PlannerAgent(BaseAgent):
                 max_tokens=200,
             )
             raw = response.choices[0].message.content or ""
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            data = json.loads(raw.strip())
+            data = self._safe_load_json(raw, expected=dict)
+            if data is None:
+                raise ValueError("Could not parse JSON object from query generation output")
             queries = data.get("queries", [])
             return [q for q in queries if isinstance(q, str) and len(q.strip()) > 3]
         except Exception as e:
@@ -729,12 +1234,9 @@ class PlannerAgent(BaseAgent):
                 max_tokens=500,
             )
             raw = response.choices[0].message.content or ""
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            evaluations = json.loads(raw.strip())
+            evaluations = self._safe_load_json(raw, expected=list)
+            if evaluations is None:
+                raise ValueError("Could not parse JSON array from relevance output")
 
             # Build score lookup
             score_map: Dict[int, Dict[str, Any]] = {}
@@ -803,9 +1305,18 @@ class PlannerAgent(BaseAgent):
                 "paper_assignments": {},
             }
 
-        # Prepare paper information for LLM
+        # Prepare paper information for LLM (cap volume to reduce malformed/truncated outputs)
+        ranked_papers = sorted(
+            all_papers,
+            key=lambda p: (
+                int(p.get("citation_count") or 0),
+                int(p.get("year") or 0),
+            ),
+            reverse=True,
+        )
+        analysis_papers = ranked_papers[:24]
         paper_summaries = []
-        for p in all_papers:
+        for p in analysis_papers:
             paper_summaries.append({
                 "title": p.get("title", ""),
                 "year": p.get("year"),
@@ -825,10 +1336,18 @@ class PlannerAgent(BaseAgent):
             "3. key_papers: Top 5 most important papers with their contributions\n"
             "4. research_trends: 2-3 key research trends identified\n"
             "5. gaps: 2-3 research gaps or opportunities\n"
+            "6. claim_evidence_matrix: 6-10 records with {section_type, claim, support_refs, reason, priority}\n"
+            "7. contribution_ranking: object with keys P0/P1/P2, each item has "
+            "{contribution, why_it_matters, suggested_sections, suggested_result_focus}\n"
+            "8. planning_decision_trace: short list of explicit trade-off decisions\n"
             "Output ONLY JSON with this structure:\n"
             "{\"research_area\": \"...\", \"summary\": \"...\", "
             "\"key_papers\": [{\"title\": \"...\", \"contribution\": \"...\"}], "
-            "\"research_trends\": [\"...\"], \"gaps\": [\"...\"]}"
+            "\"research_trends\": [\"...\"], \"gaps\": [\"...\"], "
+            "\"claim_evidence_matrix\": [{\"section_type\": \"method\", \"claim\": \"...\", "
+            "\"support_refs\": [\"ref1\"], \"reason\": \"...\", \"priority\": \"P0\"}], "
+            "\"contribution_ranking\": {\"P0\": [], \"P1\": [], \"P2\": []}, "
+            "\"planning_decision_trace\": [\"...\"]}"
         )
 
         try:
@@ -839,19 +1358,58 @@ class PlannerAgent(BaseAgent):
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,
-                max_tokens=800,
+                max_tokens=1400,
             )
             raw = response.choices[0].message.content or ""
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-
-            context = json.loads(raw.strip())
+            context = self._safe_load_json(raw, expected=dict)
+            if context is None:
+                # Retry once with a dedicated JSON-repair pass to reduce fallback rate.
+                repair_prompt = (
+                    "Convert the following model output into a STRICT valid JSON object. "
+                    "Keep only these keys: research_area, summary, key_papers, research_trends, gaps, "
+                    "claim_evidence_matrix, contribution_ranking, planning_decision_trace.\n"
+                    "Rules:\n"
+                    "- Output ONLY JSON object, no markdown/code fences.\n"
+                    "- If a field is missing, fill with empty default.\n"
+                    "- contribution_ranking must be an object with keys P0/P1/P2 (arrays).\n"
+                    "- claim_evidence_matrix and planning_decision_trace must be arrays.\n\n"
+                    f"Raw output:\n{raw[:12000]}"
+                )
+                repair_resp = await self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are a strict JSON fixer. Return JSON object only.",
+                        },
+                        {"role": "user", "content": repair_prompt},
+                    ],
+                    temperature=0.0,
+                    max_tokens=1400,
+                )
+                repaired_raw = repair_resp.choices[0].message.content or ""
+                context = self._safe_load_json(repaired_raw, expected=dict)
+            if context is None:
+                raise ValueError("Could not parse JSON object from research context output")
 
             # Generate paper assignments
             paper_assignments = self._assign_papers_to_sections(plan, discovered)
+            fallback_context = self._build_context_fallback_payload(
+                plan=plan,
+                discovered=discovered,
+                all_papers=all_papers,
+            )
+
+            parsed_claim_matrix = context.get("claim_evidence_matrix", [])
+            parsed_ranking = context.get("contribution_ranking", {"P0": [], "P1": [], "P2": []})
+            ranking_empty = (
+                not isinstance(parsed_ranking, dict)
+                or (
+                    not parsed_ranking.get("P0")
+                    and not parsed_ranking.get("P1")
+                    and not parsed_ranking.get("P2")
+                )
+            )
 
             return {
                 "research_area": context.get("research_area", ""),
@@ -859,21 +1417,27 @@ class PlannerAgent(BaseAgent):
                 "key_papers": context.get("key_papers", [])[:10],
                 "research_trends": context.get("research_trends", []),
                 "gaps": context.get("gaps", []),
+                "claim_evidence_matrix": (
+                    parsed_claim_matrix
+                    if parsed_claim_matrix
+                    else fallback_context.get("claim_evidence_matrix", [])
+                ),
+                "contribution_ranking": (
+                    parsed_ranking
+                    if not ranking_empty
+                    else fallback_context.get("contribution_ranking", {"P0": [], "P1": [], "P2": []})
+                ),
+                "planning_decision_trace": context.get("planning_decision_trace", []),
                 "paper_assignments": paper_assignments,
             }
 
         except Exception as e:
             logger.warning("planner.context_generation_error: %s", e)
-            # Return basic context without LLM analysis
-            paper_assignments = self._assign_papers_to_sections(plan, discovered)
-            return {
-                "research_area": "Research area analysis",
-                "summary": f"Found {len(all_papers)} relevant papers across {len(discovered)} sections.",
-                "key_papers": [],
-                "research_trends": [],
-                "gaps": [],
-                "paper_assignments": paper_assignments,
-            }
+            return self._build_context_fallback_payload(
+                plan=plan,
+                discovered=discovered,
+                all_papers=all_papers,
+            )
 
     def _assign_papers_to_sections(
         self,
@@ -1039,6 +1603,18 @@ class PlannerAgent(BaseAgent):
                 depends_on=llm_section.get(
                     "depends_on", self._get_dependencies(section_type),
                 ),
+                citation_budget=llm_section.get("citation_budget", {}),
+                topic_clusters=self._normalize_string_list(
+                    llm_section.get("topic_clusters", []),
+                    max_items=4,
+                ),
+                transition_intents=self._normalize_string_list(
+                    llm_section.get("transition_intents", []),
+                    max_items=3,
+                ),
+                sectioning_recommended=self._coerce_bool(
+                    llm_section.get("sectioning_recommended", False),
+                ),
                 writing_guidance=llm_section.get("writing_guidance", ""),
                 order=order,
             ))
@@ -1077,6 +1653,38 @@ class PlannerAgent(BaseAgent):
                 tables_to_reference=raw.get("tables_to_reference", []),
             ))
         return paragraphs
+
+    @staticmethod
+    def _normalize_string_list(raw: Any, max_items: int = 5) -> List[str]:
+        """
+        Normalize mixed list/string into a clean bounded string list.
+        """
+        if isinstance(raw, str):
+            items = [x.strip() for x in raw.split(",") if x.strip()]
+        elif isinstance(raw, list):
+            items = [str(x).strip() for x in raw if str(x).strip()]
+        else:
+            items = []
+        # De-duplicate while preserving order
+        deduped: List[str] = []
+        for item in items:
+            if item not in deduped:
+                deduped.append(item)
+            if len(deduped) >= max_items:
+                break
+        return deduped
+
+    @staticmethod
+    def _coerce_bool(raw: Any) -> bool:
+        """
+        Coerce bool from permissive raw JSON value.
+        """
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, (int, float)):
+            return bool(raw)
+        text = str(raw).strip().lower()
+        return text in {"1", "true", "yes", "y", "recommended"}
 
     def _generate_default_paragraphs(
         self,
@@ -1401,19 +2009,11 @@ class PlannerAgent(BaseAgent):
 
     @staticmethod
     def _parse_plan_json(text: str) -> Dict[str, Any]:
-        if "```json" in text:
-            start = text.find("```json") + 7
-            end = text.find("```", start)
-            text = text[start:end].strip()
-        elif "```" in text:
-            start = text.find("```") + 3
-            end = text.find("```", start)
-            text = text[start:end].strip()
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
+        parsed = PlannerAgent._safe_load_json(text, expected=dict)
+        if parsed is None:
             logger.warning("planner.json_parse_error, using defaults")
             return {}
+        return parsed
 
     @staticmethod
     def _format_figure_info(

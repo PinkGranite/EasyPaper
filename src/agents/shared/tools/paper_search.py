@@ -10,6 +10,7 @@ import asyncio
 import re
 import time as _time
 import xml.etree.ElementTree as ET
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -31,7 +32,7 @@ class SemanticScholarClient:
     FIELDS = "paperId,title,authors,year,abstract,venue,citationCount,externalIds,publicationTypes,journal"
 
     # Maximum number of retries on 429 (rate limit)
-    MAX_RETRIES = 3
+    MAX_RETRIES = 6
     # Base wait time in seconds (exponential backoff: 2s, 4s, 8s)
     RETRY_BASE_WAIT = 2.0
 
@@ -50,6 +51,7 @@ class SemanticScholarClient:
         query: str,
         max_results: int = 5,
         year_range: Optional[str] = None,
+        retry_attempts: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         Search for papers on Semantic Scholar with retry on 429.
@@ -80,8 +82,10 @@ class SemanticScholarClient:
         if year_range:
             params["year"] = year_range
 
+        max_attempts = retry_attempts if retry_attempts is not None else self.MAX_RETRIES
+        max_attempts = max(1, int(max_attempts))
         last_error = None
-        for attempt in range(1, self.MAX_RETRIES + 1):
+        for attempt in range(1, max_attempts + 1):
             try:
                 async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
                     response = await client.get(
@@ -102,9 +106,9 @@ class SemanticScholarClient:
 
             except httpx.HTTPStatusError as e:
                 status = e.response.status_code
-                if status == 429 and attempt < self.MAX_RETRIES:
+                if status == 429 and attempt < max_attempts:
                     wait = self.RETRY_BASE_WAIT * (2 ** (attempt - 1))
-                    print(f"[SemanticScholar] 429 rate limited, retry {attempt}/{self.MAX_RETRIES} "
+                    print(f"[SemanticScholar] 429 rate limited, retry {attempt}/{max_attempts} "
                           f"in {wait:.0f}s...")
                     await asyncio.sleep(wait)
                     last_error = e
@@ -112,7 +116,7 @@ class SemanticScholarClient:
                 else:
                     if status == 429:
                         self._rate_limited = True
-                        print(f"[SemanticScholar] 429 rate limited, all {self.MAX_RETRIES} retries exhausted")
+                        print(f"[SemanticScholar] 429 rate limited, all {max_attempts} retries exhausted")
                     else:
                         print(f"[SemanticScholar] HTTP error: {status}")
                     return []
@@ -464,12 +468,17 @@ class PaperSearchTool(WriterTool):
 
     # Circuit-breaker: skip arXiv for this many seconds after a 429
     _arxiv_cooldown_until: float = 0.0
+    # Lightweight in-memory cache to reduce duplicate API calls
+    _query_cache: Dict[str, Dict[str, Any]] = {}
 
     def __init__(
         self,
         serpapi_api_key: Optional[str] = None,
         semantic_scholar_api_key: Optional[str] = None,
         timeout: int = 10,
+        semantic_scholar_min_results_before_fallback: int = 3,
+        enable_query_cache: bool = True,
+        cache_ttl_hours: int = 24,
     ):
         # Note: serpapi_api_key is kept for backward compatibility but not used
         # Google Scholar support has been removed
@@ -479,6 +488,11 @@ class PaperSearchTool(WriterTool):
         )
         # arXiv gets a shorter timeout to avoid blocking
         self._arxiv_client = ArxivClient(timeout=min(timeout, 5))
+        self._semantic_scholar_min_results_before_fallback = max(
+            1, semantic_scholar_min_results_before_fallback
+        )
+        self._enable_query_cache = enable_query_cache
+        self._cache_ttl_seconds = max(1, cache_ttl_hours) * 3600
 
     @property
     def name(self) -> str:
@@ -579,6 +593,33 @@ class PaperSearchTool(WriterTool):
         PaperSearchTool._arxiv_cooldown_until = _time.time() + seconds
         print(f"[Tool:search_papers] arXiv cooldown set for {seconds}s")
 
+    def _make_cache_key(
+        self,
+        query: str,
+        max_results: int,
+        year_range: Optional[str],
+        source: str,
+    ) -> str:
+        query_norm = query.strip().lower()
+        yr = (year_range or "").strip()
+        return f"{source}|{max_results}|{yr}|{query_norm}"
+
+    def _get_cached_data(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        entry = PaperSearchTool._query_cache.get(cache_key)
+        if not entry:
+            return None
+        age = _time.time() - float(entry.get("ts", 0))
+        if age > self._cache_ttl_seconds:
+            PaperSearchTool._query_cache.pop(cache_key, None)
+            return None
+        return deepcopy(entry.get("data"))
+
+    def _set_cached_data(self, cache_key: str, data: Dict[str, Any]) -> None:
+        PaperSearchTool._query_cache[cache_key] = {
+            "ts": _time.time(),
+            "data": deepcopy(data),
+        }
+
     async def _search_arxiv_safe(
         self,
         query: str,
@@ -653,25 +694,69 @@ class PaperSearchTool(WriterTool):
         print(f"[Tool:search_papers] Searching '{query}' (max={max_res}, "
               f"source={source}, years={year_range or 'any'})...")
 
+        cache_key = self._make_cache_key(query, max_res, year_range, source)
+        if self._enable_query_cache:
+            cached = self._get_cached_data(cache_key)
+            if cached is not None:
+                print("[Tool:search_papers] Cache hit")
+                return ToolResult(
+                    success=True,
+                    data=cached,
+                    message=f"Found {cached.get('total_found', 0)} paper(s) for '{query}' (cache hit).",
+                )
+
         all_papers: List[Dict[str, Any]] = []
         seen_titles: set = set()
         message_notes: List[str] = []
 
         if source == "semantic_scholar":
-            ss_papers = await self._ss_client.search(
-                query=query, max_results=max_res, year_range=year_range,
-            )
-            ss_added = self._merge_unique_by_title(all_papers, seen_titles, ss_papers)
-            print(f"[Tool:search_papers] Semantic Scholar: {len(ss_papers)} results ({ss_added} new)")
+            min_for_no_fallback = min(max_res, self._semantic_scholar_min_results_before_fallback)
+            max_alternating_rounds = max(1, int(kwargs.get("alternating_rounds", 3)))
+            for round_idx in range(max_alternating_rounds):
+                needed = max_res - len(all_papers)
+                if needed <= 0:
+                    break
 
-            # Fallback: if Semantic Scholar returned empty or was rate-limited, try arXiv
-            if not ss_papers and self._ss_client.is_rate_limited:
-                print("[Tool:search_papers] Semantic Scholar rate-limited, falling back to arXiv...")
+                round_added = 0
+                ss_papers = await self._ss_client.search(
+                    query=query,
+                    max_results=needed,
+                    year_range=year_range,
+                    retry_attempts=1,
+                )
+                ss_added = self._merge_unique_by_title(all_papers, seen_titles, ss_papers)
+                round_added += ss_added
+                print(
+                    f"[Tool:search_papers] Round {round_idx + 1}/{max_alternating_rounds} "
+                    f"Semantic Scholar: {len(ss_papers)} results ({ss_added} new)"
+                )
+
+                needed = max_res - len(all_papers)
+                if needed <= 0:
+                    break
+
+                # Alternate source in every round to avoid long one-source stalls.
                 arxiv_papers = await self._search_arxiv_safe(
-                    query=query, max_results=max_res, year_range=year_range,
+                    query=query,
+                    max_results=needed,
+                    year_range=year_range,
                 )
                 arxiv_added = self._merge_unique_by_title(all_papers, seen_titles, arxiv_papers)
-                print(f"[Tool:search_papers] arXiv fallback: {len(arxiv_papers)} results ({arxiv_added} new)")
+                round_added += arxiv_added
+                print(
+                    f"[Tool:search_papers] Round {round_idx + 1}/{max_alternating_rounds} "
+                    f"arXiv: {len(arxiv_papers)} results ({arxiv_added} new)"
+                )
+
+                if round_added == 0:
+                    break
+
+            if self._ss_client.is_rate_limited:
+                message_notes.append("Semantic Scholar rate-limited during alternating retries.")
+            if len(all_papers) < min_for_no_fallback:
+                message_notes.append(
+                    f"Low recall after alternating retries ({len(all_papers)}/{min_for_no_fallback} minimum target)."
+                )
 
         elif source == "arxiv":
             arxiv_papers = await self._search_arxiv_safe(
@@ -720,6 +805,7 @@ class PaperSearchTool(WriterTool):
                 "authors": p["authors"][:5],  # Limit to 5 authors for brevity
                 "year": p["year"],
                 "venue": p["venue"],
+                "source": p.get("source", ""),
                 "citation_count": p.get("citation_count"),
                 "abstract": (p.get("abstract", "")[:300] + "...")
                             if p.get("abstract") and len(p.get("abstract", "")) > 300
@@ -733,6 +819,8 @@ class PaperSearchTool(WriterTool):
             "bibtex": combined_bibtex,
             "total_found": len(all_papers),
         }
+        if self._enable_query_cache:
+            self._set_cached_data(cache_key, data)
 
         if all_papers:
             message = (f"Found {len(all_papers)} paper(s) for '{query}'. "

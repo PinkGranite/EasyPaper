@@ -441,6 +441,12 @@ class TypesetterAgent(BaseAgent):
             candidate = os.path.join("figures", basename)
             if os.path.exists(os.path.join(work_dir, candidate)):
                 return self._strip_graphics_extension(candidate)
+            # If model emits bare token without extension (e.g. {fig1}),
+            # resolve against common graphics extensions under figures/.
+            for ext in (".pdf", ".png", ".jpg", ".jpeg", ".svg", ".eps"):
+                ext_candidate = os.path.join("figures", f"{basename}{ext}")
+                if os.path.exists(os.path.join(work_dir, ext_candidate)):
+                    return self._strip_graphics_extension(ext_candidate)
             return target
 
         pattern = r'(\\includegraphics)(?:\[([^\]]*)\])?\{([^}]+)\}'

@@ -103,6 +103,14 @@ class SectionPlan(BaseModel):
     content_sources: List[str] = Field(default_factory=list)
     depends_on: List[str] = Field(default_factory=list)
     assigned_refs: List[str] = Field(default_factory=list)
+    budget_selected_refs: List[str] = Field(default_factory=list)
+    budget_reserve_refs: List[str] = Field(default_factory=list)
+    budget_must_use_refs: List[str] = Field(default_factory=list)
+    citation_budget: Dict[str, Any] = Field(default_factory=dict)
+    # Soft structure signals for writer/reviewer coordination.
+    topic_clusters: List[str] = Field(default_factory=list)
+    transition_intents: List[str] = Field(default_factory=list)
+    sectioning_recommended: bool = False
     writing_guidance: str = ""
     order: int = 0
 
@@ -227,6 +235,7 @@ class PlanRequest(BaseModel):
     data: str
     experiments: str
     references: List[str] = Field(default_factory=list)
+    research_context: Optional[Dict[str, Any]] = None
     figures: List[FigureInfo] = Field(default_factory=list)
     tables: List[TableInfo] = Field(default_factory=list)
     target_pages: Optional[int] = None

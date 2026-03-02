@@ -9,9 +9,141 @@ Prompt Compiler - Shared prompt generation utilities
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
 import json
 import os
+import re
 
 if TYPE_CHECKING:
     from ...skills.models import WritingSkill
+
+
+PROMPT_BUDGETS: Dict[str, int] = {
+    "metadata_content_chars": 2800,
+    "intro_context_chars": 1600,
+    "memory_context_chars": 1400,
+    "code_context_chars": 2200,
+    "research_context_chars": 2200,
+    "evidence_abstract_chars": 180,
+    "refs_list_limit": 16,
+    "evidence_keys_limit": 10,
+    "table_latex_chars": 2200,
+}
+
+
+def _truncate_text(text: Optional[str], limit: int) -> str:
+    """
+    Truncate text to the nearest sentence/newline boundary.
+    """
+    if not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    boundary = max(window.rfind("\n"), window.rfind(". "), window.rfind("; "))
+    if boundary < int(limit * 0.6):
+        boundary = limit
+    clipped = window[:boundary].rstrip()
+    return clipped + " ..."
+
+
+def _normalize_reference_entry(ref: Any) -> Optional[Dict[str, Any]]:
+    """
+    Normalize dict/object reference to a unified schema.
+    """
+    if ref is None:
+        return None
+
+    if isinstance(ref, dict):
+        ref_id = (
+            ref.get("ref_id")
+            or ref.get("id")
+            or ref.get("key")
+            or ref.get("citation_key")
+            or ""
+        )
+        if not ref_id:
+            return None
+        return {
+            "id": str(ref_id).strip(),
+            "title": str(ref.get("title", "")).strip(),
+            "authors": str(ref.get("authors", "")).strip(),
+            "year": ref.get("year"),
+            "venue": str(ref.get("venue", "")).strip(),
+            "abstract": str(ref.get("abstract", "")).strip(),
+        }
+
+    ref_id = getattr(ref, "ref_id", None) or getattr(ref, "id", None)
+    if not ref_id:
+        return None
+    return {
+        "id": str(ref_id).strip(),
+        "title": str(getattr(ref, "title", "")).strip(),
+        "authors": str(getattr(ref, "authors", "")).strip(),
+        "year": getattr(ref, "year", None),
+        "venue": str(getattr(ref, "venue", "")).strip(),
+        "abstract": str(getattr(ref, "abstract", "")).strip(),
+    }
+
+
+def _build_reference_blocks(
+    references: List[Any],
+    assigned_refs: Optional[List[str]] = None,
+    ref_limit: int = 16,
+    evidence_limit: int = 10,
+) -> Dict[str, Any]:
+    """
+    Build normalized citation blocks for prompt injection.
+    """
+    normalized: List[Dict[str, Any]] = []
+    ref_lookup: Dict[str, Dict[str, Any]] = {}
+    for ref in references or []:
+        item = _normalize_reference_entry(ref)
+        if not item:
+            continue
+        rid = item["id"]
+        if rid in ref_lookup:
+            continue
+        normalized.append(item)
+        ref_lookup[rid] = item
+
+    limited = normalized[: max(1, ref_limit)]
+    valid_keys = [r["id"] for r in limited]
+
+    refs_info = []
+    for r in limited:
+        title = r.get("title", "")
+        refs_info.append(
+            f"- \\cite{{{r['id']}}}: {title[:90]}" if title else f"- \\cite{{{r['id']}}}"
+        )
+
+    assigned = [str(x).strip() for x in (assigned_refs or []) if str(x).strip()]
+    coverage_keys = assigned[:evidence_limit] if assigned else valid_keys[:evidence_limit]
+    missing_assigned = [k for k in assigned if k not in ref_lookup]
+
+    evidence_lines = []
+    for key in coverage_keys:
+        ref = ref_lookup.get(key)
+        if not ref:
+            continue
+        evidence_lines.append(f"- {key}: {ref.get('title', '')[:120]}")
+        meta_bits = []
+        if ref.get("year"):
+            meta_bits.append(f"year={ref.get('year')}")
+        if ref.get("venue"):
+            meta_bits.append(f"venue={ref.get('venue', '')[:80]}")
+        if meta_bits:
+            evidence_lines.append(f"  - Meta: {', '.join(meta_bits)}")
+        abstract = ref.get("abstract", "")
+        if abstract:
+            evidence_lines.append(
+                "  - Abstract gist: "
+                + _truncate_text(abstract, PROMPT_BUDGETS["evidence_abstract_chars"])
+            )
+
+    return {
+        "valid_keys": valid_keys,
+        "refs_info": refs_info,
+        "evidence_lines": evidence_lines,
+        "missing_assigned": missing_assigned,
+    }
 
 
 def _inject_skill_constraints(
@@ -176,6 +308,82 @@ def _format_paragraph_guidance(section_plan: Any) -> str:
     return "\n".join(lines)
 
 
+def _format_structure_quality_contract(section_type: str, section_plan: Any) -> str:
+    """
+    Build a soft structure contract for writer quality control.
+
+    - **Description**:
+        - Encourages clear thematic block organization without forcing fixed subsection titles.
+        - Allows explicit (`\\subsection`) or implicit (strong block transitions) structure.
+    """
+    if not section_plan:
+        return ""
+
+    paragraphs = getattr(section_plan, "paragraphs", None) or []
+    paragraph_count = len(paragraphs)
+    topic_clusters = getattr(section_plan, "topic_clusters", None) or []
+    transition_intents = getattr(section_plan, "transition_intents", None) or []
+    sectioning_recommended = bool(
+        getattr(section_plan, "sectioning_recommended", False)
+    )
+
+    # For short sections, avoid over-constraining structure.
+    if paragraph_count < 3 and not sectioning_recommended:
+        return ""
+
+    lines: List[str] = ["## Structure Quality Contract"]
+    lines.append(
+        "- Organize this section into clear thematic blocks with explicit transitions."
+    )
+    lines.append("- Two valid implementations are acceptable:")
+    lines.append(
+        "  1) Explicit structure: use \\subsection{} / \\subsubsection{} where helpful."
+    )
+    lines.append(
+        "  2) Implicit structure: keep strong block boundaries and transition sentences."
+    )
+    lines.append("- Do NOT force subsection commands if they hurt readability; prioritize coherent flow.")
+    lines.append(
+        "- Every major claim cluster must map to at least one paragraph block."
+    )
+
+    if topic_clusters:
+        lines.append("- Suggested thematic blocks:")
+        for cluster in topic_clusters[:4]:
+            lines.append(f"  - {cluster}")
+
+    if transition_intents:
+        lines.append("- Suggested transitions:")
+        for intent in transition_intents[:3]:
+            lines.append(f"  - {intent}")
+
+    if sectioning_recommended or paragraph_count >= 5:
+        lines.append(
+            "- This section is structurally dense; ensure block boundaries are unmistakable."
+        )
+    if sectioning_recommended:
+        lines.append(
+            "- For this section, explicit `\\subsection{}` headings are strongly recommended."
+        )
+        lines.append(
+            "- Reviewer expects either explicit subsection headings OR unmistakable implicit blocks with clear transition language."
+        )
+    else:
+        lines.append(
+            "- For this section, prefer implicit thematic blocks; avoid explicit `\\subsection{}` unless absolutely necessary."
+        )
+        lines.append(
+            "- If explicit subsection headings are used, keep them minimal and justified by major topic shifts."
+        )
+
+    if section_type in {"abstract", "conclusion"}:
+        lines.append(
+            "- Keep synthesis sections compact; avoid unnecessary explicit subsection commands."
+        )
+
+    return "\n".join(lines)
+
+
 def _format_figure_placement_guidance(section_plan: Any, figures: List[Any]) -> str:
     """
     Format figure placement guidance using FigurePlacement semantics.
@@ -197,11 +405,16 @@ def _format_figure_placement_guidance(section_plan: Any, figures: List[Any]) -> 
         if fig_id:
             figure_map[fig_id] = fig
 
+    figures_to_reference = set(getattr(section_plan, "figures_to_reference", []) or [])
     parts = ["\n## Figures to DEFINE in this section"]
     parts.append("**CREATE the complete figure environment for each figure below.**\n")
+    overlaps = []
 
     for fp in placements:
         fig_id = fp.figure_id
+        if fig_id in figures_to_reference:
+            overlaps.append(fig_id)
+            continue
         fig = figure_map.get(fig_id)
         if not fig:
             continue
@@ -234,6 +447,12 @@ def _format_figure_placement_guidance(section_plan: Any, figures: List[Any]) -> 
         parts.append(f"  \\\\end{{{env_name}}}")
         parts.append(f"  ```\n")
 
+    if overlaps:
+        parts.append(
+            "Conflict notice: these figure IDs were marked as both define and reference; "
+            "treat them as REFERENCE-only to avoid duplicate definitions: "
+            + ", ".join(overlaps)
+        )
     return "\n".join(parts)
 
 
@@ -254,11 +473,16 @@ def _format_table_placement_guidance(
             table_map[tbl_id] = tbl
 
     _converted = converted_tables or {}
+    tables_to_reference = set(getattr(section_plan, "tables_to_reference", []) or [])
     parts = ["\n## Tables to DEFINE in this section"]
     parts.append("**Include the complete table environment for each table below.**\n")
+    overlaps = []
 
     for tp in placements:
         tbl_id = tp.table_id
+        if tbl_id in tables_to_reference:
+            overlaps.append(tbl_id)
+            continue
         tbl = table_map.get(tbl_id)
         if not tbl:
             continue
@@ -280,7 +504,11 @@ def _format_table_placement_guidance(
         if tbl_id in _converted:
             parts.append(f"  **Required LaTeX (include this exact table):**")
             parts.append(f"  ```latex")
-            parts.append(f"  {_converted[tbl_id]}")
+            rendered = _converted[tbl_id]
+            if len(rendered) > PROMPT_BUDGETS["table_latex_chars"]:
+                rendered = _truncate_text(rendered, PROMPT_BUDGETS["table_latex_chars"])
+                parts.append("  % Table LaTeX truncated for prompt budget; preserve label/caption semantics.")
+            parts.append(f"  {rendered}")
             parts.append(f"  ```\n")
         else:
             content = tbl.content if hasattr(tbl, "content") else tbl.get("content", "")
@@ -288,6 +516,12 @@ def _format_table_placement_guidance(
                 parts.append(f"  Data:\n  {content[:500]}")
             parts.append(f"  **Required: Create \\\\begin{{{env_name}}}...\\\\end{{{env_name}}} with \\\\label{{{tbl_id}}}**\n")
 
+    if overlaps:
+        parts.append(
+            "Conflict notice: these table IDs were marked as both define and reference; "
+            "treat them as REFERENCE-only to avoid duplicate definitions: "
+            + ", ".join(overlaps)
+        )
     return "\n".join(parts)
 
 
@@ -428,6 +662,9 @@ def compile_introduction_prompt(
     figures: List[Any] = None,
     tables: List[Any] = None,
     active_skills: Optional[List["WritingSkill"]] = None,
+    code_context: Optional[str] = None,
+    research_context: Optional[str] = None,
+    enable_structure_contract: bool = True,
 ) -> str:
     """
     Compile prompt for Introduction generation (Phase 1 - Leader section).
@@ -470,28 +707,28 @@ The Introduction is the LEADER section that:
         guidance = _format_paragraph_guidance(section_plan)
         if guidance:
             prompt += f"\n## Writing Structure\n{guidance}\n"
+        if enable_structure_contract:
+            structure_contract = _format_structure_quality_contract("introduction", section_plan)
+            if structure_contract:
+                prompt += f"\n{structure_contract}\n"
 
     # References with citation rules
     if references:
-        refs_info = []
-        valid_keys = []
-        for ref in references[:15]:
-            if isinstance(ref, dict):
-                ref_id = ref.get("ref_id", ref.get("id", ""))
-                title = ref.get("title", "")
-                if ref_id:
-                    valid_keys.append(ref_id)
-                    refs_info.append(
-                        f"- \\cite{{{ref_id}}}: {title[:80]}" if title
-                        else f"- \\cite{{{ref_id}}}"
-                    )
-        if refs_info:
+        assigned_refs = getattr(section_plan, "assigned_refs", []) if section_plan else []
+        ref_blocks = _build_reference_blocks(
+            references=references,
+            assigned_refs=assigned_refs,
+            ref_limit=PROMPT_BUDGETS["refs_list_limit"],
+            evidence_limit=PROMPT_BUDGETS["evidence_keys_limit"],
+        )
+        refs_info = ref_blocks["refs_info"]
+        valid_keys = ref_blocks["valid_keys"]
+        if refs_info and valid_keys:
             prompt += f"\n### CRITICAL: Citation Rules\n"
             prompt += f"**ONLY use these citation keys. DO NOT invent or hallucinate citations.**\n"
             prompt += f"**Valid keys**: {', '.join(valid_keys)}\n\n"
             prompt += "Available references:\n" + "\n".join(refs_info)
             prompt += "\n\n**WARNING**: Any citation not in the above list will be automatically removed.\n"
-            assigned_refs = getattr(section_plan, "assigned_refs", []) if section_plan else []
             if assigned_refs:
                 prompt += (
                     "\n\n**Coverage priority for this section**:\n"
@@ -499,6 +736,43 @@ The Introduction is the LEADER section that:
                     + ", ".join(assigned_refs[:8])
                     + "\nDo not force unrelated citations; integrate naturally with matching claims.\n"
                 )
+
+            evidence_lines = ref_blocks["evidence_lines"]
+            if evidence_lines:
+                prompt += (
+                    "\n\n## Reference Evidence Map\n"
+                    "Use these key-to-paper mappings when selecting citations:\n"
+                    + "\n".join(evidence_lines)
+                    + "\n"
+                )
+            missing_assigned = ref_blocks["missing_assigned"]
+            if missing_assigned:
+                prompt += (
+                    "\nUnavailable assigned refs (do NOT invent): "
+                    + ", ".join(missing_assigned[:8])
+                    + "\n"
+                )
+            citation_budget = getattr(section_plan, "citation_budget", {}) if section_plan else {}
+            budget_selected_refs = getattr(section_plan, "budget_selected_refs", []) if section_plan else []
+            budget_reserve_refs = getattr(section_plan, "budget_reserve_refs", []) if section_plan else []
+            if citation_budget and citation_budget.get("enabled"):
+                prompt += (
+                    "\n\n## Citation Budget Guidance\n"
+                    f"- Target refs for this section: {citation_budget.get('target_refs', 0)} "
+                    f"(min={citation_budget.get('min_refs', 0)}, max={citation_budget.get('max_refs', 0)})\n"
+                )
+                if budget_selected_refs:
+                    prompt += (
+                        "- Budget-selected keys (use these first):\n"
+                        + ", ".join(budget_selected_refs[:10])
+                        + "\n"
+                    )
+                if budget_reserve_refs:
+                    prompt += (
+                        "- Reserve keys (only if needed for strong claim support):\n"
+                        + ", ".join(budget_reserve_refs[:8])
+                        + "\n"
+                    )
 
     # Figure placement guidance
     if section_plan:
@@ -538,6 +812,12 @@ The Introduction is the LEADER section that:
         if tables_info:
             prompt += f"\n### Available Tables\n" + "\n".join(tables_info)
 
+    if code_context:
+        prompt += f"\n\n{_truncate_text(code_context, PROMPT_BUDGETS['code_context_chars'])}"
+
+    if research_context:
+        prompt += f"\n\n{_truncate_text(research_context, PROMPT_BUDGETS['research_context_chars'])}"
+
     if style_guide:
         prompt += f"\n\n## Target Venue: {style_guide}"
 
@@ -556,6 +836,10 @@ The Introduction is the LEADER section that:
 4. Use \\cite{key} for citations
 5. Use \\ref{fig:id} for figure references and \\ref{tab:id} for table references
 6. Write in formal academic English
+
+## Subsection Policy
+- Unless the plan explicitly recommends sectioning for Introduction, prefer implicit structure.
+- Do NOT add multiple \\subsection{} blocks by default.
 
 ## Important
 At the end, clearly state the contributions using:
@@ -583,6 +867,9 @@ def compile_body_section_prompt(
     converted_tables: Optional[Dict[str, str]] = None,
     active_skills: Optional[List["WritingSkill"]] = None,
     memory_context: Optional[str] = None,
+    code_context: Optional[str] = None,
+    research_context: Optional[str] = None,
+    enable_structure_contract: bool = True,
 ) -> str:
     """
     Compile prompt for Body section generation (Phase 2).
@@ -604,10 +891,10 @@ def compile_body_section_prompt(
     prompt = f"""{base_prompt}
 
 ## Section Content Source
-{metadata_content}
+{_truncate_text(metadata_content, PROMPT_BUDGETS["metadata_content_chars"])}
 
 ## Introduction Context (maintain consistency)
-{intro_context[:2000]}{"..." if len(intro_context) > 2000 else ""}
+{_truncate_text(intro_context, PROMPT_BUDGETS["intro_context_chars"])}
 
 ## Key Contributions to Support
 """
@@ -616,34 +903,44 @@ def compile_body_section_prompt(
 
     # Memory-provided cross-section coordination context
     if memory_context:
-        prompt += f"\n## Coordination Context (from Session Memory)\n{memory_context}\n"
+        prompt += (
+            "\n## Coordination Context (from Session Memory)\n"
+            + _truncate_text(memory_context, PROMPT_BUDGETS["memory_context_chars"])
+            + "\n"
+        )
+
+    if code_context:
+        prompt += f"\n{_truncate_text(code_context, PROMPT_BUDGETS['code_context_chars'])}\n"
+
+    if research_context:
+        prompt += f"\n{_truncate_text(research_context, PROMPT_BUDGETS['research_context_chars'])}\n"
 
     # Paragraph-level planning guidance
     if section_plan:
         guidance = _format_paragraph_guidance(section_plan)
         if guidance:
             prompt += f"\n## Writing Structure\n{guidance}\n"
+        if enable_structure_contract:
+            structure_contract = _format_structure_quality_contract(section_type, section_plan)
+            if structure_contract:
+                prompt += f"\n{structure_contract}\n"
 
     # References
     if references:
-        refs_info = []
-        valid_keys = []
-        for ref in references[:10]:
-            if isinstance(ref, dict):
-                ref_id = ref.get("ref_id", ref.get("id", ""))
-                title = ref.get("title", "")
-                if ref_id:
-                    valid_keys.append(ref_id)
-                    refs_info.append(
-                        f"- \\cite{{{ref_id}}}: {title[:60]}" if title
-                        else f"- \\cite{{{ref_id}}}"
-                    )
-        if refs_info:
+        assigned_refs = getattr(section_plan, "assigned_refs", []) if section_plan else []
+        ref_blocks = _build_reference_blocks(
+            references=references,
+            assigned_refs=assigned_refs,
+            ref_limit=PROMPT_BUDGETS["refs_list_limit"],
+            evidence_limit=PROMPT_BUDGETS["evidence_keys_limit"],
+        )
+        refs_info = ref_blocks["refs_info"]
+        valid_keys = ref_blocks["valid_keys"]
+        if refs_info and valid_keys:
             prompt += f"\n## CRITICAL: Citation Rules\n"
             prompt += f"**ONLY use these citation keys. DO NOT invent citations.**\n"
             prompt += f"**Valid keys**: {', '.join(valid_keys)}\n\n"
             prompt += "\n".join(refs_info)
-            assigned_refs = getattr(section_plan, "assigned_refs", []) if section_plan else []
             if assigned_refs:
                 prompt += (
                     "\n\n## Citation Coverage Priority\n"
@@ -651,6 +948,42 @@ def compile_body_section_prompt(
                     + ", ".join(assigned_refs[:10])
                     + "\nUse each key only if it supports an actual statement in the text.\n"
                 )
+            evidence_lines = ref_blocks["evidence_lines"]
+            if evidence_lines:
+                prompt += (
+                    "\n\n## Reference Evidence Map\n"
+                    "Use these key-to-paper mappings when selecting citations:\n"
+                    + "\n".join(evidence_lines)
+                    + "\n"
+                )
+            missing_assigned = ref_blocks["missing_assigned"]
+            if missing_assigned:
+                prompt += (
+                    "\nUnavailable assigned refs (do NOT invent): "
+                    + ", ".join(missing_assigned[:10])
+                    + "\n"
+                )
+            citation_budget = getattr(section_plan, "citation_budget", {}) if section_plan else {}
+            budget_selected_refs = getattr(section_plan, "budget_selected_refs", []) if section_plan else []
+            budget_reserve_refs = getattr(section_plan, "budget_reserve_refs", []) if section_plan else []
+            if citation_budget and citation_budget.get("enabled"):
+                prompt += (
+                    "\n\n## Citation Budget Guidance\n"
+                    f"- Target refs for this section: {citation_budget.get('target_refs', 0)} "
+                    f"(min={citation_budget.get('min_refs', 0)}, max={citation_budget.get('max_refs', 0)})\n"
+                )
+                if budget_selected_refs:
+                    prompt += (
+                        "- Budget-selected keys (use these first):\n"
+                        + ", ".join(budget_selected_refs[:12])
+                        + "\n"
+                    )
+                if budget_reserve_refs:
+                    prompt += (
+                        "- Reserve keys (only if needed for strong claim support):\n"
+                        + ", ".join(budget_reserve_refs[:10])
+                        + "\n"
+                    )
 
     # Figure placement guidance (using FigurePlacement semantics)
     if section_plan:
@@ -737,6 +1070,10 @@ def compile_body_section_prompt(
 6. Use \\cite{key} for citations
 7. Use \\ref{fig:id} for figure references and \\ref{tab:id} for table references
 8. Use clear academic writing style
+
+## Subsection Policy
+- Use explicit \\subsection{} headings only when section-level structure signals recommend it or when block separation would otherwise be unclear.
+- Avoid boilerplate subsection proliferation in every section.
 """
 
     return prompt
@@ -799,6 +1136,11 @@ Synthesize a concise abstract (150-250 words) from the following paper sections.
 3. Key Results (1-2 sentences)
 4. Conclusions/Impact (1 sentence)
 
+## Hard Constraints (Highest Priority)
+- If any instruction conflicts with this block, follow this block.
+- Do NOT include any citations (\\cite{{...}}) in the abstract.
+- Keep the abstract self-contained and concise.
+
 ## Output Requirements
 - Generate ONLY the abstract text
 - Do NOT include \\begin{abstract} or any LaTeX commands
@@ -818,13 +1160,13 @@ Write a conclusion that synthesizes the paper's contributions and findings.
 ## Paper Sections for Reference
 
 ### Introduction
-{prior_sections.get('introduction', '')[:1000]}...
+{_truncate_text(prior_sections.get('introduction', ''), 1000)}
 
 ### Method
-{prior_sections.get('method', '')[:800]}...
+{_truncate_text(prior_sections.get('method', ''), 800)}
 
 ### Results
-{prior_sections.get('result', prior_sections.get('experiment', ''))[:1000]}...
+{_truncate_text(prior_sections.get('result', prior_sections.get('experiment', '')), 1000)}
 
 ## Key Contributions
 """
@@ -840,6 +1182,10 @@ Write a conclusion that synthesizes the paper's contributions and findings.
 2. Key findings and their significance (1 paragraph)
 3. Limitations (brief, 2-3 sentences)
 4. Future work (2-3 sentences)
+
+## Hard Constraints (Highest Priority)
+- If any instruction conflicts with this block, follow this block.
+- Do NOT include any citations (\\cite{{...}}) in the conclusion.
 
 ## Output Requirements
 - Generate LaTeX content for the Conclusion section body

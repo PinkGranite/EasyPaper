@@ -47,6 +47,7 @@ from .models import (
     BODY_SECTION_SOURCES,
     SYNTHESIS_SECTIONS,
     DEFAULT_SECTION_ORDER,
+    CodeRepoOnError,
 )
 from ..shared.prompt_compiler import (
     compile_introduction_prompt,
@@ -68,6 +69,11 @@ from ..planner_agent.models import (
 )
 from ..shared.table_converter import convert_tables
 from ..shared.session_memory import SessionMemory, ReviewRecord
+from ..shared.code_context import (
+    CodeContextBuilder,
+    format_code_context_for_prompt,
+    render_code_repository_summary_markdown,
+)
 from ..reviewer_agent.models import (
     ReviewResult,
     FeedbackResult,
@@ -248,10 +254,731 @@ class MetaDataAgent(ReActAgent):
         """
         if self._skill_registry is None or len(self._skill_registry) == 0:
             return None
+        # Runtime decision: select skills using the current request's style_guide.
+        # This avoids binding venue profiles at service startup time.
         return self._skill_registry.get_writing_skills(
             section_type=section_type,
             venue=style_guide,
         )
+
+    async def _build_code_repository_context(
+        self,
+        metadata: PaperMetaData,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Build code repository context for section-aware writing.
+        - **Description**:
+            - Resolves and scans optional code repository input.
+            - Produces repository overview, section evidence packs, and index.
+
+        - **Args**:
+            - `metadata` (PaperMetaData): User metadata payload.
+
+        - **Returns**:
+            - `Dict[str, Any] | None`: Built context or None when not provided.
+        """
+        if not metadata.code_repository:
+            return None
+
+        builder = CodeContextBuilder(workspace_root=str(Path.cwd()))
+        return await builder.build(
+            code_repo=metadata.code_repository,
+            paper_title=metadata.title,
+        )
+
+    def _retrieve_runtime_code_evidence(
+        self,
+        code_context: Optional[Dict[str, Any]],
+        section_type: str,
+        metadata: PaperMetaData,
+        contributions: Optional[List[str]] = None,
+        top_k: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve section-specific runtime evidence as fallback.
+        - **Description**:
+            - Uses lightweight query bundles per section.
+            - Runs before writing to enrich prompt context.
+
+        - **Args**:
+            - `code_context` (Dict | None): Built repository context.
+            - `section_type` (str): Target section.
+            - `metadata` (PaperMetaData): User metadata.
+            - `contributions` (List[str], optional): Known contributions.
+            - `top_k` (int): Max snippets to return.
+
+        - **Returns**:
+            - `List[Dict]`: Retrieved evidence list.
+        """
+        if not code_context:
+            return []
+
+        query_bundle: List[str] = []
+        if section_type == "method":
+            query_bundle = ["algorithm", "model", "module", "implementation", "forward", "pipeline"]
+            query_bundle.extend(metadata.method.split()[:12])
+        elif section_type == "experiment":
+            query_bundle = ["train", "eval", "dataset", "metric", "configuration", "ablation"]
+            query_bundle.extend(metadata.data.split()[:12])
+            query_bundle.extend(metadata.experiments.split()[:12])
+        elif section_type == "result":
+            query_bundle = ["result", "analysis", "benchmark", "compare", "metric", "report"]
+            query_bundle.extend(metadata.experiments.split()[:12])
+        else:
+            query_bundle = ["project", "workflow", "pipeline"]
+            query_bundle.extend(metadata.idea_hypothesis.split()[:10])
+
+        if contributions:
+            query_bundle.extend(" ".join(contributions[:2]).split()[:8])
+
+        builder = CodeContextBuilder(workspace_root=str(Path.cwd()))
+        return builder.retrieve_for_section(
+            context=code_context,
+            section_type=section_type,
+            query_bundle=query_bundle,
+            top_k=top_k,
+        )
+
+    def _format_research_context_for_prompt(
+        self,
+        research_context: Optional[Dict[str, Any]],
+        section_type: str,
+    ) -> str:
+        """
+        Format research context into a compact writer-consumable brief.
+        """
+        if not research_context:
+            return ""
+
+        lines: List[str] = ["## Research Context Brief"]
+        area = str(research_context.get("research_area", "")).strip()
+        summary = str(research_context.get("summary", "")).strip()
+        if area:
+            lines.append(f"- Area: {area}")
+        if summary:
+            lines.append(f"- Landscape: {summary}")
+
+        trends = research_context.get("research_trends", []) or []
+        if trends:
+            lines.append("- Trends:")
+            for t in trends[:3]:
+                lines.append(f"  - {t}")
+
+        gaps = research_context.get("gaps", []) or []
+        if gaps:
+            lines.append("- Gaps to address:")
+            for g in gaps[:3]:
+                lines.append(f"  - {g}")
+
+        key_papers = research_context.get("key_papers", []) or []
+        if key_papers:
+            lines.append("- Key papers and why they matter:")
+            for kp in key_papers[:5]:
+                title = kp.get("title", "")
+                contribution = kp.get("contribution", "")
+                if title:
+                    lines.append(f"  - {title}: {contribution}")
+
+        claim_matrix = research_context.get("claim_evidence_matrix", []) or []
+        section_claims = [
+            c for c in claim_matrix
+            if c.get("section_type") in {section_type, "global", "", None}
+        ]
+        if section_claims:
+            lines.append("- Claim-evidence priorities:")
+            for c in section_claims[:6]:
+                claim = c.get("claim", "")
+                refs = c.get("support_refs", []) or []
+                priority = c.get("priority", "")
+                reason = c.get("reason", "")
+                ref_text = ", ".join(refs[:4]) if refs else "none"
+                lines.append(
+                    f"  - [{priority}] Claim: {claim} | Evidence refs: {ref_text} | Why: {reason}"
+                )
+
+        ranking = research_context.get("contribution_ranking", {}) or {}
+        if ranking:
+            lines.append("- Contribution ranking:")
+            for band in ("P0", "P1", "P2"):
+                items = ranking.get(band, []) or []
+                if not items:
+                    continue
+                for item in items[:3]:
+                    contribution = item.get("contribution", "")
+                    why = item.get("why_it_matters", "")
+                    sections = item.get("suggested_sections", []) or []
+                    section_hint = ", ".join(sections[:3]) if sections else "n/a"
+                    lines.append(
+                        f"  - {band}: {contribution} | Why: {why} | Suggested sections: {section_hint}"
+                    )
+
+        if len(lines) <= 1:
+            return ""
+        return "\n".join(lines)
+
+    def _collect_section_citation_budget_usage(
+        self,
+        *,
+        section_type: str,
+        content: str,
+        section_plan: Optional[SectionPlan],
+        writer_valid_keys: List[str],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Collect soft-cap citation usage stats for one section.
+        """
+        if not section_plan:
+            return None
+
+        valid_set = set(writer_valid_keys or [])
+        _, _, used_keys = self._validate_and_fix_citations(
+            content,
+            valid_set,
+            remove_invalid=False,
+        )
+        selected_refs = list(
+            section_plan.budget_selected_refs
+            or section_plan.assigned_refs
+            or []
+        )
+        selected_set = set(selected_refs)
+        used_budget_keys = [k for k in used_keys if k in selected_set]
+        overflow_keys = [k for k in used_keys if k not in selected_set]
+        budget = section_plan.citation_budget or {}
+        return {
+            "section_type": section_type,
+            "min_refs": budget.get("min_refs"),
+            "target_refs": budget.get("target_refs"),
+            "max_refs": budget.get("max_refs"),
+            "selected_refs": selected_refs,
+            "reserve_refs": list(section_plan.budget_reserve_refs or []),
+            "writer_valid_keys_count": len(valid_set),
+            "used_keys": used_keys,
+            "used_count": len(used_keys),
+            "used_budget_keys": used_budget_keys,
+            "used_budget_count": len(used_budget_keys),
+            "overflow_keys": overflow_keys,
+            "overflow_count": len(overflow_keys),
+        }
+
+    @staticmethod
+    def _upsert_section_budget_usage(
+        usage_rows: List[Dict[str, Any]],
+        usage_row: Optional[Dict[str, Any]],
+    ) -> None:
+        """
+        Upserts one section citation usage row by section_type.
+        - **Description**:
+         - Updates existing section stats if present, otherwise appends a new row.
+         - Ensures one section appears once in exported citation_budget_usage.
+
+        - **Args**:
+         - `usage_rows` (List[Dict[str, Any]]): Collected usage rows.
+         - `usage_row` (Optional[Dict[str, Any]]): New usage row to merge.
+
+        - **Returns**:
+         - `None` (None): In-place update only.
+        """
+        if not usage_row:
+            return
+        section_type = usage_row.get("section_type")
+        if not section_type:
+            return
+        for idx, row in enumerate(usage_rows):
+            if row.get("section_type") == section_type:
+                usage_rows[idx] = usage_row
+                return
+        usage_rows.append(usage_row)
+
+    @staticmethod
+    def _build_citation_plan_alignment_stats(
+        paper_plan: Optional[PaperPlan],
+        usage_rows: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Builds citation alignment stats between plan and final manuscript.
+        - **Description**:
+         - Compares planned citation budget and selected keys with actual used keys.
+         - Produces per-section and overall metrics for citation usage auditing.
+
+        - **Args**:
+         - `paper_plan` (Optional[PaperPlan]): Planner output containing citation budgets.
+         - `usage_rows` (List[Dict[str, Any]]): Real usage extracted from final section content.
+
+        - **Returns**:
+         - `stats` (Dict[str, Any]): Aggregated alignment report payload.
+        """
+        usage_by_section: Dict[str, Dict[str, Any]] = {
+            str(r.get("section_type")): r
+            for r in usage_rows
+            if r.get("section_type")
+        }
+
+        per_section: List[Dict[str, Any]] = []
+        total_selected = 0
+        total_used = 0
+        total_used_budget = 0
+        total_overflow = 0
+        total_missing = 0
+        sections_with_budget = 0
+        sections_meeting_min = 0
+
+        for sp in (paper_plan.sections if paper_plan else []):
+            budget = sp.citation_budget or {}
+            selected_refs = list(sp.budget_selected_refs or sp.assigned_refs or [])
+            selected_set = set(selected_refs)
+            usage = usage_by_section.get(sp.section_type, {})
+            used_keys = list(usage.get("used_keys", []) or [])
+            used_budget_keys = list(usage.get("used_budget_keys", []) or [])
+            overflow_keys = list(usage.get("overflow_keys", []) or [])
+            missing_selected_refs = [k for k in selected_refs if k not in set(used_budget_keys)]
+
+            min_refs = int(budget.get("min_refs") or 0)
+            target_refs = int(budget.get("target_refs") or 0)
+            max_refs = int(budget.get("max_refs") or 0)
+
+            used_count = len(used_keys)
+            used_budget_count = len(used_budget_keys)
+            overflow_count = len(overflow_keys)
+            selected_count = len(selected_refs)
+            coverage_rate = (
+                round(used_budget_count / selected_count, 4) if selected_count > 0 else None
+            )
+            min_met = (used_count >= min_refs) if min_refs > 0 else True
+            target_met = (used_count >= target_refs) if target_refs > 0 else True
+            max_exceeded = (used_count > max_refs) if max_refs > 0 else False
+
+            if selected_count > 0:
+                sections_with_budget += 1
+            if min_met:
+                sections_meeting_min += 1
+
+            total_selected += selected_count
+            total_used += used_count
+            total_used_budget += used_budget_count
+            total_overflow += overflow_count
+            total_missing += len(missing_selected_refs)
+
+            per_section.append(
+                {
+                    "section_type": sp.section_type,
+                    "plan": {
+                        "min_refs": min_refs,
+                        "target_refs": target_refs,
+                        "max_refs": max_refs,
+                        "selected_count": selected_count,
+                        "selected_refs": selected_refs,
+                    },
+                    "final": {
+                        "used_count": used_count,
+                        "used_keys": used_keys,
+                        "used_budget_count": used_budget_count,
+                        "used_budget_keys": used_budget_keys,
+                        "overflow_count": overflow_count,
+                        "overflow_keys": overflow_keys,
+                    },
+                    "delta": {
+                        "coverage_rate": coverage_rate,
+                        "missing_selected_count": len(missing_selected_refs),
+                        "missing_selected_refs": missing_selected_refs,
+                        "extra_non_budget_count": overflow_count,
+                    },
+                    "status": {
+                        "min_met": min_met,
+                        "target_met": target_met,
+                        "max_exceeded": max_exceeded,
+                    },
+                }
+            )
+
+        overall = {
+            "sections_total": len(per_section),
+            "sections_with_budget": sections_with_budget,
+            "sections_meeting_min": sections_meeting_min,
+            "total_selected_refs": total_selected,
+            "total_used_refs": total_used,
+            "total_used_budget_refs": total_used_budget,
+            "total_overflow_refs": total_overflow,
+            "total_missing_selected_refs": total_missing,
+            "overall_budget_coverage_rate": (
+                round(total_used_budget / total_selected, 4) if total_selected > 0 else None
+            ),
+        }
+
+        return {
+            "overall": overall,
+            "sections": per_section,
+        }
+
+    def _build_structure_alignment_stats(
+        self,
+        *,
+        paper_plan: Optional[PaperPlan],
+        generated_sections: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """
+        Build plan-vs-final structure alignment statistics.
+        """
+        threshold = int(
+            getattr(self.tools_config, "structure_gate_min_paragraph_threshold", 5)
+        ) if self.tools_config else 5
+        per_section: List[Dict[str, Any]] = []
+        gate_expected_count = 0
+        gate_pass_count = 0
+
+        for sp in (paper_plan.sections if paper_plan else []):
+            final_content = generated_sections.get(sp.section_type, "") or ""
+            paragraphs = [
+                p.strip() for p in re.split(r"\n\s*\n", final_content) if p.strip()
+            ]
+            paragraph_count = len(paragraphs)
+            subsection_count = len(
+                re.findall(r"\\subsection\{.+?\}|\\subsubsection\{.+?\}", final_content)
+            )
+            transition_count = 0
+            for para in paragraphs[1:]:
+                lower = para.lower()
+                if lower.startswith((
+                    "however", "therefore", "in contrast", "meanwhile",
+                    "moreover", "furthermore", "additionally", "by contrast",
+                    "in summary",
+                )):
+                    transition_count += 1
+
+            expected_gate = bool(
+                sp.sectioning_recommended
+                or paragraph_count >= threshold
+            ) and sp.section_type not in {"abstract", "conclusion"}
+            passed_gate = bool(
+                subsection_count > 0
+                or (paragraph_count >= 4 and transition_count >= 1)
+            )
+            if expected_gate:
+                gate_expected_count += 1
+                if passed_gate:
+                    gate_pass_count += 1
+
+            per_section.append(
+                {
+                    "section_type": sp.section_type,
+                    "plan": {
+                        "paragraph_count": len(sp.paragraphs or []),
+                        "topic_clusters": list(sp.topic_clusters or []),
+                        "transition_intents": list(sp.transition_intents or []),
+                        "sectioning_recommended": bool(sp.sectioning_recommended),
+                    },
+                    "final": {
+                        "paragraph_count": paragraph_count,
+                        "explicit_subsection_count": subsection_count,
+                        "transition_marker_count": transition_count,
+                    },
+                    "status": {
+                        "structure_gate_expected": expected_gate,
+                        "structure_gate_passed": passed_gate if expected_gate else None,
+                    },
+                }
+            )
+
+        return {
+            "overall": {
+                "sections_total": len(per_section),
+                "gate_expected_sections": gate_expected_count,
+                "gate_passed_sections": gate_pass_count,
+                "gate_pass_rate": (
+                    round(gate_pass_count / gate_expected_count, 4)
+                    if gate_expected_count > 0
+                    else None
+                ),
+            },
+            "sections": per_section,
+        }
+
+    def _build_paragraph_feedback_alignment_report(
+        self,
+        *,
+        memory: Optional[SessionMemory],
+        generated_sections: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """
+        Build paragraph feedback alignment report against final section paragraphs.
+        """
+        if memory is None or not getattr(memory, "review_history", None):
+            return {"sections": [], "overall": {"records": 0}}
+
+        latest = memory.review_history[-1]
+        rows: List[Dict[str, Any]] = []
+        total_targets = 0
+        total_mapped = 0
+        total_out_of_range = 0
+
+        for section_type, feedback in (latest.section_feedbacks or {}).items():
+            if not isinstance(feedback, dict):
+                continue
+            target_paragraphs = [
+                int(x) for x in (feedback.get("target_paragraphs", []) or [])
+                if str(x).strip().lstrip("-").isdigit()
+            ]
+            final_paragraphs = self._split_section_paragraphs(
+                generated_sections.get(section_type, "") or ""
+            )
+            final_count = len(final_paragraphs)
+            mapped = []
+            out_of_range = []
+            for pidx in target_paragraphs:
+                if 0 <= pidx < final_count:
+                    mapped.append({"from": pidx, "to": [pidx], "strategy": "identity"})
+                elif final_count > 0:
+                    nearest = min(max(pidx, 0), final_count - 1)
+                    mapped.append({"from": pidx, "to": [nearest], "strategy": "clamped_nearest"})
+                    out_of_range.append(pidx)
+                else:
+                    mapped.append({"from": pidx, "to": [], "strategy": "no_paragraphs"})
+                    out_of_range.append(pidx)
+
+            total_targets += len(target_paragraphs)
+            total_mapped += len([m for m in mapped if m.get("to")])
+            total_out_of_range += len(out_of_range)
+
+            rows.append(
+                {
+                    "section_type": section_type,
+                    "target_paragraphs": target_paragraphs,
+                    "final_paragraph_count": final_count,
+                    "mappings": mapped,
+                    "out_of_range_targets": out_of_range,
+                }
+            )
+
+        return {
+            "overall": {
+                "records": len(rows),
+                "total_targets": total_targets,
+                "mapped_targets": total_mapped,
+                "out_of_range_targets": total_out_of_range,
+            },
+            "sections": rows,
+        }
+
+    def _rebuild_citation_budget_usage_from_final_sections(
+        self,
+        *,
+        paper_plan: Optional[PaperPlan],
+        generated_sections: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Rebuild citation budget usage from final post-review section contents.
+        - **Description**:
+         - Extracts citation usage from final manuscript sections after review iterations.
+         - Ensures exported usage/alignment reflects the final delivered content.
+
+        - **Args**:
+         - `paper_plan` (Optional[PaperPlan]): Planner output containing section plans.
+         - `generated_sections` (Dict[str, str]): Final section content map.
+
+        - **Returns**:
+         - `usage_rows` (List[Dict[str, Any]]): Final per-section citation usage rows.
+        """
+        if not paper_plan:
+            return []
+
+        usage_rows: List[Dict[str, Any]] = []
+        for sp in paper_plan.sections:
+            final_content = generated_sections.get(sp.section_type, "")
+            writer_valid_keys = list(
+                dict.fromkeys(
+                    list(sp.assigned_refs or [])
+                    + list(sp.budget_reserve_refs or [])
+                )
+            )
+            usage_row = self._collect_section_citation_budget_usage(
+                section_type=sp.section_type,
+                content=final_content,
+                section_plan=sp,
+                writer_valid_keys=writer_valid_keys,
+            )
+            self._upsert_section_budget_usage(usage_rows, usage_row)
+        return usage_rows
+
+    def _build_reviewer_acceptance_stats(
+        self,
+        *,
+        memory: Optional[SessionMemory],
+    ) -> Dict[str, Any]:
+        """
+        Build acceptance statistics from reviewer verification records.
+        """
+        if memory is None or not getattr(memory, "review_history", None):
+            return {"overall": {"total": 0}, "by_iteration": []}
+
+        by_iteration: List[Dict[str, Any]] = []
+        total = 0
+        passed = 0
+        failed = 0
+        noop_accepted = 0
+        changed_accepted = 0
+
+        for rec in memory.review_history:
+            verifications = list(getattr(rec, "reviewer_verification", []) or [])
+            iter_total = len(verifications)
+            iter_passed = 0
+            iter_failed = 0
+            iter_noop_accepted = 0
+            iter_changed_accepted = 0
+            for v in verifications:
+                if not isinstance(v, dict):
+                    continue
+                ok = bool(v.get("passed", False))
+                changed_flag = bool(v.get("changed", False))
+                if ok:
+                    iter_passed += 1
+                    if changed_flag:
+                        iter_changed_accepted += 1
+                    else:
+                        iter_noop_accepted += 1
+                else:
+                    iter_failed += 1
+
+            total += iter_total
+            passed += iter_passed
+            failed += iter_failed
+            noop_accepted += iter_noop_accepted
+            changed_accepted += iter_changed_accepted
+            by_iteration.append(
+                {
+                    "iteration": int(getattr(rec, "iteration", 0)),
+                    "total": iter_total,
+                    "passed": iter_passed,
+                    "failed": iter_failed,
+                    "noop_accepted": iter_noop_accepted,
+                    "changed_accepted": iter_changed_accepted,
+                }
+            )
+
+        return {
+            "overall": {
+                "total": total,
+                "passed": passed,
+                "failed": failed,
+                "pass_rate": round(passed / total, 4) if total > 0 else None,
+                "noop_accepted": noop_accepted,
+                "changed_accepted": changed_accepted,
+            },
+            "by_iteration": by_iteration,
+        }
+
+    def _build_citation_repair_stats(
+        self,
+        *,
+        memory: Optional[SessionMemory],
+    ) -> Dict[str, Any]:
+        """
+        Build invalid-citation removal statistics from decision traces.
+        """
+        if memory is None or not getattr(memory, "review_history", None):
+            return {"overall": {"removed_total": 0}, "by_section": {}, "events": []}
+
+        by_section: Dict[str, int] = {}
+        events: List[Dict[str, Any]] = []
+        removed_total = 0
+        for rec in memory.review_history:
+            trace_rows = list(getattr(rec, "decision_trace", []) or [])
+            for row in trace_rows:
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("decision", "")) != "removed_invalid_citations":
+                    continue
+                section_type = str(row.get("section_type", "unknown"))
+                count = int(row.get("count", 0) or 0)
+                removed_total += count
+                by_section[section_type] = by_section.get(section_type, 0) + count
+                events.append(
+                    {
+                        "iteration": int(getattr(rec, "iteration", 0)),
+                        "section_type": section_type,
+                        "count": count,
+                        "keys": list(row.get("keys", []) or []),
+                    }
+                )
+        return {
+            "overall": {
+                "removed_total": removed_total,
+                "events": len(events),
+            },
+            "by_section": by_section,
+            "events": events,
+        }
+
+    def _build_explicit_subsection_coverage(
+        self,
+        *,
+        paper_plan: Optional[PaperPlan],
+        generated_sections: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """
+        Build explicit subsection coverage for recommended sections.
+        """
+        rows: List[Dict[str, Any]] = []
+        recommended_total = 0
+        recommended_with_explicit = 0
+        for sp in (paper_plan.sections if paper_plan else []):
+            if sp.section_type in {"abstract", "conclusion"}:
+                continue
+            if not bool(sp.sectioning_recommended):
+                continue
+            recommended_total += 1
+            content = generated_sections.get(sp.section_type, "") or ""
+            explicit_count = len(
+                re.findall(r"\\subsection\{.+?\}|\\subsubsection\{.+?\}", content)
+            )
+            has_explicit = explicit_count > 0
+            if has_explicit:
+                recommended_with_explicit += 1
+            rows.append(
+                {
+                    "section_type": sp.section_type,
+                    "section_title": sp.section_title,
+                    "explicit_subsection_count": explicit_count,
+                    "has_explicit_subsection": has_explicit,
+                }
+            )
+        return {
+            "overall": {
+                "recommended_sections": recommended_total,
+                "recommended_with_explicit_subsection": recommended_with_explicit,
+                "coverage_rate": (
+                    round(recommended_with_explicit / recommended_total, 4)
+                    if recommended_total > 0
+                    else None
+                ),
+            },
+            "sections": rows,
+        }
+
+    def _build_core_refs_for_research_context(
+        self,
+        ref_pool: ReferencePool,
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert core references into research-context paper records.
+        """
+        rows: List[Dict[str, Any]] = []
+        for ref in ref_pool.core_refs:
+            ref_id = ref.get("ref_id", "")
+            if not ref_id:
+                continue
+            rows.append(
+                {
+                    "ref_id": ref_id,
+                    "bibtex": ref.get("bibtex", ""),
+                    "title": ref.get("title", ""),
+                    "year": ref.get("year"),
+                    "abstract": ref.get("abstract", ""),
+                    "venue": ref.get("venue", ""),
+                    "citation_count": ref.get("citation_count"),
+                    "source": ref.get("source", "core_reference"),
+                }
+            )
+        return rows
     
     async def generate_paper(
         self,
@@ -305,6 +1032,16 @@ class MetaDataAgent(ReActAgent):
         paper_plan: Optional[PaperPlan] = None
         review_iterations = 0
         target_word_count = None
+        research_context: Optional[Dict[str, Any]] = None
+        research_context_v1: Optional[Dict[str, Any]] = None
+        research_context_v2: Optional[Dict[str, Any]] = None
+        discovered_references_by_section: Dict[str, List[Dict[str, Any]]] = {}
+        seed_discovered_references: List[Dict[str, Any]] = []
+        core_refs_for_context: List[Dict[str, Any]] = []
+        citation_budget_usage: List[Dict[str, Any]] = []
+        code_context: Optional[Dict[str, Any]] = None
+        code_summary_markdown: Optional[str] = None
+        prompt_traces: List[Dict[str, Any]] = []
         
         # Initialize Session Memory for cross-agent coordination
         memory = SessionMemory()
@@ -321,6 +1058,9 @@ class MetaDataAgent(ReActAgent):
                 "serpapi_api_key": ps.serpapi_api_key,
                 "semantic_scholar_api_key": ps.semantic_scholar_api_key,
                 "timeout": ps.timeout,
+                "semantic_scholar_min_results_before_fallback": ps.semantic_scholar_min_results_before_fallback,
+                "enable_query_cache": ps.enable_query_cache,
+                "cache_ttl_hours": ps.cache_ttl_hours,
             }
         ref_pool = await ReferencePool.create(
             metadata.references,
@@ -368,13 +1108,104 @@ class MetaDataAgent(ReActAgent):
             # =================================================================
             if enable_planning:
                 print(f"[MetaDataAgent] Phase 0: Creating Paper Plan...")
+                search_cfg = {}
+                if self.tools_config and self.tools_config.paper_search:
+                    ps = self.tools_config.paper_search
+                    search_cfg = {
+                        "serpapi_api_key": ps.serpapi_api_key,
+                        "semantic_scholar_api_key": ps.semantic_scholar_api_key,
+                        "timeout": ps.timeout,
+                        "search_results_per_round": ps.search_results_per_round,
+                        "planner_max_queries_per_section": ps.planner_max_queries_per_section,
+                        "planner_inter_round_delay_sec": ps.planner_inter_round_delay_sec,
+                        "planner_min_target_papers_per_section": ps.planner_min_target_papers_per_section,
+                        "semantic_scholar_min_results_before_fallback": ps.semantic_scholar_min_results_before_fallback,
+                        "enable_query_cache": ps.enable_query_cache,
+                        "cache_ttl_hours": ps.cache_ttl_hours,
+                        "citation_budget_enabled": ps.citation_budget_enabled,
+                        "citation_budget_soft_cap": ps.citation_budget_soft_cap,
+                        "citation_budget_export": ps.citation_budget_export,
+                        "citation_budget_reserve_size": ps.citation_budget_reserve_size,
+                    }
+
+                rc_cfg = (
+                    self.tools_config.research_context
+                    if self.tools_config and self.tools_config.research_context
+                    else None
+                )
+                rc_first_enabled = rc_cfg.research_context_first_enabled if rc_cfg else False
+                rc_enabled = rc_cfg.enabled if rc_cfg else False
+                if rc_enabled and not core_refs_for_context:
+                    core_refs_for_context = self._build_core_refs_for_research_context(ref_pool)
+                    core_with_abstract = sum(
+                        1 for r in core_refs_for_context if (r.get("abstract") or "").strip()
+                    )
+                    print(
+                        "[MetaDataAgent] Core refs prepared for context: "
+                        f"{len(core_refs_for_context)} total, {core_with_abstract} with abstract"
+                    )
+
+                # Phase 0a: build research context before planning decisions
+                if rc_enabled and rc_first_enabled:
+                    print("[MetaDataAgent] Phase 0a: Building research context v1 (pre-plan)...")
+                    try:
+                        core_refs_for_context = self._build_core_refs_for_research_context(ref_pool)
+                        core_with_abstract = sum(
+                            1 for r in core_refs_for_context if (r.get("abstract") or "").strip()
+                        )
+                        print(
+                            "[MetaDataAgent] Core refs in pre-plan context: "
+                            f"{len(core_refs_for_context)} total, {core_with_abstract} with abstract"
+                        )
+                        seed_discovered_references = await self._planner.discover_seed_references(
+                            title=metadata.title,
+                            idea_hypothesis=metadata.idea_hypothesis,
+                            method=metadata.method,
+                            data=metadata.data,
+                            experiments=metadata.experiments,
+                            existing_ref_keys=list(ref_pool.valid_citation_keys),
+                            paper_search_config=search_cfg,
+                        )
+                        for paper in seed_discovered_references:
+                            ref_pool.add_discovered(
+                                paper.get("ref_id", ""),
+                                paper.get("bibtex", ""),
+                                source="planner_seed_discovery",
+                            )
+                        preplan_context_pool: List[Dict[str, Any]] = []
+                        preplan_context_pool.extend(core_refs_for_context)
+                        preplan_context_pool.extend(seed_discovered_references)
+                        if preplan_context_pool:
+                            seed_plan = PaperPlan(title=metadata.title, sections=[])
+                            research_context_v1 = await self._planner._generate_research_context(
+                                plan=seed_plan,
+                                discovered={"global": preplan_context_pool},
+                            )
+                            research_context = research_context_v1
+                            print(
+                                "[MetaDataAgent] Research context v1 ready: "
+                                f"{research_context_v1.get('research_area', 'N/A')}"
+                            )
+                    except Exception as e:
+                        print(f"[MetaDataAgent] Warning: Failed to build research context v1: {e}")
+
                 paper_plan = await self._create_paper_plan(
                     metadata=metadata,
                     target_pages=target_pages,
                     style_guide=metadata.style_guide,
+                    research_context=research_context_v1,
                 )
                 if paper_plan:
                     memory.plan = paper_plan
+                    if self.tools_config and not getattr(
+                        self.tools_config,
+                        "planner_structure_signals_enabled",
+                        True,
+                    ):
+                        for sp in paper_plan.sections:
+                            sp.topic_clusters = []
+                            sp.transition_intents = []
+                            sp.sectioning_recommended = False
                     memory.log("planner", "phase0", "plan_created",
                                narrative=f"Planner created a {len(paper_plan.sections)}-section paper plan with ~{paper_plan.get_total_estimated_words()} estimated words.",
                                sections=len(paper_plan.sections),
@@ -396,7 +1227,9 @@ class MetaDataAgent(ReActAgent):
                     
                     # Save plan to output directory
                     if save_output and paper_dir:
-                        plan_path = paper_dir / "paper_plan.json"
+                        planning_dir = paper_dir / "analysis" / "planning"
+                        planning_dir.mkdir(parents=True, exist_ok=True)
+                        plan_path = planning_dir / "paper_plan.json"
                         plan_path.write_text(
                             paper_plan.model_dump_json(indent=2),
                             encoding="utf-8",
@@ -404,19 +1237,12 @@ class MetaDataAgent(ReActAgent):
 
                     # Reference discovery: Planner searches for relevant papers
                     print("[MetaDataAgent] Phase 0b: Discovering references...")
-                    search_cfg = {}
-                    if self.tools_config and self.tools_config.paper_search:
-                        ps = self.tools_config.paper_search
-                        search_cfg = {
-                            "serpapi_api_key": ps.serpapi_api_key,
-                            "semantic_scholar_api_key": ps.semantic_scholar_api_key,
-                            "timeout": ps.timeout,
-                        }
                     discovered = await self._planner.discover_references(
                         plan=paper_plan,
                         existing_ref_keys=list(ref_pool.valid_citation_keys),
                         paper_search_config=search_cfg,
                     )
+                    discovered_references_by_section = discovered
                     disc_count = 0
                     for sec_type, papers in discovered.items():
                         for paper in papers:
@@ -438,31 +1264,74 @@ class MetaDataAgent(ReActAgent):
                         discovered=discovered,
                         core_ref_keys=list(ref_pool.valid_citation_keys
                                            - {p["ref_id"] for papers in discovered.values() for p in papers}),
+                        paper_search_config=search_cfg,
                     )
                     for sp in paper_plan.sections:
                         if sp.assigned_refs:
                             print(f"  [{sp.section_type}] {len(sp.assigned_refs)} refs assigned")
 
                     # Phase 0d: Generate research context (if enabled)
-                    research_context = None
-                    rc_enabled = (
-                        self.tools_config and
-                        self.tools_config.research_context and
-                        self.tools_config.research_context.enabled
-                    )
                     if rc_enabled and discovered:
                         print("[MetaDataAgent] Phase 0d: Generating research context...")
                         try:
-                            research_context = await self._planner._generate_research_context(
+                            merged_discovered: Dict[str, List[Dict[str, Any]]] = dict(discovered)
+                            if seed_discovered_references:
+                                merged_discovered["global"] = seed_discovered_references
+                            if core_refs_for_context:
+                                merged_discovered["global_core"] = core_refs_for_context
+                            research_context_v2 = await self._planner._generate_research_context(
                                 plan=paper_plan,
-                                discovered=discovered,
+                                discovered=merged_discovered,
                             )
-                            if research_context:
-                                print(f"[MetaDataAgent] Research context generated: {research_context.get('research_area', 'N/A')}")
+                            if research_context_v2:
+                                research_context = research_context_v2
+                                print(
+                                    "[MetaDataAgent] Research context v2 generated: "
+                                    f"{research_context_v2.get('research_area', 'N/A')}"
+                                )
                         except Exception as e:
                             print(f"[MetaDataAgent] Warning: Failed to generate research context: {e}")
                 else:
                     print(f"[MetaDataAgent] Planning skipped or failed, using defaults")
+
+            # =================================================================
+            # Phase 0e: Code repository understanding (optional)
+            # =================================================================
+            if metadata.code_repository:
+                print("[MetaDataAgent] Phase 0e: Building code repository context...")
+                try:
+                    code_context = await self._build_code_repository_context(metadata)
+                    if code_context:
+                        code_summary_markdown = render_code_repository_summary_markdown(code_context)
+                        stats = code_context.get("scan_stats", {})
+                        print(
+                            "[MetaDataAgent] Code context ready: "
+                            f"{stats.get('indexed_files', 0)} files indexed"
+                        )
+                except Exception as e:
+                    on_error = metadata.code_repository.on_error
+                    msg = f"Code repository ingestion failed: {e}"
+                    print(f"[MetaDataAgent] Warning: {msg}")
+                    # Always fail fast when user provides a local directory but path is invalid.
+                    # This avoids silently generating without code context when filesystem input is wrong.
+                    if (
+                        metadata.code_repository.type.value == "local_dir"
+                        and isinstance(e, (FileNotFoundError, ValueError))
+                    ):
+                        return PaperGenerationResult(
+                            status="error",
+                            paper_title=metadata.title,
+                            errors=[msg],
+                        )
+                    if on_error == CodeRepoOnError.STRICT:
+                        return PaperGenerationResult(
+                            status="error",
+                            paper_title=metadata.title,
+                            errors=[msg],
+                        )
+                    errors.append(msg)
+                    code_context = None
+                    code_summary_markdown = None
             
             # =================================================================
             # Phase 0.5: Convert Tables (if any)
@@ -491,6 +1360,9 @@ class MetaDataAgent(ReActAgent):
             intro_result = await self._generate_introduction(
                 metadata, ref_pool, section_plan=intro_plan,
                 figures=metadata.figures, tables=metadata.tables,
+                code_context=code_context,
+                research_context=research_context,
+                prompt_traces=prompt_traces,
                 memory=memory,
             )
             sections_results.append(intro_result)
@@ -501,6 +1373,20 @@ class MetaDataAgent(ReActAgent):
                 memory.log("metadata", "phase1", "introduction_generated",
                            narrative=f"Writer completed the introduction section ({intro_result.word_count} words).",
                            word_count=intro_result.word_count)
+                if intro_plan:
+                    intro_valid_keys = list(
+                        dict.fromkeys(
+                            list(intro_plan.assigned_refs or [])
+                            + list(intro_plan.budget_reserve_refs or [])
+                        )
+                    )
+                    intro_budget_usage = self._collect_section_citation_budget_usage(
+                        section_type="introduction",
+                        content=intro_result.latex_content,
+                        section_plan=intro_plan,
+                        writer_valid_keys=intro_valid_keys,
+                    )
+                    self._upsert_section_budget_usage(citation_budget_usage, intro_budget_usage)
                 # Extract contributions for consistency
                 contributions = extract_contributions_from_intro(intro_result.latex_content)
                 if not contributions:
@@ -563,6 +1449,9 @@ class MetaDataAgent(ReActAgent):
                         figures=section_figures,
                         tables=section_tables,
                         converted_tables=converted_tables,
+                        code_context=code_context,
+                        research_context=research_context,
+                        prompt_traces=prompt_traces,
                         memory=memory,
                     )
                 except Exception as e:
@@ -578,6 +1467,20 @@ class MetaDataAgent(ReActAgent):
                     memory.log("metadata", "phase2", f"{section_type}_generated",
                                narrative=f"Writer completed the {section_type} section ({result.word_count} words).",
                                word_count=result.word_count)
+                    if section_plan:
+                        section_valid_keys = list(
+                            dict.fromkeys(
+                                list(section_plan.assigned_refs or [])
+                                + list(section_plan.budget_reserve_refs or [])
+                            )
+                        )
+                        section_budget_usage = self._collect_section_citation_budget_usage(
+                            section_type=section_type,
+                            content=result.latex_content,
+                            section_plan=section_plan,
+                            writer_valid_keys=section_valid_keys,
+                        )
+                        self._upsert_section_budget_usage(citation_budget_usage, section_budget_usage)
                     print(f"[MetaDataAgent] After {section_type}: {ref_pool.summary()}")
                 else:
                     errors.append(f"{section_type} generation failed: {result.error}")
@@ -595,6 +1498,7 @@ class MetaDataAgent(ReActAgent):
                 contributions=contributions,
                 style_guide=metadata.style_guide,
                 section_plan=paper_plan.get_section("abstract") if paper_plan else None,
+                prompt_traces=prompt_traces,
                 memory=memory,
             )
             sections_results.insert(0, abstract_result)  # Abstract goes first
@@ -614,6 +1518,7 @@ class MetaDataAgent(ReActAgent):
                 contributions=contributions,
                 style_guide=metadata.style_guide,
                 section_plan=paper_plan.get_section("conclusion") if paper_plan else None,
+                prompt_traces=prompt_traces,
                 memory=memory,
             )
             sections_results.append(conclusion_result)
@@ -659,6 +1564,14 @@ class MetaDataAgent(ReActAgent):
             )
             if orchestration_errors:
                 errors.extend(orchestration_errors)
+
+            # Recompute citation usage from final post-review content so exports align
+            # with the delivered manuscript instead of pre-review drafts.
+            if paper_plan:
+                citation_budget_usage = self._rebuild_citation_budget_usage_from_final_sections(
+                    paper_plan=paper_plan,
+                    generated_sections=generated_sections,
+                )
             
             # =================================================================
             # Assemble Paper
@@ -678,6 +1591,29 @@ class MetaDataAgent(ReActAgent):
             output_path = None
             if save_output and paper_dir:
                 output_path = str(paper_dir)
+                analysis_dir = paper_dir / "analysis"
+                planning_dir = analysis_dir / "planning"
+                research_dir = analysis_dir / "research_context"
+                citation_dir = analysis_dir / "citations"
+                structure_dir = analysis_dir / "structure"
+                review_dir = analysis_dir / "review"
+                references_dir = analysis_dir / "references"
+                code_dir = analysis_dir / "code_context"
+                logs_dir = paper_dir / "logs"
+                traces_dir = logs_dir / "traces"
+                for d in (
+                    analysis_dir,
+                    planning_dir,
+                    research_dir,
+                    citation_dir,
+                    structure_dir,
+                    review_dir,
+                    references_dir,
+                    code_dir,
+                    logs_dir,
+                    traces_dir,
+                ):
+                    d.mkdir(parents=True, exist_ok=True)
                 
                 # Save main.tex
                 tex_path = paper_dir / "main.tex"
@@ -697,15 +1633,304 @@ class MetaDataAgent(ReActAgent):
 
                 # Save research_context.json (if generated)
                 if research_context:
-                    rc_path = paper_dir / "research_context.json"
+                    rc_path = research_dir / "research_context.json"
                     # Add generated timestamp
                     context_output = dict(research_context)
+                    core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
+                    core_refs_with_abstract_count = sum(
+                        1 for r in core_refs_for_context if (r.get("abstract") or "").strip()
+                    )
+                    context_output["core_refs_included_count"] = len(core_ref_ids)
+                    context_output["core_ref_ids"] = core_ref_ids
+                    context_output["core_refs_with_abstract_count"] = core_refs_with_abstract_count
                     context_output["generated_at"] = datetime.now().isoformat()
                     rc_path.write_text(
                         json.dumps(context_output, indent=2, ensure_ascii=False),
                         encoding="utf-8",
                     )
                     print(f"[MetaDataAgent] Research context saved to: {rc_path}")
+
+                if research_context_v1:
+                    rc_v1_path = research_dir / "research_context_v1.json"
+                    rc_v1_payload = dict(research_context_v1)
+                    core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
+                    core_refs_with_abstract_count = sum(
+                        1 for r in core_refs_for_context if (r.get("abstract") or "").strip()
+                    )
+                    rc_v1_payload["core_refs_included_count"] = len(core_ref_ids)
+                    rc_v1_payload["core_ref_ids"] = core_ref_ids
+                    rc_v1_payload["core_refs_with_abstract_count"] = core_refs_with_abstract_count
+                    rc_v1_payload["generated_at"] = datetime.now().isoformat()
+                    rc_v1_path.write_text(
+                        json.dumps(rc_v1_payload, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Research context v1 saved to: {rc_v1_path}")
+
+                if research_context_v2:
+                    rc_v2_path = research_dir / "research_context_v2.json"
+                    rc_v2_payload = dict(research_context_v2)
+                    core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
+                    core_refs_with_abstract_count = sum(
+                        1 for r in core_refs_for_context if (r.get("abstract") or "").strip()
+                    )
+                    rc_v2_payload["core_refs_included_count"] = len(core_ref_ids)
+                    rc_v2_payload["core_ref_ids"] = core_ref_ids
+                    rc_v2_payload["core_refs_with_abstract_count"] = core_refs_with_abstract_count
+                    rc_v2_payload["generated_at"] = datetime.now().isoformat()
+                    rc_v2_path.write_text(
+                        json.dumps(rc_v2_payload, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Research context v2 saved to: {rc_v2_path}")
+
+                if research_context:
+                    cem = research_context.get("claim_evidence_matrix", [])
+                    cr = research_context.get("contribution_ranking", {"P0": [], "P1": [], "P2": []})
+                    cem_path = research_dir / "claim_evidence_matrix.json"
+                    cem_path.write_text(
+                        json.dumps(
+                            {"claim_evidence_matrix": cem, "generated_at": datetime.now().isoformat()},
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    cr_path = research_dir / "contribution_ranking.json"
+                    cr_path.write_text(
+                        json.dumps(
+                            {"contribution_ranking": cr, "generated_at": datetime.now().isoformat()},
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    rc_cfg_for_export = (
+                        self.tools_config.research_context
+                        if self.tools_config and self.tools_config.research_context
+                        else None
+                    )
+                    if (
+                        rc_cfg_for_export
+                        and rc_cfg_for_export.export_planning_decision_trace
+                        and research_context.get("planning_decision_trace")
+                    ):
+                        pdt_path = research_dir / "planning_decision_trace.json"
+                        pdt_path.write_text(
+                            json.dumps(
+                                {
+                                    "planning_decision_trace": research_context.get(
+                                        "planning_decision_trace", []
+                                    ),
+                                    "generated_at": datetime.now().isoformat(),
+                                },
+                                indent=2,
+                                ensure_ascii=False,
+                            ),
+                            encoding="utf-8",
+                        )
+                        print(f"[MetaDataAgent] Planning decision trace saved to: {pdt_path}")
+
+                ps_cfg_for_export = (
+                    self.tools_config.paper_search
+                    if self.tools_config and self.tools_config.paper_search
+                    else None
+                )
+                budget_export_enabled = bool(
+                    ps_cfg_for_export and ps_cfg_for_export.citation_budget_export
+                )
+                if budget_export_enabled and paper_plan:
+                    # Keep usage rows in plan section order for stable auditing.
+                    usage_by_section = {
+                        row.get("section_type"): row
+                        for row in citation_budget_usage
+                        if row.get("section_type")
+                    }
+                    ordered_usage: List[Dict[str, Any]] = []
+                    for sp in paper_plan.sections:
+                        section_row = usage_by_section.get(sp.section_type)
+                        if section_row:
+                            ordered_usage.append(section_row)
+
+                    budget_plan_rows: List[Dict[str, Any]] = []
+                    for sp in paper_plan.sections:
+                        if not sp.citation_budget:
+                            continue
+                        budget_plan_rows.append(
+                            {
+                                "section_type": sp.section_type,
+                                "citation_budget": sp.citation_budget,
+                                "budget_selected_refs": sp.budget_selected_refs,
+                                "budget_reserve_refs": sp.budget_reserve_refs,
+                                "budget_must_use_refs": sp.budget_must_use_refs,
+                                "assigned_refs": sp.assigned_refs,
+                            }
+                        )
+                    budget_plan_path = citation_dir / "citation_budget_plan.json"
+                    budget_plan_path.write_text(
+                        json.dumps(
+                            {
+                                "sections": budget_plan_rows,
+                                "generated_at": datetime.now().isoformat(),
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Citation budget plan saved to: {budget_plan_path}")
+
+                    budget_usage_path = citation_dir / "citation_budget_usage.json"
+                    budget_usage_path.write_text(
+                        json.dumps(
+                            {
+                                "sections": ordered_usage,
+                                "generated_at": datetime.now().isoformat(),
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Citation budget usage saved to: {budget_usage_path}")
+
+                    alignment_stats = self._build_citation_plan_alignment_stats(
+                        paper_plan=paper_plan,
+                        usage_rows=ordered_usage,
+                    )
+                    alignment_stats["generated_at"] = datetime.now().isoformat()
+                    alignment_path = citation_dir / "citation_plan_alignment.json"
+                    alignment_path.write_text(
+                        json.dumps(alignment_stats, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Citation plan alignment saved to: {alignment_path}")
+                    citation_repair_stats = self._build_citation_repair_stats(
+                        memory=memory,
+                    )
+                    citation_repair_stats["generated_at"] = datetime.now().isoformat()
+                    citation_repair_path = citation_dir / "citation_repair_stats.json"
+                    citation_repair_path.write_text(
+                        json.dumps(citation_repair_stats, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(
+                        "[MetaDataAgent] Citation repair stats saved to: "
+                        f"{citation_repair_path}"
+                    )
+
+                if paper_plan:
+                    structure_alignment = self._build_structure_alignment_stats(
+                        paper_plan=paper_plan,
+                        generated_sections=generated_sections,
+                    )
+                    structure_alignment["generated_at"] = datetime.now().isoformat()
+                    structure_alignment_path = structure_dir / "structure_alignment.json"
+                    structure_alignment_path.write_text(
+                        json.dumps(structure_alignment, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(
+                        "[MetaDataAgent] Structure alignment saved to: "
+                        f"{structure_alignment_path}"
+                    )
+                    paragraph_alignment = self._build_paragraph_feedback_alignment_report(
+                        memory=memory,
+                        generated_sections=generated_sections,
+                    )
+                    paragraph_alignment["generated_at"] = datetime.now().isoformat()
+                    paragraph_alignment_path = (
+                        structure_dir / "paragraph_feedback_alignment.json"
+                    )
+                    paragraph_alignment_path.write_text(
+                        json.dumps(paragraph_alignment, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(
+                        "[MetaDataAgent] Paragraph feedback alignment saved to: "
+                        f"{paragraph_alignment_path}"
+                    )
+                    subsection_coverage = self._build_explicit_subsection_coverage(
+                        paper_plan=paper_plan,
+                        generated_sections=generated_sections,
+                    )
+                    subsection_coverage["generated_at"] = datetime.now().isoformat()
+                    subsection_coverage_path = (
+                        structure_dir / "explicit_subsection_coverage.json"
+                    )
+                    subsection_coverage_path.write_text(
+                        json.dumps(subsection_coverage, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(
+                        "[MetaDataAgent] Explicit subsection coverage saved to: "
+                        f"{subsection_coverage_path}"
+                    )
+
+                reviewer_acceptance_stats = self._build_reviewer_acceptance_stats(
+                    memory=memory,
+                )
+                reviewer_acceptance_stats["generated_at"] = datetime.now().isoformat()
+                reviewer_acceptance_path = review_dir / "reviewer_acceptance_stats.json"
+                reviewer_acceptance_path.write_text(
+                    json.dumps(reviewer_acceptance_stats, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                print(
+                    "[MetaDataAgent] Reviewer acceptance stats saved to: "
+                    f"{reviewer_acceptance_path}"
+                )
+
+                # Save per-paper planner analysis for auditability
+                if discovered_references_by_section:
+                    core_ref_id_set = {
+                        r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")
+                    }
+                    analysis_rows: List[Dict[str, Any]] = []
+                    for section_type, papers in discovered_references_by_section.items():
+                        for paper in papers:
+                            ref_id = paper.get("ref_id", "")
+                            analysis_rows.append({
+                                "section_type": section_type,
+                                "ref_id": ref_id,
+                                "title": paper.get("title", ""),
+                                "year": paper.get("year"),
+                                "venue": paper.get("venue", ""),
+                                "source": paper.get("source", ""),
+                                "citation_count": paper.get("citation_count"),
+                                "abstract": paper.get("abstract", ""),
+                                "relevance_score": paper.get("relevance_score"),
+                                "relevance_reason": paper.get("relevance_reason", ""),
+                                "is_core_reference": ref_id in core_ref_id_set,
+                            })
+
+                    analysis_payload = {
+                        "total_sections": len(discovered_references_by_section),
+                        "total_papers": len(analysis_rows),
+                        "papers": analysis_rows,
+                        "generated_at": datetime.now().isoformat(),
+                    }
+                    analysis_path = references_dir / "discovered_papers_analysis.json"
+                    analysis_path.write_text(
+                        json.dumps(analysis_payload, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Discovered papers analysis saved to: {analysis_path}")
+
+                # Save code repository summary markdown (if generated)
+                if code_summary_markdown:
+                    crs_path = code_dir / "code_repository_summary.md"
+                    crs_path.write_text(code_summary_markdown, encoding="utf-8")
+                    print(f"[MetaDataAgent] Code repository summary saved to: {crs_path}")
+
+                # Save prompt/evidence traces (optional)
+                if metadata.export_prompt_traces and prompt_traces:
+                    traces_path = traces_dir / "prompt_traces.json"
+                    traces_path.write_text(
+                        json.dumps(prompt_traces, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Prompt traces saved to: {traces_path}")
 
                 # Persist session memory (review history + agent logs)
                 memory.log("metadata", "final", "paper_assembled",
@@ -788,6 +2013,9 @@ class MetaDataAgent(ReActAgent):
         section_plan: Optional[SectionPlan] = None,
         figures: Optional[List[FigureSpec]] = None,
         tables: Optional[List[TableSpec]] = None,
+        code_context: Optional[Dict[str, Any]] = None,
+        research_context: Optional[Dict[str, Any]] = None,
+        prompt_traces: Optional[List[Dict[str, Any]]] = None,
         memory: Optional[SessionMemory] = None,
     ) -> SectionResult:
         """
@@ -815,6 +2043,22 @@ class MetaDataAgent(ReActAgent):
                 key_points = section_plan.get_key_points()
 
             # Compile prompt then delegate to WriterAgent
+            intro_runtime_evidence = self._retrieve_runtime_code_evidence(
+                code_context=code_context,
+                section_type="introduction",
+                metadata=metadata,
+                top_k=2,
+            )
+            intro_code_context = format_code_context_for_prompt(
+                context=code_context,
+                section_type="introduction",
+                retrieved_evidence=intro_runtime_evidence,
+                top_k=4,
+            )
+            intro_research_context = self._format_research_context_for_prompt(
+                research_context=research_context,
+                section_type="introduction",
+            )
             prompt = compile_introduction_prompt(
                 paper_title=metadata.title,
                 idea_hypothesis=metadata.idea_hypothesis,
@@ -827,7 +2071,24 @@ class MetaDataAgent(ReActAgent):
                 figures=figures,
                 tables=tables,
                 active_skills=self._get_active_skills("introduction", metadata.style_guide),
+                code_context=intro_code_context,
+                research_context=intro_research_context,
+                enable_structure_contract=bool(
+                    self.tools_config is None
+                    or getattr(self.tools_config, "writer_structure_contract_enabled", True)
+                ),
             )
+            if prompt_traces is not None:
+                prompt_traces.append(
+                    {
+                        "section_type": "introduction",
+                        "phase": "generation",
+                        "code_context_used": bool(intro_code_context),
+                        "research_context_used": bool(intro_research_context),
+                        "runtime_evidence": intro_runtime_evidence,
+                        "prompt": prompt,
+                    }
+                )
 
             # Use section-assigned refs if available, else fall back to full pool
             section_keys = (
@@ -835,11 +2096,17 @@ class MetaDataAgent(ReActAgent):
                 if section_plan and section_plan.assigned_refs
                 else list(ref_pool.valid_citation_keys)
             )
+            reserve_keys = (
+                section_plan.budget_reserve_refs
+                if section_plan and section_plan.budget_reserve_refs
+                else []
+            )
+            writer_valid_keys = list(dict.fromkeys(list(section_keys) + list(reserve_keys)))
             result = await self._writer.run(
                 system_prompt=GENERATION_SYSTEM_PROMPT,
                 user_prompt=prompt,
                 section_type="introduction",
-                valid_citation_keys=section_keys,
+                valid_citation_keys=writer_valid_keys,
                 key_points=key_points or None,
                 memory=memory,
                 peers={"planner": self._planner, "reviewer": self._reviewer},
@@ -883,6 +2150,9 @@ class MetaDataAgent(ReActAgent):
         figures: Optional[List[FigureSpec]] = None,
         tables: Optional[List[TableSpec]] = None,
         converted_tables: Optional[Dict[str, str]] = None,
+        code_context: Optional[Dict[str, Any]] = None,
+        research_context: Optional[Dict[str, Any]] = None,
+        prompt_traces: Optional[List[Dict[str, Any]]] = None,
         memory: Optional[SessionMemory] = None,
     ) -> SectionResult:
         """
@@ -939,6 +2209,24 @@ class MetaDataAgent(ReActAgent):
             # Build memory context for cross-section awareness
             memory_context = memory.get_writing_context(section_type) if memory else ""
 
+            runtime_evidence = self._retrieve_runtime_code_evidence(
+                code_context=code_context,
+                section_type=section_type,
+                metadata=metadata,
+                contributions=contributions,
+                top_k=3,
+            )
+            section_code_context = format_code_context_for_prompt(
+                context=code_context,
+                section_type=section_type,
+                retrieved_evidence=runtime_evidence,
+                top_k=6,
+            )
+            section_research_context = self._format_research_context_for_prompt(
+                research_context=research_context,
+                section_type=section_type,
+            )
+
             # Build prompt AFTER search so it includes any new refs
             prompt = compile_body_section_prompt(
                 section_type=section_type,
@@ -953,18 +2241,41 @@ class MetaDataAgent(ReActAgent):
                 converted_tables=converted_tables,
                 active_skills=self._get_active_skills(section_type, metadata.style_guide),
                 memory_context=memory_context,
+                code_context=section_code_context,
+                research_context=section_research_context,
+                enable_structure_contract=bool(
+                    self.tools_config is None
+                    or getattr(self.tools_config, "writer_structure_contract_enabled", True)
+                ),
             )
+            if prompt_traces is not None:
+                prompt_traces.append(
+                    {
+                        "section_type": section_type,
+                        "phase": "generation",
+                        "code_context_used": bool(section_code_context),
+                        "research_context_used": bool(section_research_context),
+                        "runtime_evidence": runtime_evidence,
+                        "prompt": prompt,
+                    }
+                )
 
             section_keys = (
                 section_plan.assigned_refs
                 if section_plan and section_plan.assigned_refs
                 else list(ref_pool.valid_citation_keys)
             )
+            reserve_keys = (
+                section_plan.budget_reserve_refs
+                if section_plan and section_plan.budget_reserve_refs
+                else []
+            )
+            writer_valid_keys = list(dict.fromkeys(list(section_keys) + list(reserve_keys)))
             result = await self._writer.run(
                 system_prompt=GENERATION_SYSTEM_PROMPT,
                 user_prompt=prompt,
                 section_type=section_type,
-                valid_citation_keys=section_keys,
+                valid_citation_keys=writer_valid_keys,
                 key_points=key_points or None,
                 memory=memory,
                 peers={"planner": self._planner, "reviewer": self._reviewer},
@@ -1011,6 +2322,7 @@ class MetaDataAgent(ReActAgent):
         contributions: List[str],
         style_guide: Optional[str] = None,
         section_plan: Optional[SectionPlan] = None,
+        prompt_traces: Optional[List[Dict[str, Any]]] = None,
         memory: Optional[SessionMemory] = None,
     ) -> SectionResult:
         """Generate synthesis section (Abstract or Conclusion) via WriterAgent."""
@@ -1027,6 +2339,16 @@ class MetaDataAgent(ReActAgent):
                 active_skills=self._get_active_skills(section_type, style_guide),
                 memory_context=memory_context,
             )
+            if prompt_traces is not None:
+                prompt_traces.append(
+                    {
+                        "section_type": section_type,
+                        "phase": "generation",
+                        "code_context_used": False,
+                        "runtime_evidence": [],
+                        "prompt": prompt,
+                    }
+                )
 
             synthesis_system = (
                 "You are an expert academic writer. Use present tense for methods, "
@@ -1598,7 +2920,15 @@ class MetaDataAgent(ReActAgent):
         # This prevents re-injecting figures that were moved to the appendix
         # by structural overflow actions.
         globally_defined_figs: set = set()
+        globally_used_targets: set = set()
         all_content = "\n".join(generated_sections.values())
+        target_pattern = r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}'
+        for tgt in re.findall(target_pattern, all_content):
+            norm = str(tgt).strip()
+            if norm:
+                globally_used_targets.add(norm)
+                globally_used_targets.add(Path(norm).name)
+                globally_used_targets.add(Path(norm).stem)
         for fig in figures:
             fig_pattern = rf'\\begin{{figure\*?}}.*?\\label{{{re.escape(fig.id)}}}.*?\\end{{figure\*?}}'
             if re.search(fig_pattern, all_content, re.DOTALL):
@@ -1621,6 +2951,14 @@ class MetaDataAgent(ReActAgent):
                 # Skip if this figure is already defined ANYWHERE in the paper
                 # (including appendix — it may have been moved there deliberately)
                 if fig_id in globally_defined_figs:
+                    continue
+                # Also skip if the same underlying image target already appears
+                # via includegraphics with a different label/alias.
+                aliases = {fig_id, Path(fig_id).name, Path(fig_id).stem}
+                if getattr(fig, "file_path", ""):
+                    fp = str(fig.file_path)
+                    aliases.update({Path(fp).name, Path(fp).stem})
+                if any(a for a in aliases if a in globally_used_targets):
                     continue
                 
                 # Figure not defined anywhere - inject it
@@ -1962,6 +3300,12 @@ class MetaDataAgent(ReActAgent):
                 paper_search_cfg.semantic_scholar_api_key if paper_search_cfg else None
             ),
             timeout=paper_search_cfg.timeout if paper_search_cfg else 10,
+            semantic_scholar_min_results_before_fallback=(
+                paper_search_cfg.semantic_scholar_min_results_before_fallback
+                if paper_search_cfg else 3
+            ),
+            enable_query_cache=paper_search_cfg.enable_query_cache if paper_search_cfg else True,
+            cache_ttl_hours=paper_search_cfg.cache_ttl_hours if paper_search_cfg else 24,
         )
 
         added_count = 0
@@ -1973,7 +3317,8 @@ class MetaDataAgent(ReActAgent):
 
             print(f"[PreSearch] Executing search ({i+1}/{len(queries)}): '{query}'")
             try:
-                result = await tool.execute(query=query, max_results=5)
+                per_round = paper_search_cfg.search_results_per_round if paper_search_cfg else 5
+                result = await tool.execute(query=query, max_results=per_round)
                 if not result.success:
                     print(f"[PreSearch] Search failed: {result.message}")
                     continue
@@ -2407,6 +3752,7 @@ class MetaDataAgent(ReActAgent):
         metadata: PaperMetaData,
         target_pages: Optional[int],
         style_guide: Optional[str],
+        research_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[PaperPlan]:
         """
         Create a paper plan by calling the Planner Agent
@@ -2453,6 +3799,7 @@ class MetaDataAgent(ReActAgent):
                 data=metadata.data,
                 experiments=metadata.experiments,
                 references=metadata.references,
+                research_context=research_context,
                 figures=[FigureInfo(**fi) for fi in figures_info],
                 tables=[TableInfo(**ti) for ti in tables_info],
                 target_pages=target_pages,
@@ -2827,10 +4174,10 @@ class MetaDataAgent(ReActAgent):
         except Exception as e:
             return SemanticCheckRecord(
                 section_type=section_type,
-                passed=True,
-                summary=f"Semantic guard skipped due to error: {e}",
-                risks=[],
-                action_taken="accepted",
+                passed=False,
+                summary=f"Semantic guard failed due to error: {e}",
+                risks=["semantic_guard_unavailable"],
+                action_taken="rollback",
             )
 
     async def _translate_vlm_to_revision_plan(
@@ -4115,6 +5462,15 @@ class MetaDataAgent(ReActAgent):
                 )
                 if invalid_citations:
                     print(f"[ReviewLoop] Removed {len(invalid_citations)} invalid citations from {sf.section_type}: {invalid_citations[:3]}{'...' if len(invalid_citations) > 3 else ''}")
+                    if decision_trace is not None:
+                        decision_trace.append(
+                            {
+                                "section_type": sf.section_type,
+                                "decision": "removed_invalid_citations",
+                                "count": len(invalid_citations),
+                                "keys": list(invalid_citations),
+                            }
+                        )
                 semantic_record = await self._run_semantic_consistency_guard(
                     section_type=sf.section_type,
                     before_text=before_content,
@@ -4191,7 +5547,18 @@ class MetaDataAgent(ReActAgent):
                         },
                     })
                 if writer_response_paragraph is not None:
+                    final_paragraphs = self._split_section_paragraphs(revised_content)
+                    final_para_count = len(final_paragraphs)
                     for pidx in (sf.target_paragraphs or []):
+                        mapped_to: List[int] = []
+                        mapping_strategy = "identity"
+                        if 0 <= int(pidx) < final_para_count:
+                            mapped_to = [int(pidx)]
+                        elif final_para_count > 0:
+                            mapped_to = [min(max(int(pidx), 0), final_para_count - 1)]
+                            mapping_strategy = "clamped_nearest"
+                        else:
+                            mapping_strategy = "no_paragraphs"
                         writer_response_paragraph.append({
                             "target_id": f"{sf.section_type}.p{int(pidx)}",
                             "section_type": sf.section_type,
@@ -4201,7 +5568,12 @@ class MetaDataAgent(ReActAgent):
                             "instruction": str((task_contract.get("paragraph_instructions", {}) or {}).get(int(pidx), "")),
                             "constraints": task_contract["constraints"],
                             "source_agent": "writer",
-                            "evidence": {"content_changed": True},
+                            "evidence": {
+                                "content_changed": True,
+                                "mapped_to_paragraph_indices": mapped_to,
+                                "mapping_strategy": mapping_strategy,
+                                "final_paragraph_count": final_para_count,
+                            },
                         })
                 if reviewer_verification is not None:
                     verify_result: Dict[str, Any] = {
@@ -4469,6 +5841,17 @@ class MetaDataAgent(ReActAgent):
                         s.section_type: s.get_estimated_words()
                         for s in paper_plan.sections
                     }
+                section_structure_signals = None
+                if paper_plan and paper_plan.sections:
+                    section_structure_signals = {
+                        s.section_type: {
+                            "topic_clusters": list(s.topic_clusters or []),
+                            "transition_intents": list(s.transition_intents or []),
+                            "sectioning_recommended": bool(s.sectioning_recommended),
+                            "paragraph_count": len(s.paragraphs or []),
+                        }
+                        for s in paper_plan.sections
+                    }
                 reviewer_result, target_word_count = await self._call_reviewer(
                     sections=generated_sections,
                     word_counts=word_counts,
@@ -4477,6 +5860,7 @@ class MetaDataAgent(ReActAgent):
                     template_path=template_path,
                     iteration=iteration,
                     section_targets=section_targets,
+                    section_structure_signals=section_structure_signals,
                     memory=memory,
                 )
                 if reviewer_result is None:
@@ -4999,6 +6383,7 @@ class MetaDataAgent(ReActAgent):
         template_path: Optional[str],
         iteration: int,
         section_targets: Optional[Dict[str, int]] = None,
+        section_structure_signals: Optional[Dict[str, Any]] = None,
         memory: Optional[SessionMemory] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
         """
@@ -5021,6 +6406,14 @@ class MetaDataAgent(ReActAgent):
                 template_path=template_path,
                 metadata={},
             )
+            review_ctx.metadata["review_structure_gate_enabled"] = bool(
+                getattr(self.tools_config, "review_structure_gate_enabled", True)
+            ) if self.tools_config else True
+            review_ctx.metadata["structure_gate_min_paragraph_threshold"] = int(
+                getattr(self.tools_config, "structure_gate_min_paragraph_threshold", 5)
+            ) if self.tools_config else 5
+            if section_structure_signals:
+                review_ctx.metadata["section_structure_signals"] = section_structure_signals
             if memory is not None:
                 review_ctx.metadata["issue_memory"] = memory.get_issue_context(limit=40)
             if section_targets:
@@ -5127,6 +6520,8 @@ class MetaDataAgent(ReActAgent):
                 section_type=section_type,
                 enable_review=False,
                 valid_citation_keys=sorted(list(valid_citation_keys or [])),
+                mode="revision",
+                current_content=current_content,
                 revision_plan={
                     **(task_contract or {}),
                     "section_type": section_type,
@@ -5214,6 +6609,8 @@ class MetaDataAgent(ReActAgent):
                 section_type=section_type,
                 enable_review=False,
                 valid_citation_keys=sorted(list(valid_citation_keys or [])),
+                mode="revision",
+                current_content=paragraph_text,
                 revision_plan={
                     **(task_contract or {}),
                     "section_type": section_type,

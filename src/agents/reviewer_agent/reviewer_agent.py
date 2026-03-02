@@ -30,6 +30,7 @@ from .checkers.base import FeedbackChecker
 from .checkers.word_count import WordCountChecker
 from .checkers.style_check import StyleChecker
 from .checkers.logic_check import LogicChecker
+from .checkers.structure_check import StructureChecker
 
 if TYPE_CHECKING:
     from ...skills.registry import SkillRegistry
@@ -93,6 +94,7 @@ class ReviewerAgent(BaseAgent):
         """
         # StyleChecker: pure rule-based, always available
         self.register_checker(StyleChecker(skill_registry=self._skill_registry))
+        self.register_checker(StructureChecker())
 
         # LogicChecker: needs LLM client
         try:
@@ -614,13 +616,24 @@ class ReviewerAgent(BaseAgent):
             - Semantic consistency is treated as a hard acceptance gate
         """
         changed = (before_text or "").strip() != (after_text or "").strip()
-        passed = bool(semantic_passed and changed)
+        expected_change = str(task_contract.get("expected_change", "")).strip().lower()
+        allow_noop = bool(task_contract.get("allow_noop", False)) or expected_change in {
+            "",
+            "none",
+            "no_change",
+            "no-op",
+            "already_satisfied",
+        }
+        resolved_or_not_applicable = bool(semantic_passed and (changed or allow_noop))
+        passed = bool(resolved_or_not_applicable)
         criteria = [str(x) for x in (task_contract.get("acceptance_criteria", []) or [])]
         gate_map: Dict[str, bool] = {
             "execution_changed": changed,
             "semantic_preserved": bool(semantic_passed),
             "contradiction_resolved": bool(semantic_passed and changed),
             "evidence_sufficient": bool(semantic_passed and changed),
+            "structure_coherent": bool(semantic_passed and changed),
+            "resolved_or_not_applicable": resolved_or_not_applicable,
         }
         gate_results = [
             {
@@ -642,9 +655,9 @@ class ReviewerAgent(BaseAgent):
             "acceptance_criteria": criteria,
             "acceptance_gates": gate_results,
             "summary": (
-                "Accepted: revision executed and semantic consistency passed."
+                "Accepted: acceptance criteria satisfied."
                 if passed
-                else "Rejected: no effective change or semantic consistency failed."
+                else "Rejected: acceptance criteria not satisfied."
             ),
             "reason": semantic_summary,
             "source_agent": "reviewer",
@@ -659,11 +672,13 @@ class ReviewerAgent(BaseAgent):
             - Provides generalized, reusable verification gates
             - Keeps orchestration robust even when LLM omits criteria
         """
-        base = ["execution_changed", "semantic_preserved"]
+        base = ["semantic_preserved", "resolved_or_not_applicable"]
         if issue_type == IssueType.LOGICAL_CONTRADICTION:
-            return base + ["contradiction_resolved"]
+            return base + ["execution_changed", "contradiction_resolved"]
         if issue_type in (IssueType.CLAIM_EVIDENCE_GAP, IssueType.UNSUPPORTED_GENERALIZATION):
-            return base + ["evidence_sufficient"]
+            return base + ["execution_changed", "evidence_sufficient"]
+        if issue_type == IssueType.STRUCTURE_QUALITY:
+            return base + ["execution_changed", "structure_coherent"]
         return base
 
     @staticmethod
@@ -677,6 +692,8 @@ class ReviewerAgent(BaseAgent):
             "style_check": IssueType.STYLE_NOISE,
             "fix_latex": IssueType.LATEX_FORMAT,
             "layout": IssueType.LAYOUT_CONSTRAINT,
+            "structure": IssueType.STRUCTURE_QUALITY,
+            "structure_check": IssueType.STRUCTURE_QUALITY,
         }
         if value in aliases:
             return aliases[value]

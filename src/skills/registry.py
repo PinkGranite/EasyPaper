@@ -103,7 +103,7 @@ class SkillRegistry:
 
             # Include venue_profile if it matches the requested venue
             elif skill.type == "venue_profile" and venue:
-                if skill.name == venue or venue.lower() in skill.name.lower():
+                if self._venue_matches(skill_name=skill.name, venue=venue):
                     if "*" in skill.target_sections or section_type in skill.target_sections:
                         results.append(skill)
 
@@ -136,9 +136,33 @@ class SkillRegistry:
         venue_lower = venue.lower()
         for skill in self._skills.values():
             if skill.type == "venue_profile":
-                if skill.name == venue_lower or venue_lower in skill.name.lower():
+                if self._venue_matches(skill_name=skill.name, venue=venue):
                     return skill
         return None
+
+    @staticmethod
+    def _venue_matches(skill_name: str, venue: str) -> bool:
+        """
+        Runtime venue matcher with tolerant normalization.
+        """
+        if not skill_name or not venue:
+            return False
+        s = str(skill_name).strip().lower()
+        v = str(venue).strip().lower()
+        if s == v:
+            return True
+        # Normalize separators and keep alnum tokens only.
+        s_tokens = [t for t in "".join(ch if ch.isalnum() else " " for ch in s).split() if t]
+        v_tokens = [t for t in "".join(ch if ch.isalnum() else " " for ch in v).split() if t]
+        if not s_tokens or not v_tokens:
+            return s in v or v in s
+        s_join = " ".join(s_tokens)
+        v_join = " ".join(v_tokens)
+        if s_join in v_join or v_join in s_join:
+            return True
+        # Token overlap rule: venue mention contains the profile key token.
+        # e.g. "nature portfolio" -> matches "nature"
+        return any(tok == s_join for tok in v_tokens) or (s_tokens[0] in v_tokens)
 
     def list_all(self) -> List[Dict[str, Any]]:
         """

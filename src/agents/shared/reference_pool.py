@@ -67,25 +67,59 @@ class ReferencePool:
             serpapi_api_key=cfg.get("serpapi_api_key"),
             semantic_scholar_api_key=cfg.get("semantic_scholar_api_key"),
             timeout=cfg.get("timeout", 10),
+            semantic_scholar_min_results_before_fallback=cfg.get(
+                "semantic_scholar_min_results_before_fallback", 3
+            ),
+            enable_query_cache=cfg.get("enable_query_cache", True),
+            cache_ttl_hours=cfg.get("cache_ttl_hours", 24),
         )
 
         resolved: List[str] = []
+        enrichment_hits: List[Dict[str, Any]] = []
         for ref_str in initial_refs:
-            if re.search(r"@\w+\{", ref_str):
-                resolved.append(ref_str)
-                continue
-            # Plain text — try to search
-            query = cls._extract_search_query(ref_str)
+            is_bib = bool(re.search(r"@\w+\{", ref_str))
+            query = cls._extract_search_query_from_reference(ref_str)
             if not query:
                 resolved.append(ref_str)
                 continue
             try:
                 result = await tool.execute(query=query, max_results=1)
                 papers = (result.data or {}).get("papers", []) if result.success else []
-                if papers and papers[0].get("bibtex"):
-                    resolved.append(papers[0]["bibtex"])
-                    logger.info("ref_pool.search_resolved query='%s' -> %s",
-                                query[:60], papers[0].get("bibtex_key", "?"))
+                if papers:
+                    top = papers[0]
+                    logger.info(
+                        "ref_pool.search_resolved query='%s' -> %s",
+                        query[:60], top.get("bibtex_key", "?"),
+                    )
+                    if is_bib:
+                        # Keep user-provided BibTeX key/entry for stability, enrich metadata only.
+                        resolved.append(ref_str)
+                        enrichment_hits.append(
+                            {
+                                "hint_ref_id": cls._extract_bibtex_key(ref_str),
+                                "hint_title": cls._extract_bibtex_title(ref_str),
+                                "paper": top,
+                            }
+                        )
+                    elif top.get("bibtex"):
+                        resolved.append(top["bibtex"])
+                        # Also enrich parsed core ref with abstract/venue/citation metadata.
+                        enrichment_hits.append(
+                            {
+                                "hint_ref_id": top.get("bibtex_key", ""),
+                                "hint_title": top.get("title", ""),
+                                "paper": top,
+                            }
+                        )
+                    else:
+                        resolved.append(ref_str)
+                        enrichment_hits.append(
+                            {
+                                "hint_ref_id": "",
+                                "hint_title": top.get("title", ""),
+                                "paper": top,
+                            }
+                        )
                 else:
                     logger.info("ref_pool.search_miss query='%s', using heuristic", query[:60])
                     resolved.append(ref_str)
@@ -93,8 +127,10 @@ class ReferencePool:
                 logger.warning("ref_pool.search_error query='%s': %s", query[:60], exc)
                 resolved.append(ref_str)
             await asyncio.sleep(1.0)
-
-        return cls(resolved)
+        pool = cls(resolved)
+        if enrichment_hits:
+            pool._enrich_core_refs_from_search_hits(enrichment_hits)
+        return pool
 
     @staticmethod
     def _extract_search_query(plaintext: str) -> str:
@@ -117,6 +153,71 @@ class ReferencePool:
         if first_author and year_str:
             return f"{first_author} {year_str}"
         return plaintext[:120]
+
+    @staticmethod
+    def _extract_search_query_from_reference(reference: str) -> str:
+        """
+        Extract a robust search query from either BibTeX or plain-text reference.
+        """
+        if re.search(r"@\w+\{", reference):
+            title = ReferencePool._extract_bibtex_title(reference)
+            if title and len(title.strip()) > 8:
+                return title.strip()
+            key = ReferencePool._extract_bibtex_key(reference)
+            return key or reference[:120]
+        return ReferencePool._extract_search_query(reference)
+
+    @staticmethod
+    def _extract_bibtex_key(bibtex: str) -> str:
+        match = re.search(r"@\w+\{([^,]+),", bibtex)
+        return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def _extract_bibtex_title(bibtex: str) -> str:
+        match = re.search(r"title\s*=\s*[{\"]([^}\"]+)[}\"]", bibtex, re.IGNORECASE)
+        return match.group(1).strip() if match else ""
+
+    @staticmethod
+    def _norm_text(text: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+    def _enrich_core_refs_from_search_hits(self, hits: List[Dict[str, Any]]) -> None:
+        """
+        Enrich core references with abstract/venue/citation metadata from search hits.
+        """
+        for hit in hits:
+            paper = hit.get("paper") or {}
+            if not isinstance(paper, dict):
+                continue
+            hint_ref_id = hit.get("hint_ref_id", "")
+            hint_title = self._norm_text(hit.get("hint_title", ""))
+            paper_title_norm = self._norm_text(paper.get("title", ""))
+            target = None
+            for core in self._core_refs:
+                if hint_ref_id and core.get("ref_id") == hint_ref_id:
+                    target = core
+                    break
+                core_title_norm = self._norm_text(core.get("title", ""))
+                if hint_title and core_title_norm and core_title_norm == hint_title:
+                    target = core
+                    break
+                if paper_title_norm and core_title_norm and core_title_norm == paper_title_norm:
+                    target = core
+                    break
+            if not target:
+                continue
+            if paper.get("title"):
+                target["title"] = target.get("title") or paper.get("title")
+            if paper.get("year") and not target.get("year"):
+                target["year"] = paper.get("year")
+            if paper.get("authors"):
+                existing_authors = target.get("authors")
+                if not existing_authors:
+                    target["authors"] = " and ".join(paper.get("authors", []))
+            target["abstract"] = paper.get("abstract", target.get("abstract", ""))
+            target["venue"] = paper.get("venue", target.get("venue", ""))
+            target["citation_count"] = paper.get("citation_count", target.get("citation_count"))
+            target["source"] = target.get("source", "core_search_enriched")
 
     # ------------------------------------------------------------------
     # Public properties

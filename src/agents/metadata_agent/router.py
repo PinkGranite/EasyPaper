@@ -232,6 +232,78 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
                     "description": "Custom output directory path",
                     "required": False,
                 },
+                "export_prompt_traces": {
+                    "type": "boolean",
+                    "description": "Whether to export section-level prompt and evidence traces",
+                    "required": False,
+                    "default": False,
+                },
+                "code_repository": {
+                    "type": "object",
+                    "description": "Optional code/docs repository source for section-aware writing support",
+                    "required": False,
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "enum": ["local_dir", "git_repo"],
+                            "description": "Source type: local folder or remote git repository",
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Required when type=local_dir; local folder path",
+                            "required": False,
+                        },
+                        "url": {
+                            "type": "string",
+                            "description": "Required when type=git_repo; repository URL",
+                            "required": False,
+                        },
+                        "ref": {
+                            "type": "string",
+                            "description": "Optional git branch/tag/commit (default: main)",
+                            "required": False,
+                            "default": "main",
+                        },
+                        "subdir": {
+                            "type": "string",
+                            "description": "Optional sub-directory inside repository to scan",
+                            "required": False,
+                        },
+                        "include_globs": {
+                            "type": "array",
+                            "items": "string",
+                            "description": "Optional include glob patterns",
+                            "required": False,
+                            "default": [],
+                        },
+                        "exclude_globs": {
+                            "type": "array",
+                            "items": "string",
+                            "description": "Optional exclude glob patterns",
+                            "required": False,
+                            "default": [],
+                        },
+                        "max_files": {
+                            "type": "integer",
+                            "description": "Maximum number of files to ingest",
+                            "required": False,
+                            "default": 5000,
+                        },
+                        "max_total_bytes": {
+                            "type": "integer",
+                            "description": "Maximum bytes to ingest across all files",
+                            "required": False,
+                            "default": 200000000,
+                        },
+                        "on_error": {
+                            "type": "string",
+                            "enum": ["fallback", "strict"],
+                            "description": "Failure policy: fallback to normal flow or abort",
+                            "required": False,
+                            "default": "fallback",
+                        },
+                    },
+                },
             },
             "example": {
                 "title": "TransKG: Knowledge Graph Completion with Transformers",
@@ -245,6 +317,14 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
                 "template_path": "example_jsons/icml2026.zip",
                 "style_guide": "ICML",
                 "compile_pdf": True,
+                "code_repository": {
+                    "type": "local_dir",
+                    "path": "examples/project_code",
+                    "include_globs": ["**/*.py", "**/*.md"],
+                    "exclude_globs": ["**/.git/**", "**/venv/**"],
+                    "on_error": "fallback",
+                },
+                "export_prompt_traces": False,
             },
         }
     
