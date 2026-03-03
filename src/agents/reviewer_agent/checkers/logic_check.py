@@ -11,8 +11,6 @@ import logging
 import re
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
 
-from openai import AsyncOpenAI
-
 from .base import FeedbackChecker
 
 if TYPE_CHECKING:
@@ -76,7 +74,7 @@ class LogicChecker(FeedbackChecker):
 
     def __init__(
         self,
-        llm_client: AsyncOpenAI,
+        llm_client,
         model_name: str,
         skill_registry: Optional["SkillRegistry"] = None,
     ):

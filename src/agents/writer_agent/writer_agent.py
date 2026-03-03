@@ -38,24 +38,34 @@ CRITICAL RULES:
 3. Use \\cite{reference_id} for all citations
 4. Use \\ref{label} for cross-references
 5. Use \\includegraphics{figure_id} for figures (just the ID, no path)
-6. Maintain formal academic writing style
-7. Be precise and evidence-based
-8. Structure content logically:
-8.1 If the user prompt includes a "Structure Quality Contract", treat it as **mandatory**.
+6. FIGURE PLACEMENT: Each figure environment (\\begin{figure}...\\end{figure}) must appear
+   AT MOST ONCE in this section. NEVER create duplicate figure environments for the same figure.
+   If a figure is listed as "REFERENCE ONLY", use \\ref{fig:...} to refer to it — do NOT
+   create a \\begin{figure} environment for it.
+7. Maintain formal academic writing style
+8. Be precise and evidence-based
+9. Structure content logically:
+9.1 If the user prompt includes a "Structure Quality Contract", treat it as **mandatory**.
     Follow its subsection policy exactly — if it says DO NOT use \\subsection{}, you must not.
-8.2 Only use \\subsection{} commands when the Structure Quality Contract explicitly recommends them.
+9.2 Only use \\subsection{} commands when the Structure Quality Contract explicitly recommends them.
     By default, prefer continuous narrative prose with paragraph-level transitions.
-9. CITATION CONSTRAINT: You MUST ONLY use citation keys that are explicitly provided in the resources/references list. 
+10. CITATION CONSTRAINT: You MUST ONLY use citation keys that are explicitly provided in the resources/references list. 
    DO NOT invent, hallucinate, or use any citation keys that are not in the provided list.
    DO NOT use placeholder citations like \\cite{need_citation} or similar.
    If you need to cite something but no suitable reference is provided, simply omit the \\cite command entirely and describe the concept without citation.
-10. NEVER use Markdown formatting. This is a LaTeX document, NOT Markdown.
+11. NEVER use Markdown formatting. This is a LaTeX document, NOT Markdown.
     - NO **bold** or __bold__ — use \\textbf{bold}
     - NO *italic* or _italic_ — use \\textit{italic}
     - NO ## headings — use \\subsection{} or \\subsubsection{}
     - NO - bullet lists — use \\begin{itemize} ... \\item ... \\end{itemize}
     - NO 1. numbered lists — use \\begin{enumerate} ... \\item ... \\end{enumerate}
     - NO `code` backticks — use \\texttt{code}
+12. CODE EVIDENCE RULE: NEVER reference specific code file names, file paths,
+    or repository structure in the generated text. Code evidence is provided
+    to help you understand the methods — describe algorithms and techniques
+    conceptually (e.g., "a fine-tuned BERT classifier", "convex hull volume
+    computation") rather than citing implementation files (e.g., do NOT write
+    "implemented in \\texttt{code/classify.py}").
 
 ACADEMIC WRITING BASELINE (always enforce):
 1. Use present tense for describing methods and general conclusions;

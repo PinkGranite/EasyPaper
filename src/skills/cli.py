@@ -21,7 +21,7 @@ import yaml
 
 def cmd_register(args):
     """Register a new skill from instruction + reference URL."""
-    from openai import AsyncOpenAI
+    from ..agents.shared.llm_client import LLMClient
     from .generator import SkillGenerator
     from .registry import SkillRegistry
     from .loader import SkillLoader
@@ -44,7 +44,7 @@ def cmd_register(args):
         print("Error: OPENAI_API_KEY environment variable is required.")
         sys.exit(1)
 
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+    client = LLMClient(api_key=api_key, base_url=base_url)
     generator = SkillGenerator(
         llm_client=client,
         model_name=model_name,

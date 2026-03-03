@@ -8,7 +8,7 @@ import json
 import logging
 from typing import Optional
 
-from openai import AsyncOpenAI
+from ...shared.llm_client import LLMClient
 
 from .base import VLMProvider
 from ..models import VLMResponse
@@ -56,7 +56,7 @@ class OpenAIVLM(VLMProvider):
         if base_url:
             client_kwargs["base_url"] = base_url
         
-        self.client = AsyncOpenAI(**client_kwargs)
+        self.client = LLMClient(**client_kwargs)
     
     @property
     def provider_name(self) -> str:

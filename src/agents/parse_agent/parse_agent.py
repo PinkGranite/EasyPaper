@@ -1,5 +1,5 @@
-from openai import AsyncOpenAI
 from langchain.messages import AnyMessage
+from ..shared.llm_client import LLMClient
 from typing_extensions import TypedDict, Annotated, Optional, IO
 from langgraph.graph import StateGraph, START, END
 import operator
@@ -47,7 +47,7 @@ class ParseAgentState(TypedDict):
 
 class ParseAgent(BaseAgent):
     def __init__(self, config: ModelConfig):
-        self.client = AsyncOpenAI(
+        self.client = LLMClient(
             api_key=config.api_key,
             base_url=config.base_url,
         )

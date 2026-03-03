@@ -8,9 +8,8 @@ decide when and how to call tools during generation and review.
 
 import time
 from typing import Any, Dict, List, Optional, Tuple
-from openai import AsyncOpenAI
-
 from .base import BaseAgent
+from .shared.llm_client import LLMClient
 from .shared.tools.base import WriterTool, ToolResult
 from .shared.tools.registry import ToolRegistry
 from ..config.schema import ModelConfig, ToolsConfig
@@ -34,7 +33,7 @@ class ReActAgent(BaseAgent):
     """
 
     def __init__(self, config: ModelConfig, tools_config: Optional[ToolsConfig] = None):
-        self.client = AsyncOpenAI(
+        self.client = LLMClient(
             api_key=config.api_key,
             base_url=config.base_url,
         )

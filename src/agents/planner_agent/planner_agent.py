@@ -12,9 +12,8 @@ import random
 from typing import List, Dict, Any, Optional
 
 from fastapi import APIRouter
-from openai import AsyncOpenAI
-
 from ..base import BaseAgent
+from ..shared.llm_client import LLMClient
 from ...config.schema import ModelConfig
 from .models import (
     PaperPlan,
@@ -179,6 +178,11 @@ IMPORTANT:
   like introduction or discussion where continuous prose flow is expected.
 - Do NOT set sectioning_recommended to true for introduction or discussion
   unless the section is exceptionally long and structurally complex.
+- FIGURE PLACEMENT RULES:
+  - Only include figures marked "DEFINE in this section" in the "figures" array.
+  - For figures marked "REFERENCE ONLY", use them in paragraphs' "figures_to_reference"
+    but do NOT add them to the "figures" array (they are defined elsewhere).
+  - NEVER create a \\begin{{figure}} environment for a REFERENCE ONLY figure.
 Output valid JSON only."""
 
 
@@ -209,7 +213,7 @@ class PlannerAgent(BaseAgent):
         """
         self.config = config
         self.model_name = config.model_name
-        self.client = AsyncOpenAI(
+        self.client = LLMClient(
             api_key=config.api_key,
             base_url=config.base_url,
         )
@@ -803,26 +807,49 @@ class PlannerAgent(BaseAgent):
         )
         sections: List[SectionPlan] = []
 
+        # Pre-assign figures to sections so each figure is DEFINED in
+        # exactly one section.  Other sections may still REFERENCE it.
+        figure_assignment = self._assign_figures_to_sections(
+            request.figures or [], section_order,
+        )
+
         for order, sec_info in enumerate(section_order):
             section_type = sec_info["section_type"]
             section_title = sec_info["section_title"]
 
+            # Abstract and conclusion are synthesis sections generated
+            # separately; skip Step 3 planning (no figures, no paragraphs).
+            if section_type in ("abstract", "conclusion"):
+                sections.append(SectionPlan(
+                    section_type=section_type,
+                    section_title=section_title,
+                    paragraphs=[],
+                    figures=[],
+                    tables=[],
+                    content_sources=self._get_default_sources(section_type),
+                    depends_on=self._get_dependencies(section_type),
+                    citation_budget={"target_refs": 0, "min_refs": 0, "max_refs": 0},
+                    order=order,
+                ))
+                logger.info("planner.step3_skip section=%s (synthesis)", section_type)
+                continue
+
             # Allocate word budget per section proportionally
-            if section_type == "abstract":
-                section_words = min(300, total_words // 10)
-            elif section_type == "conclusion":
-                section_words = min(500, total_words // 8)
+            alloc = (citation_strategy.get("section_allocation") or {}).get(section_type, {})
+            if isinstance(alloc, dict) and alloc.get("target_refs"):
+                total_target = int(citation_strategy.get("total_target", 1) or 1)
+                share = int(alloc.get("target_refs", 0)) / max(1, total_target)
+                section_words = max(400, int(total_words * max(share, 0.1)))
             else:
-                alloc = (citation_strategy.get("section_allocation") or {}).get(section_type, {})
-                if isinstance(alloc, dict) and alloc.get("target_refs"):
-                    # Use citation weight as a proxy for section importance
-                    total_target = int(citation_strategy.get("total_target", 1) or 1)
-                    share = int(alloc.get("target_refs", 0)) / max(1, total_target)
-                    section_words = max(400, int(total_words * max(share, 0.1)))
-                else:
-                    section_words = max(400, total_words // max(1, n_body))
+                section_words = max(400, total_words // max(1, n_body))
 
             section_paragraphs = max(1, section_words // WORDS_PER_PARAGRAPH)
+
+            # Build per-section figure info distinguishing DEFINE vs REFERENCE
+            section_figure_info = self._format_section_figure_info(
+                request.figures or [], figure_analyses or {},
+                section_type, figure_assignment,
+            )
 
             step3_prompt = STEP3_SECTION_USER.format(
                 section_type=section_type,
@@ -833,7 +860,7 @@ class PlannerAgent(BaseAgent):
                 section_words=section_words,
                 section_paragraphs=section_paragraphs,
                 contributions=", ".join(contributions) if contributions else "Not specified",
-                figure_info=figure_info,
+                figure_info=section_figure_info,
                 table_info=table_info,
                 reference_keys=", ".join(reference_keys) if reference_keys else "None",
                 code_writing_assets_summary=code_summary,
@@ -1886,50 +1913,90 @@ class PlannerAgent(BaseAgent):
             "\"planning_decision_trace\": [\"...\"]}"
         )
 
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": "You are an academic research analyst. Respond with JSON only."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-                max_tokens=1400,
-            )
-            raw = response.choices[0].message.content or ""
-            context = self._safe_load_json(raw, expected=dict)
-            if context is None:
-                # Retry once with a dedicated JSON-repair pass to reduce fallback rate.
-                repair_prompt = (
-                    "Convert the following model output into a STRICT valid JSON object. "
-                    "Keep only these keys: research_area, summary, key_papers, research_trends, gaps, "
-                    "claim_evidence_matrix, contribution_ranking, planning_decision_trace.\n"
-                    "Rules:\n"
-                    "- Output ONLY JSON object, no markdown/code fences.\n"
-                    "- If a field is missing, fill with empty default.\n"
-                    "- contribution_ranking must be an object with keys P0/P1/P2 (arrays).\n"
-                    "- claim_evidence_matrix and planning_decision_trace must be arrays.\n\n"
-                    f"Raw output:\n{raw[:12000]}"
+        max_attempts = 3
+        llm_raw_outputs: List[str] = []
+        context: Optional[Dict[str, Any]] = None
+
+        system_msg = "You are an academic research analyst. Respond with JSON only."
+        repair_system_msg = "You are a strict JSON fixer. Return JSON object only."
+        repair_prompt_template = (
+            "Convert the following model output into a STRICT valid JSON object. "
+            "Keep only these keys: research_area, summary, key_papers, research_trends, gaps, "
+            "claim_evidence_matrix, contribution_ranking, planning_decision_trace.\n"
+            "Rules:\n"
+            "- Output ONLY JSON object, no markdown/code fences.\n"
+            "- If a field is missing, fill with empty default.\n"
+            "- contribution_ranking must be an object with keys P0/P1/P2 (arrays).\n"
+            "- claim_evidence_matrix and planning_decision_trace must be arrays.\n\n"
+            "Raw output:\n{raw_output}"
+        )
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                temperature = max(0.1, 0.4 - 0.1 * attempt)
+                max_tokens = 1400 + 200 * (attempt - 1)
+
+                response = await self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=temperature,
+                    max_tokens=max_tokens,
                 )
+                raw = response.choices[0].message.content or ""
+                llm_raw_outputs.append(raw)
+                logger.info(
+                    "planner.research_context attempt=%d/%d raw_len=%d",
+                    attempt, max_attempts, len(raw),
+                )
+
+                context = self._safe_load_json(raw, expected=dict)
+                if context is not None:
+                    break
+
+                # JSON repair pass
                 repair_resp = await self.client.chat.completions.create(
                     model=self.model_name,
                     messages=[
+                        {"role": "system", "content": repair_system_msg},
                         {
-                            "role": "system",
-                            "content": "You are a strict JSON fixer. Return JSON object only.",
+                            "role": "user",
+                            "content": repair_prompt_template.format(
+                                raw_output=raw[:12000],
+                            ),
                         },
-                        {"role": "user", "content": repair_prompt},
                     ],
                     temperature=0.0,
-                    max_tokens=1400,
+                    max_tokens=max_tokens,
                 )
                 repaired_raw = repair_resp.choices[0].message.content or ""
-                context = self._safe_load_json(repaired_raw, expected=dict)
-            if context is None:
-                raise ValueError("Could not parse JSON object from research context output")
+                llm_raw_outputs.append(f"[repair_attempt_{attempt}] {repaired_raw}")
 
-            # Generate paper assignments
-            paper_assignments = self._assign_papers_to_sections(plan, discovered)
+                context = self._safe_load_json(repaired_raw, expected=dict)
+                if context is not None:
+                    logger.info(
+                        "planner.research_context attempt=%d/%d parsed via repair",
+                        attempt, max_attempts,
+                    )
+                    break
+
+                logger.warning(
+                    "planner.research_context attempt=%d/%d parse_failed",
+                    attempt, max_attempts,
+                )
+
+            except Exception as e:
+                logger.warning(
+                    "planner.research_context attempt=%d/%d error: %s",
+                    attempt, max_attempts, e,
+                )
+
+        # Build paper assignments (always deterministic)
+        paper_assignments = self._assign_papers_to_sections(plan, discovered)
+
+        if context is not None:
             fallback_context = self._build_context_fallback_payload(
                 plan=plan,
                 discovered=discovered,
@@ -1967,13 +2034,18 @@ class PlannerAgent(BaseAgent):
                 "paper_assignments": paper_assignments,
             }
 
-        except Exception as e:
-            logger.warning("planner.context_generation_error: %s", e)
-            return self._build_context_fallback_payload(
-                plan=plan,
-                discovered=discovered,
-                all_papers=all_papers,
-            )
+        # All attempts failed — build fallback and attach raw LLM outputs
+        logger.warning(
+            "planner.research_context all %d attempts failed, using fallback",
+            max_attempts,
+        )
+        fallback = self._build_context_fallback_payload(
+            plan=plan,
+            discovered=discovered,
+            all_papers=all_papers,
+        )
+        fallback["_llm_raw_outputs"] = llm_raw_outputs
+        return fallback
 
     def _assign_papers_to_sections(
         self,
@@ -2644,6 +2716,131 @@ class PlannerAgent(BaseAgent):
             logger.warning("planner.json_parse_error, using defaults")
             return {}
         return parsed
+
+    @staticmethod
+    def _assign_figures_to_sections(
+        figures: List[Any],
+        section_order: List[Dict[str, str]],
+    ) -> Dict[str, str]:
+        """
+        Assign each figure to exactly one section for definition.
+        - **Description**:
+            - Uses the figure's suggested section if it matches a planned section
+            - Falls back to heuristic matching by section_type base name
+            - Unmatched figures go to the first body section
+
+        - **Args**:
+            - `figures` (list): Figure specs with id, section, caption
+            - `section_order` (list): Planned sections from Step 1
+
+        - **Returns**:
+            - `assignment` (Dict[str, str]): figure_id -> section_type
+        """
+        body_sections = [
+            s["section_type"] for s in section_order
+            if s["section_type"] not in ("abstract", "conclusion")
+        ]
+        first_body = body_sections[0] if body_sections else "introduction"
+
+        # Build a lookup: base_type -> list of actual section_types
+        # e.g. "result" -> ["result", "result_2", "result_3"]
+        base_to_sections: Dict[str, List[str]] = {}
+        for st in body_sections:
+            base = re.sub(r'_\d+$', '', st)
+            base_to_sections.setdefault(base, []).append(st)
+
+        assignment: Dict[str, str] = {}
+        section_fig_count: Dict[str, int] = {s: 0 for s in body_sections}
+
+        for fig in figures:
+            fig_id = fig.id
+            suggested = getattr(fig, "section", None) or ""
+
+            assigned = False
+            # Try exact match with suggested section
+            if suggested in body_sections:
+                assignment[fig_id] = suggested
+                section_fig_count[suggested] += 1
+                assigned = True
+            elif suggested:
+                # Try base-name match
+                suggested_base = re.sub(r'_\d+$', '', suggested.lower())
+                candidates = base_to_sections.get(suggested_base, [])
+                if candidates:
+                    # Pick the candidate with fewest assigned figures
+                    best = min(candidates, key=lambda s: section_fig_count[s])
+                    assignment[fig_id] = best
+                    section_fig_count[best] += 1
+                    assigned = True
+
+            if not assigned:
+                # Assign to the body section with fewest figures
+                best = min(body_sections, key=lambda s: section_fig_count[s])
+                assignment[fig_id] = best
+                section_fig_count[best] += 1
+
+        logger.info(
+            "planner.figure_assignment %s",
+            {k: v for k, v in assignment.items()},
+        )
+        return assignment
+
+    @staticmethod
+    def _format_section_figure_info(
+        figures: List[Any],
+        analyses: Dict[str, Any],
+        section_type: str,
+        figure_assignment: Dict[str, str],
+    ) -> str:
+        """
+        Format figure info for a specific section, distinguishing DEFINE vs REFERENCE.
+        - **Description**:
+            - Figures assigned to this section are marked "DEFINE HERE"
+            - Other figures are listed as "REFERENCE ONLY (defined elsewhere)"
+
+        - **Args**:
+            - `figures` (list): All figure specs
+            - `analyses` (dict): VLM analyses
+            - `section_type` (str): Current section being planned
+            - `figure_assignment` (dict): figure_id -> assigned section_type
+
+        - **Returns**:
+            - Formatted string for the prompt
+        """
+        if not figures:
+            return "None provided"
+
+        define_lines = []
+        reference_lines = []
+
+        for fig in figures:
+            line = f"- {fig.id}: {fig.caption}"
+            if fig.description:
+                line += f" ({fig.description})"
+            vlm = analyses.get(fig.id)
+            if vlm:
+                line += f" [VLM: role={getattr(vlm, 'semantic_role', '')}, message={getattr(vlm, 'message', '')}]"
+
+            assigned_to = figure_assignment.get(fig.id)
+            if assigned_to == section_type:
+                define_lines.append(line)
+            else:
+                reference_lines.append(line)
+
+        parts = []
+        if define_lines:
+            parts.append(
+                "**DEFINE in this section** (include \\begin{figure}...\\end{figure}):\n"
+                + "\n".join(define_lines)
+            )
+        if reference_lines:
+            parts.append(
+                "**REFERENCE ONLY** (use \\ref{fig:...}, do NOT create \\begin{figure}):\n"
+                + "\n".join(reference_lines)
+            )
+        if not parts:
+            return "None assigned to this section"
+        return "\n\n".join(parts)
 
     @staticmethod
     def _format_figure_info(

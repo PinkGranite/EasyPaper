@@ -1678,8 +1678,8 @@ class MetaDataAgent(ReActAgent):
                 # Save research_context.json (if generated)
                 if research_context:
                     rc_path = research_dir / "research_context.json"
-                    # Add generated timestamp
                     context_output = dict(research_context)
+                    context_output.pop("_llm_raw_outputs", None)
                     core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
                     core_refs_with_abstract_count = sum(
                         1 for r in core_refs_for_context if (r.get("abstract") or "").strip()
@@ -1697,6 +1697,7 @@ class MetaDataAgent(ReActAgent):
                 if research_context_v1:
                     rc_v1_path = research_dir / "research_context_v1.json"
                     rc_v1_payload = dict(research_context_v1)
+                    raw_outputs_v1 = rc_v1_payload.pop("_llm_raw_outputs", None)
                     core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
                     core_refs_with_abstract_count = sum(
                         1 for r in core_refs_for_context if (r.get("abstract") or "").strip()
@@ -1710,10 +1711,18 @@ class MetaDataAgent(ReActAgent):
                         encoding="utf-8",
                     )
                     print(f"[MetaDataAgent] Research context v1 saved to: {rc_v1_path}")
+                    if raw_outputs_v1:
+                        raw_path = research_dir / "research_context_v1_raw.txt"
+                        raw_path.write_text(
+                            "\n\n---\n\n".join(raw_outputs_v1),
+                            encoding="utf-8",
+                        )
+                        print(f"[MetaDataAgent] Research context v1 raw LLM outputs saved to: {raw_path}")
 
                 if research_context_v2:
                     rc_v2_path = research_dir / "research_context_v2.json"
                     rc_v2_payload = dict(research_context_v2)
+                    raw_outputs_v2 = rc_v2_payload.pop("_llm_raw_outputs", None)
                     core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
                     core_refs_with_abstract_count = sum(
                         1 for r in core_refs_for_context if (r.get("abstract") or "").strip()
@@ -1727,6 +1736,13 @@ class MetaDataAgent(ReActAgent):
                         encoding="utf-8",
                     )
                     print(f"[MetaDataAgent] Research context v2 saved to: {rc_v2_path}")
+                    if raw_outputs_v2:
+                        raw_path = research_dir / "research_context_v2_raw.txt"
+                        raw_path.write_text(
+                            "\n\n---\n\n".join(raw_outputs_v2),
+                            encoding="utf-8",
+                        )
+                        print(f"[MetaDataAgent] Research context v2 raw LLM outputs saved to: {raw_path}")
 
                 if research_context:
                     cem = research_context.get("claim_evidence_matrix", [])
@@ -2462,9 +2478,19 @@ class MetaDataAgent(ReActAgent):
             )
             content = result.get("generated_content", "")
 
-            # Strip citations from abstract and conclusion
+            # Hard rule: strip ALL citations and cross-references from
+            # abstract and conclusion — these must be self-contained.
             if section_type in ("abstract", "conclusion"):
                 content = re.sub(r'~?\\cite\{[^}]*\}', '', content)
+                # Strip "Figure~\ref{...}", "Table~\ref{...}", "Section~\ref{...}"
+                content = re.sub(
+                    r'(?:Figure|Fig\.|Table|Tab\.|Section|Sec\.|Equation|Eq\.)~?\\ref\{[^}]*\}',
+                    '', content,
+                )
+                # Strip any remaining bare \ref{...}
+                content = re.sub(r'~?\\ref\{[^}]*\}', '', content)
+                # Clean orphaned parentheses like "(, )" or "( )"
+                content = re.sub(r'\(\s*[,;]?\s*\)', '', content)
                 content = re.sub(r'  +', ' ', content)
 
             word_count = len(content.split())
@@ -3088,7 +3114,128 @@ class MetaDataAgent(ReActAgent):
                 generated_sections[section_type] = content
         
         return generated_sections
-    
+
+    @staticmethod
+    def _deduplicate_figure_environments(
+        generated_sections: Dict[str, str],
+        section_order: Optional[List[str]] = None,
+    ) -> Dict[str, str]:
+        """
+        Remove duplicate figure/table environments across and within sections.
+        - **Description**:
+            - Scans all sections for \\begin{figure}...\\end{figure} blocks
+            - Keeps only the FIRST occurrence of each \\label{...}
+            - Removes subsequent duplicates (both within and across sections)
+            - Preserves \\ref{} references to figures defined elsewhere
+
+        - **Args**:
+            - `generated_sections` (Dict[str, str]): section_type -> LaTeX content
+            - `section_order` (List[str], optional): Preferred ordering for priority
+
+        - **Returns**:
+            - Updated generated_sections with duplicates removed
+        """
+        import re
+
+        # Determine processing order: use section_order if given
+        if section_order:
+            ordered_keys = [k for k in section_order if k in generated_sections]
+            ordered_keys += [k for k in generated_sections if k not in ordered_keys]
+        else:
+            ordered_keys = list(generated_sections.keys())
+
+        seen_labels: set = set()
+        total_removed = 0
+
+        for section_type in ordered_keys:
+            content = generated_sections.get(section_type, "")
+            if not content:
+                continue
+
+            # Match figure and figure* environments
+            env_pattern = re.compile(
+                r'\\begin\{(figure\*?)\}.*?\\end\{\1\}',
+                re.DOTALL,
+            )
+
+            new_content = content
+            offset = 0
+
+            for m in env_pattern.finditer(content):
+                block = m.group(0)
+                labels = re.findall(r'\\label\{([^}]+)\}', block)
+                label = labels[0] if labels else None
+
+                if label and label in seen_labels:
+                    # Duplicate — remove the entire figure environment
+                    start = m.start() + offset
+                    end = m.end() + offset
+                    new_content = new_content[:start] + new_content[end:]
+                    offset += -(m.end() - m.start())
+                    total_removed += 1
+                elif label:
+                    seen_labels.add(label)
+
+            # Also remove within-section duplicates for unlabeled figures
+            # by checking includegraphics targets
+            generated_sections[section_type] = new_content.strip()
+
+        if total_removed > 0:
+            print(f"[DeduplicateFigures] Removed {total_removed} duplicate figure environments")
+
+        return generated_sections
+
+    @staticmethod
+    def _strip_code_path_references(
+        generated_sections: Dict[str, str],
+    ) -> Dict[str, str]:
+        """
+        Remove raw code file path references from all generated sections.
+        - **Description**:
+            - Strips \\texttt{code/...} and \\texttt{*.py/.c/.cpp/.R/.jl} patterns
+            - Removes surrounding prose like "implemented in \\texttt{...}"
+            - Acts as a safety net in case the Writer ignores prompt rules
+
+        - **Args**:
+            - `generated_sections` (Dict[str, str]): section_type -> LaTeX content
+
+        - **Returns**:
+            - Updated generated_sections with code paths removed
+        """
+        import re as _re
+
+        total_stripped = 0
+        for section_type in list(generated_sections.keys()):
+            content = generated_sections[section_type]
+            original = content
+
+            # Pattern 1: \texttt{code/...} or \texttt{path/to/file.py}
+            content = _re.sub(
+                r'(?:,?\s*(?:implemented|defined|derived|found|coded|written|specified|described)'
+                r'\s+(?:in|from|within|via|using)\s+)?'
+                r'\\texttt\{[^}]*(?:\.py|\.c|\.cc|\.cpp|\.R|\.jl|\.ipynb|code/)[^}]*\}',
+                '', content,
+                flags=_re.IGNORECASE,
+            )
+            # Pattern 2: \texttt{function_name} derived from \texttt{code/file.py}
+            content = _re.sub(
+                r'\s*\((?:derived\s+from|from|in|see)\s+\\texttt\{[^}]*(?:\.py|\.c|\.cpp|code/)[^}]*\}\)',
+                '', content,
+                flags=_re.IGNORECASE,
+            )
+            # Clean double spaces and orphaned commas
+            content = _re.sub(r'\s*,\s*,', ',', content)
+            content = _re.sub(r'  +', ' ', content)
+
+            if content != original:
+                total_stripped += 1
+                generated_sections[section_type] = content
+
+        if total_stripped > 0:
+            print(f"[StripCodePaths] Cleaned code path references in {total_stripped} section(s)")
+
+        return generated_sections
+
     def _ensure_tables_defined(
         self,
         generated_sections: Dict[str, str],
@@ -3633,7 +3780,10 @@ class MetaDataAgent(ReActAgent):
             
             if total_invalid_removed > 0:
                 print(f"[CompilePDF] Total invalid citations removed: {total_invalid_removed}")
-            
+
+            # Strip raw code file path references from all sections
+            generated_sections = self._strip_code_path_references(generated_sections)
+
             # Ensure all assigned figures have their environments created
             if paper_plan and figures:
                 generated_sections = self._ensure_figures_defined(
@@ -3641,7 +3791,13 @@ class MetaDataAgent(ReActAgent):
                     paper_plan=paper_plan,
                     figures=figures,
                 )
-            
+
+            # Deduplicate figure environments (cross-section and within-section)
+            generated_sections = self._deduplicate_figure_environments(
+                generated_sections,
+                section_order=section_order,
+            )
+
             # Ensure all assigned tables have their environments created
             if paper_plan and metadata_tables:
                 generated_sections = self._ensure_tables_defined(

@@ -1153,12 +1153,17 @@ Synthesize a concise abstract (150-250 words) from the following paper sections.
 ## Hard Constraints (Highest Priority)
 - If any instruction conflicts with this block, follow this block.
 - Do NOT include any citations (\\cite{{...}}) in the abstract.
+- Do NOT include any cross-references: NO \\ref{{...}}, NO Figure~\\ref{{...}},
+  NO Table~\\ref{{...}}, NO Section~\\ref{{...}}. The abstract must be fully
+  self-contained — a reader should understand it without seeing any figures,
+  tables, or section numbers.
 - Keep the abstract self-contained and concise.
 
 ## Output Requirements
 - Generate ONLY the abstract text
 - Do NOT include \\begin{abstract} or any LaTeX commands
 - Do NOT include any citations (\\cite{...}) — abstracts must be self-contained
+- Do NOT reference any figures, tables, or sections by number or label
 - Write in third person, present/past tense
 - Be specific about results (include numbers if available)
 """
@@ -1200,11 +1205,15 @@ Write a conclusion that synthesizes the paper's contributions and findings.
 ## Hard Constraints (Highest Priority)
 - If any instruction conflicts with this block, follow this block.
 - Do NOT include any citations (\\cite{{...}}) in the conclusion.
+- Do NOT include any cross-references: NO \\ref{{...}}, NO Figure~\\ref{{...}},
+  NO Table~\\ref{{...}}, NO Section~\\ref{{...}}. The conclusion must stand
+  on its own without referencing specific figures, tables, or sections.
 
 ## Output Requirements
 - Generate LaTeX content for the Conclusion section body
 - Do NOT include \\section{Conclusion}
 - Do NOT include any citations (\\cite{...}) — conclusions must stand alone
+- Do NOT reference any figures, tables, or sections by number or label
 - Be concise but comprehensive
 - End on a forward-looking note
 """

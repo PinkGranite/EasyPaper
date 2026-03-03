@@ -136,6 +136,16 @@ def _readme_priority_boost(path: str) -> int:
 
 
 def _build_summary(path: str, symbols: List[str], text: str, role_tags: List[str]) -> str:
+    """
+    Build a semantic summary WITHOUT exposing the raw file path.
+    - **Description**:
+        - Produces a human-readable description of what the file contains
+        - Uses symbol names, role tags, or first line of content
+        - File paths are deliberately excluded to prevent leakage into
+          generated paper text.
+    """
+    # Use just the stem as a short module hint (no directory or extension)
+    stem = os.path.splitext(os.path.basename(path))[0]
     first_non_empty = ""
     for line in text.splitlines():
         stripped = line.strip()
@@ -143,12 +153,12 @@ def _build_summary(path: str, symbols: List[str], text: str, role_tags: List[str
             first_non_empty = stripped
             break
     if symbols:
-        return f"{path}: defines/contains {', '.join(symbols[:4])}"
+        return f"[{stem}] defines: {', '.join(symbols[:4])}"
     if role_tags:
-        return f"{path}: likely {'/'.join(role_tags[:2])} implementation surface"
+        return f"[{stem}] role: {'/'.join(role_tags[:2])} implementation"
     if first_non_empty:
-        return f"{path}: {first_non_empty[:120]}"
-    return f"{path}: content available"
+        return f"[{stem}] {first_non_empty[:120]}"
+    return f"[{stem}] supporting code module"
 
 
 def _safe_read_text(path: Path, max_bytes: int = 256_000) -> Optional[str]:
@@ -636,21 +646,25 @@ def format_code_context_for_prompt(
     if not chosen and not writing_assets:
         return ""
 
-    lines: List[str] = ["## Code Evidence Map"]
+    lines: List[str] = [
+        "## Code Evidence Map",
+        "(Use these as grounding for method/algorithm descriptions. "
+        "Do NOT mention file names or paths in the paper text.)",
+    ]
     if not chosen:
         lines.append("- No high-confidence evidence selected for this section.")
     for idx, ev in enumerate(chosen, start=1):
         ev_id = ev.get("evidence_id", f"runtime_{idx}")
-        lines.append(f"- `{ev_id}` -> `{ev.get('path', '')}`")
+        why = ev.get("why_relevant", "") or ev.get("purpose", "")
         symbol = ev.get("symbol", "")
-        if symbol:
-            lines.append(f"  - Symbols: {symbol}")
-        why = ev.get("why_relevant", "")
-        if why:
-            lines.append(f"  - Purpose: {why}")
+        # Show semantic purpose only — no file paths
+        desc = why if why else (f"Defines: {symbol}" if symbol else "Supporting evidence")
+        lines.append(f"- `{ev_id}`: {desc}")
+        if symbol and why:
+            lines.append(f"  - Key symbols: {symbol}")
         snippet = (ev.get("snippet", "") or "").strip()
         if snippet:
-            lines.append("  - Snippet:")
+            lines.append("  - Implementation detail:")
             lines.append("```text")
             lines.append(snippet[:700])
             lines.append("```")

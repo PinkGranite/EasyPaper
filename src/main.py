@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import logging
 from typing import Tuple, Set
-from openai import AsyncOpenAI
+from .agents.shared.llm_client import LLMClient
 from .config import load_config
 from .config.schema import SkillsConfig
 from .agents import initialize_agents, register_agent_routers
@@ -24,7 +24,7 @@ async def _validate_chat_connection(
     """
     Validate an OpenAI-compatible chat endpoint with a tiny completion call.
     """
-    client = AsyncOpenAI(
+    client = LLMClient(
         api_key=api_key,
         base_url=base_url,
     )

@@ -10,9 +10,8 @@ import json
 import re
 from typing import List, Dict, Any, Optional, Type, TYPE_CHECKING
 from fastapi import APIRouter
-from openai import AsyncOpenAI
-
 from ..base import BaseAgent
+from ..shared.llm_client import LLMClient
 from ...config.schema import ModelConfig
 from .models import (
     ReviewContext,
@@ -98,7 +97,7 @@ class ReviewerAgent(BaseAgent):
 
         # LogicChecker: needs LLM client
         try:
-            llm_client = AsyncOpenAI(
+            llm_client = LLMClient(
                 api_key=self.config.api_key,
                 base_url=self.config.base_url,
             )
@@ -228,7 +227,7 @@ class ReviewerAgent(BaseAgent):
         context_block = "\n".join(context_parts) if context_parts else "No context available."
 
         try:
-            llm_client = AsyncOpenAI(
+            llm_client = LLMClient(
                 api_key=self.config.api_key,
                 base_url=self.config.base_url,
             )
@@ -508,7 +507,7 @@ class ReviewerAgent(BaseAgent):
 
         llm_output: Dict[str, Any] = {}
         try:
-            llm_client = AsyncOpenAI(
+            llm_client = LLMClient(
                 api_key=self.config.api_key,
                 base_url=self.config.base_url,
             )

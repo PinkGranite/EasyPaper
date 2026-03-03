@@ -13,7 +13,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
-from openai import AsyncOpenAI
+from ..agents.shared.llm_client import LLMClient
 
 from .registry import SkillRegistry
 from .generator import SkillGenerator
@@ -84,7 +84,7 @@ def create_skills_router(registry: SkillRegistry, config) -> APIRouter:
         if config.skills:
             skills_dir = Path(config.skills.skills_dir)
 
-        client = AsyncOpenAI(
+        client = LLMClient(
             api_key=model_cfg.api_key,
             base_url=model_cfg.base_url,
         )

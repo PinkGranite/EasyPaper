@@ -6,8 +6,8 @@ Commander Agent
     - Outputs unified SectionWritePayload for Writer Agent
     - Acts as the adapter between FlowGram.ai and the Writer Agent
 """
-from openai import AsyncOpenAI
 from langchain.messages import AnyMessage
+from ..shared.llm_client import LLMClient
 from typing_extensions import TypedDict, Annotated, Optional
 from langgraph.graph import StateGraph, START, END
 import operator
@@ -152,7 +152,7 @@ class CommanderAgent(BaseAgent):
     """
     
     def __init__(self, config: ModelConfig):
-        self.client = AsyncOpenAI(
+        self.client = LLMClient(
             api_key=config.api_key,
             base_url=config.base_url,
         )
