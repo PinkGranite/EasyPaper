@@ -69,6 +69,8 @@ from ..planner_agent.models import (
 )
 from ..shared.table_converter import convert_tables
 from ..shared.session_memory import SessionMemory, ReviewRecord
+from .progress import ProgressEmitter, ProgressCallback, EventType, Phase
+from ..shared.llm_client import set_llm_progress_context, clear_llm_progress_context
 from ..shared.code_context import (
     CodeContextBuilder,
     format_code_context_for_prompt,
@@ -994,6 +996,9 @@ class MetaDataAgent(ReActAgent):
         max_review_iterations: int = 3,
         enable_planning: bool = True,
         enable_vlm_review: bool = False,
+        progress_callback: Optional[ProgressCallback] = None,
+        feedback_queue: Optional[asyncio.Queue] = None,
+        feedback_timeout: float = 300.0,
     ) -> PaperGenerationResult:
         """
         Generate complete paper from MetaData
@@ -1027,6 +1032,14 @@ class MetaDataAgent(ReActAgent):
         # Use target_pages from metadata if not provided
         if target_pages is None:
             target_pages = metadata.target_pages
+
+        # Progress emitter for real-time streaming
+        emitter = ProgressEmitter(progress_callback)
+        await emitter.generation_started(
+            title=metadata.title,
+            target_pages=target_pages,
+        )
+
         errors = []
         sections_results = []
         generated_sections: Dict[str, str] = {}
@@ -1108,6 +1121,7 @@ class MetaDataAgent(ReActAgent):
             # Phase 0e-pre: Code repository understanding (optional, pre-plan)
             # =================================================================
             if metadata.code_repository:
+                await emitter.phase_start(Phase.CODE_CONTEXT, "Building code repository context")
                 print("[MetaDataAgent] Phase 0e-pre: Building code repository context...")
                 try:
                     code_context = await self._build_code_repository_context(metadata)
@@ -1145,6 +1159,7 @@ class MetaDataAgent(ReActAgent):
             # Phase 0: Planning (if enabled)
             # =================================================================
             if enable_planning:
+                await emitter.phase_start(Phase.PLANNING, "Creating paper plan")
                 print(f"[MetaDataAgent] Phase 0: Creating Paper Plan...")
                 search_cfg = {}
                 if self.tools_config and self.tools_config.paper_search:
@@ -1196,15 +1211,20 @@ class MetaDataAgent(ReActAgent):
                             "[MetaDataAgent] Core refs in pre-plan context: "
                             f"{len(core_refs_for_context)} total, {core_with_abstract} with abstract"
                         )
-                        seed_discovered_references = await self._planner.discover_seed_references(
-                            title=metadata.title,
-                            idea_hypothesis=metadata.idea_hypothesis,
-                            method=metadata.method,
-                            data=metadata.data,
-                            experiments=metadata.experiments,
-                            existing_ref_keys=list(ref_pool.valid_citation_keys),
-                            paper_search_config=search_cfg,
-                        )
+                        if progress_callback:
+                            set_llm_progress_context(progress_callback, "PlannerAgent", Phase.PLANNING)
+                        try:
+                            seed_discovered_references = await self._planner.discover_seed_references(
+                                title=metadata.title,
+                                idea_hypothesis=metadata.idea_hypothesis,
+                                method=metadata.method,
+                                data=metadata.data,
+                                experiments=metadata.experiments,
+                                existing_ref_keys=list(ref_pool.valid_citation_keys),
+                                paper_search_config=search_cfg,
+                            )
+                        finally:
+                            clear_llm_progress_context()
                         for paper in seed_discovered_references:
                             ref_pool.add_discovered(
                                 paper.get("ref_id", ""),
@@ -1228,6 +1248,8 @@ class MetaDataAgent(ReActAgent):
                     except Exception as e:
                         print(f"[MetaDataAgent] Warning: Failed to build research context v1: {e}")
 
+                if progress_callback:
+                    set_llm_progress_context(progress_callback, "PlannerAgent", Phase.PLANNING)
                 paper_plan = await self._create_paper_plan(
                     metadata=metadata,
                     target_pages=target_pages,
@@ -1235,6 +1257,7 @@ class MetaDataAgent(ReActAgent):
                     research_context=research_context_v1,
                     code_context=code_context,
                 )
+                clear_llm_progress_context()
                 if paper_plan:
                     memory.plan = paper_plan
                     if self.tools_config and not getattr(
@@ -1251,6 +1274,20 @@ class MetaDataAgent(ReActAgent):
                                sections=len(paper_plan.sections),
                                estimated_words=paper_plan.get_total_estimated_words())
                     print(f"[MetaDataAgent] Plan created: {len(paper_plan.sections)} sections, ~{paper_plan.get_total_estimated_words()} words (est.)")
+                    await emitter.plan_created(
+                        sections=len(paper_plan.sections),
+                        estimated_words=paper_plan.get_total_estimated_words(),
+                        plan_summary={
+                            "sections": [
+                                {
+                                    "type": s.section_type,
+                                    "title": s.section_title,
+                                    "estimated_words": s.get_estimated_words(),
+                                }
+                                for s in paper_plan.sections
+                            ],
+                        },
+                    )
                     
                     # Apply auto-detected wide flags from plan to metadata figures/tables
                     if paper_plan.wide_figures:
@@ -1277,11 +1314,15 @@ class MetaDataAgent(ReActAgent):
 
                     # Reference discovery: Planner searches for relevant papers
                     print("[MetaDataAgent] Phase 0b: Discovering references...")
+                    await emitter.phase_start(Phase.REF_DISCOVERY, "Discovering references via academic search")
+                    if progress_callback:
+                        set_llm_progress_context(progress_callback, "PlannerAgent", Phase.REF_DISCOVERY)
                     discovered = await self._planner.discover_references(
                         plan=paper_plan,
                         existing_ref_keys=list(ref_pool.valid_citation_keys),
                         paper_search_config=search_cfg,
                     )
+                    clear_llm_progress_context()
                     discovered_references_by_section = discovered
                     disc_count = 0
                     for sec_type, papers in discovered.items():
@@ -1291,14 +1332,22 @@ class MetaDataAgent(ReActAgent):
                             )
                             if added:
                                 disc_count += 1
+                        if papers:
+                            await emitter.search_result(
+                                found=len(papers), section=sec_type,
+                                query=f"Reference discovery for {sec_type}",
+                            )
+                    await emitter.phase_complete(Phase.PLANNING, f"Plan created with {len(paper_plan.sections)} sections")
                     if disc_count:
                         print(f"[MetaDataAgent] Discovered {disc_count} new references (pool: {ref_pool.summary()})")
+                        await emitter.references_discovered(count=disc_count, total_pool=len(ref_pool.valid_citation_keys))
                         memory.log("planner", "phase0b", "references_discovered",
                                    narrative=f"Planner discovered {disc_count} additional references via academic search to support the paper plan.",
                                    count=disc_count)
 
                     # Phase 0c: Assign references to sections
                     print("[MetaDataAgent] Phase 0c: Assigning references to sections...")
+                    await emitter.phase_start(Phase.REF_ASSIGNMENT, "Assigning references to sections")
                     self._planner.assign_references(
                         plan=paper_plan,
                         discovered=discovered,
@@ -1309,6 +1358,8 @@ class MetaDataAgent(ReActAgent):
                     for sp in paper_plan.sections:
                         if sp.assigned_refs:
                             print(f"  [{sp.section_type}] {len(sp.assigned_refs)} refs assigned")
+                            await emitter.ref_assigned(section=sp.section_type, count=len(sp.assigned_refs))
+                    await emitter.phase_complete(Phase.REF_ASSIGNMENT, "References assigned to sections")
 
                     # Phase 0d: Generate research context (if enabled)
                     if rc_enabled and discovered:
@@ -1395,8 +1446,13 @@ class MetaDataAgent(ReActAgent):
             # =================================================================
             # Phase 1: Introduction (Leader Section)
             # =================================================================
+            await emitter.phase_start(Phase.INTRODUCTION, "Generating introduction")
+            await emitter.section_start("introduction", phase=Phase.INTRODUCTION)
             print(f"[MetaDataAgent] Phase 1: Generating Introduction...")
+            await emitter.agent_step(agent="WriterAgent", description="Generating introduction section", section="introduction", phase=Phase.INTRODUCTION)
             intro_plan = paper_plan.get_section("introduction") if paper_plan else None
+            if progress_callback:
+                set_llm_progress_context(progress_callback, "WriterAgent", Phase.INTRODUCTION, "introduction")
             intro_result = await self._generate_introduction(
                 metadata, ref_pool, section_plan=intro_plan,
                 figures=metadata.figures, tables=metadata.tables,
@@ -1405,11 +1461,18 @@ class MetaDataAgent(ReActAgent):
                 prompt_traces=prompt_traces,
                 memory=memory,
             )
+            clear_llm_progress_context()
             sections_results.append(intro_result)
             print(f"[MetaDataAgent] After introduction: {ref_pool.summary()}")
             
             if intro_result.status == "ok":
                 generated_sections["introduction"] = intro_result.latex_content
+                await emitter.section_content(
+                    section_type="introduction",
+                    content=intro_result.latex_content,
+                    word_count=intro_result.word_count or 0,
+                    phase=Phase.INTRODUCTION,
+                )
                 memory.log("metadata", "phase1", "introduction_generated",
                            narrative=f"Writer completed the introduction section ({intro_result.word_count} words).",
                            word_count=intro_result.word_count)
@@ -1463,6 +1526,7 @@ class MetaDataAgent(ReActAgent):
             # =================================================================
             # Phase 2: Body Sections (can be parallel)
             # =================================================================
+            await emitter.phase_start(Phase.BODY_SECTIONS, "Generating body sections")
             print(f"[MetaDataAgent] Phase 2: Generating Body Sections...")
             # Dynamic: read body section types from the plan (no hardcoding)
             if paper_plan:
@@ -1473,12 +1537,15 @@ class MetaDataAgent(ReActAgent):
             
             # Generate body sections sequentially (ref_pool accumulates across sections)
             for section_type in body_section_types:
+                await emitter.section_start(section_type, phase=Phase.BODY_SECTIONS)
+                await emitter.agent_step(agent="WriterAgent", description=f"Generating {section_type} section", section=section_type, phase=Phase.BODY_SECTIONS)
                 section_plan = paper_plan.get_section(section_type) if paper_plan else None
-                # Filter figures/tables for this section
                 section_figures = [f for f in metadata.figures if f.section == section_type or not f.section]
                 section_tables = [t for t in metadata.tables if t.section == section_type or not t.section]
                 
                 try:
+                    if progress_callback:
+                        set_llm_progress_context(progress_callback, "WriterAgent", Phase.BODY_SECTIONS, section_type)
                     result = await self._generate_body_section(
                         section_type=section_type,
                         metadata=metadata,
@@ -1494,6 +1561,7 @@ class MetaDataAgent(ReActAgent):
                         prompt_traces=prompt_traces,
                         memory=memory,
                     )
+                    clear_llm_progress_context()
                 except Exception as e:
                     result = SectionResult(
                         section_type=section_type,
@@ -1504,6 +1572,12 @@ class MetaDataAgent(ReActAgent):
                 sections_results.append(result)
                 if result.status == "ok":
                     generated_sections[section_type] = result.latex_content
+                    await emitter.section_content(
+                        section_type=section_type,
+                        content=result.latex_content,
+                        word_count=result.word_count or 0,
+                        phase=Phase.BODY_SECTIONS,
+                    )
                     memory.log("metadata", "phase2", f"{section_type}_generated",
                                narrative=f"Writer completed the {section_type} section ({result.word_count} words).",
                                word_count=result.word_count)
@@ -1528,9 +1602,13 @@ class MetaDataAgent(ReActAgent):
             # =================================================================
             # Phase 3: Synthesis Sections (Abstract + Conclusion)
             # =================================================================
+            await emitter.phase_start(Phase.SYNTHESIS, "Generating synthesis sections (abstract, conclusion)")
             print(f"[MetaDataAgent] Phase 3: Generating Synthesis Sections...")
             
             # Generate Abstract
+            await emitter.agent_step(agent="WriterAgent", description="Generating abstract", section="abstract", phase=Phase.SYNTHESIS)
+            if progress_callback:
+                set_llm_progress_context(progress_callback, "WriterAgent", Phase.SYNTHESIS, "abstract")
             abstract_result = await self._generate_synthesis_section(
                 section_type="abstract",
                 paper_title=metadata.title,
@@ -1541,9 +1619,16 @@ class MetaDataAgent(ReActAgent):
                 prompt_traces=prompt_traces,
                 memory=memory,
             )
+            clear_llm_progress_context()
             sections_results.insert(0, abstract_result)  # Abstract goes first
             if abstract_result.status == "ok":
                 generated_sections["abstract"] = abstract_result.latex_content
+                await emitter.section_content(
+                    section_type="abstract",
+                    content=abstract_result.latex_content,
+                    word_count=abstract_result.word_count or 0,
+                    phase=Phase.SYNTHESIS,
+                )
                 memory.log("metadata", "phase3", "abstract_generated",
                            narrative=f"Writer completed the abstract ({abstract_result.word_count} words).",
                            word_count=abstract_result.word_count)
@@ -1555,6 +1640,9 @@ class MetaDataAgent(ReActAgent):
                 paper_plan and paper_plan.get_section("conclusion") is not None
             )
             if should_generate_conclusion:
+                await emitter.agent_step(agent="WriterAgent", description="Generating conclusion", section="conclusion", phase=Phase.SYNTHESIS)
+                if progress_callback:
+                    set_llm_progress_context(progress_callback, "WriterAgent", Phase.SYNTHESIS, "conclusion")
                 conclusion_result = await self._generate_synthesis_section(
                     section_type="conclusion",
                     paper_title=metadata.title,
@@ -1565,9 +1653,16 @@ class MetaDataAgent(ReActAgent):
                     prompt_traces=prompt_traces,
                     memory=memory,
                 )
+                clear_llm_progress_context()
                 sections_results.append(conclusion_result)
                 if conclusion_result.status == "ok":
                     generated_sections["conclusion"] = conclusion_result.latex_content
+                    await emitter.section_content(
+                        section_type="conclusion",
+                        content=conclusion_result.latex_content,
+                        word_count=conclusion_result.word_count or 0,
+                        phase=Phase.SYNTHESIS,
+                    )
                     memory.log("metadata", "phase3", "conclusion_generated",
                                narrative=f"Writer completed the conclusion ({conclusion_result.word_count} words).",
                                word_count=conclusion_result.word_count)
@@ -1605,6 +1700,10 @@ class MetaDataAgent(ReActAgent):
                 target_pages=target_pages,
                 paper_dir=paper_dir,
                 memory=memory,
+                emitter=emitter,
+                feedback_queue=feedback_queue,
+                feedback_timeout=feedback_timeout,
+                progress_callback=progress_callback,
             )
             if orchestration_errors:
                 errors.extend(orchestration_errors)
@@ -2058,6 +2157,14 @@ class MetaDataAgent(ReActAgent):
                 status = "partial"
             else:
                 status = "error"
+
+            await emitter.completed(
+                status=status,
+                total_words=total_words,
+                review_iterations=review_iterations,
+                sections_count=len([s for s in sections_results if s.status == "ok"]),
+                pdf_path=pdf_path,
+            )
             
             return PaperGenerationResult(
                 status=status,
@@ -2074,6 +2181,7 @@ class MetaDataAgent(ReActAgent):
             
         except Exception as e:
             print(f"[MetaDataAgent] Error: {e}")
+            await emitter.error(message=str(e), phase="generate_paper")
             return PaperGenerationResult(
                 status="error",
                 paper_title=metadata.title,
@@ -5996,6 +6104,10 @@ class MetaDataAgent(ReActAgent):
         target_pages: Optional[int],
         paper_dir: Optional[Path],
         memory: Optional[SessionMemory] = None,
+        emitter: Optional[ProgressEmitter] = None,
+        feedback_queue: Optional[asyncio.Queue] = None,
+        feedback_timeout: float = 300.0,
+        progress_callback: Optional[ProgressCallback] = None,
     ) -> Tuple[Dict[str, str], List[SectionResult], int, Optional[int], Optional[str], List[str]]:
         """
         Run unified review orchestration across reviewer and VLM.
@@ -6027,6 +6139,8 @@ class MetaDataAgent(ReActAgent):
             - `pdf_path` (Optional[str]): Latest compiled PDF path
             - `errors` (List[str]): Orchestration errors
         """
+        if emitter is None:
+            emitter = ProgressEmitter(None)
         errors: List[str] = []
         review_iterations = 0
         target_word_count = None
@@ -6036,6 +6150,7 @@ class MetaDataAgent(ReActAgent):
         last_vlm_result = None
         
         if enable_review:
+            await emitter.phase_start(Phase.REVIEW_LOOP, f"Review loop (max {max_review_iterations} iterations)")
             print(f"[MetaDataAgent] Unified Review Loop (max {max_review_iterations} iterations)...")
         baseline_gap_audit = self._perform_baseline_gap_audit(
             generated_sections=generated_sections,
@@ -6053,6 +6168,7 @@ class MetaDataAgent(ReActAgent):
         
         for iteration in range(max_review_iterations):
             review_iterations = iteration + 1
+            await emitter.review_start(iteration=review_iterations, max_iterations=max_review_iterations)
             iteration_decision_trace: List[Dict[str, Any]] = []
             iteration_conflicts: List[ConflictResolutionRecord] = []
             iteration_semantic_checks: List[SemanticCheckRecord] = []
@@ -6119,6 +6235,9 @@ class MetaDataAgent(ReActAgent):
                         }
                         for s in paper_plan.sections
                     }
+                await emitter.agent_step(agent="ReviewerAgent", iteration=review_iterations, description=f"Reviewing all sections (iteration {review_iterations})", phase=Phase.REVIEW_LOOP)
+                if progress_callback:
+                    set_llm_progress_context(progress_callback, "ReviewerAgent", Phase.REVIEW_LOOP)
                 reviewer_result, target_word_count = await self._call_reviewer(
                     sections=generated_sections,
                     word_counts=word_counts,
@@ -6130,6 +6249,7 @@ class MetaDataAgent(ReActAgent):
                     section_structure_signals=section_structure_signals,
                     memory=memory,
                 )
+                clear_llm_progress_context()
                 if reviewer_result is None:
                     print("[MetaDataAgent] Reviewer not available, skipping content review")
                 else:
@@ -6147,7 +6267,59 @@ class MetaDataAgent(ReActAgent):
                         f"passed={review_result.passed} "
                         f"sections_to_revise={list(review_result.requires_revision.keys())}"
                     )
-                    
+                    await emitter.review_result(
+                        iteration=review_iterations,
+                        passed=review_result.passed,
+                        issues_count=len(review_result.feedbacks),
+                        summary=review_result.orchestrator_summary or "",
+                        revision_tasks=[
+                            {"target": t.target_id or t.section_type, "instruction": t.instruction[:200]}
+                            for t in review_result.revision_tasks[:10]
+                        ] if review_result.revision_tasks else None,
+                    )
+
+                    # User feedback injection point
+                    if feedback_queue is not None and not review_result.passed:
+                        sections_status_map = {
+                            sr.section_type: {
+                                "word_count": sr.word_count,
+                                "status": sr.status,
+                            }
+                            for sr in sections_results if sr.status == "ok"
+                        }
+                        await emitter.review_feedback_request(
+                            iteration=review_iterations,
+                            review_summary=review_result.orchestrator_summary or "",
+                            sections_status=sections_status_map,
+                        )
+                        try:
+                            user_feedback = await asyncio.wait_for(
+                                feedback_queue.get(), timeout=feedback_timeout
+                            )
+                            fb_action = user_feedback.get("action", "continue")
+                            fb_text = user_feedback.get("feedback_text", "")
+                            await emitter.review_feedback_received(
+                                feedback_text=fb_text, action=fb_action
+                            )
+                            if fb_action == "accept":
+                                review_result.passed = True
+                                print("[ReviewLoop] User accepted current state")
+                            elif fb_action == "stop":
+                                print("[ReviewLoop] User requested stop")
+                                break
+                            elif fb_text:
+                                targets = user_feedback.get("section_targets", [])
+                                for tgt in (targets or list(review_result.requires_revision.keys())[:2]):
+                                    review_result.revision_tasks.append(
+                                        RevisionTask(
+                                            section_type=tgt,
+                                            target_id=tgt,
+                                            instruction=f"User feedback: {fb_text}",
+                                        )
+                                    )
+                        except asyncio.TimeoutError:
+                            print("[ReviewLoop] Feedback timeout, proceeding automatically")
+
                     # Conflict resolution: if the previous VLM iteration detected
                     # page overflow, suppress any Reviewer "expand" feedback.
                     # Page limits are a hard constraint; word count targets are soft.
@@ -6184,6 +6356,11 @@ class MetaDataAgent(ReActAgent):
             )
             if reviewer_revised_sections:
                 print(f"[ReviewLoop] Reviewer revised: {sorted(reviewer_revised_sections)}")
+                for rev_sec in reviewer_revised_sections:
+                    await emitter.revision_applied(
+                        section_type=rev_sec,
+                        iteration=review_iterations,
+                    )
             self._resolve_section_feedbacks(
                 section_feedbacks=review_result.section_feedbacks,
                 revised_sections=reviewer_revised_sections,
@@ -6200,6 +6377,7 @@ class MetaDataAgent(ReActAgent):
             compile_succeeded = False
             last_compiled_fingerprint = self._get_sections_fingerprint(generated_sections)
             if compile_pdf and template_path and paper_dir:
+                await emitter.compile_start(iteration=review_iterations)
                 iteration_dir = paper_dir / f"iteration_{review_iterations:02d}"
                 iteration_dir.mkdir(parents=True, exist_ok=True)
                 print(f"[ReviewLoop] PDF output dir: {iteration_dir}")
@@ -6221,6 +6399,7 @@ class MetaDataAgent(ReActAgent):
                 if pdf_result_path:
                     pdf_path = pdf_result_path
                     compile_succeeded = True
+                    await emitter.compile_complete(success=True, pdf_path=pdf_path)
                 else:
                     # Compilation failed -> treat as review feedback, not a hard exit
                     print(f"[ReviewLoop] PDF compilation failed, treating as Typesetter review feedback")

@@ -702,6 +702,20 @@ class PaperSearchTool(WriterTool):
         print(f"[Tool:search_papers] Searching '{query}' (max={max_res}, "
               f"source={source}, years={year_range or 'any'})...")
 
+        from ..llm_client import _progress_ctx
+        ctx = _progress_ctx.get(None)
+        if ctx and ctx.get("callback"):
+            try:
+                import asyncio
+                asyncio.create_task(ctx["callback"]({
+                    "type": "search_started",
+                    "query": query,
+                    "source": source,
+                    "section": ctx.get("section", ""),
+                }))
+            except Exception:
+                pass
+
         cache_key = self._make_cache_key(query, max_res, year_range, source)
         if self._enable_query_cache:
             cached = self._get_cached_data(cache_key)
@@ -834,6 +848,19 @@ class PaperSearchTool(WriterTool):
         }
         if self._enable_query_cache:
             self._set_cached_data(cache_key, data)
+
+        if ctx and ctx.get("callback"):
+            try:
+                import asyncio
+                asyncio.create_task(ctx["callback"]({
+                    "type": "search_result",
+                    "found": len(all_papers),
+                    "new_count": len(all_papers),
+                    "query": query,
+                    "section": ctx.get("section", ""),
+                }))
+            except Exception:
+                pass
 
         if all_papers:
             message = (f"Found {len(all_papers)} paper(s) for '{query}'. "

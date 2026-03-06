@@ -4,12 +4,20 @@ MetaData Agent Router
     - FastAPI router for MetaData-based paper generation
     - Independent API - can be called directly without frontend
     - Endpoints:
-        - POST /metadata/generate - Generate complete paper
+        - POST /metadata/generate - Generate complete paper (blocking)
+        - POST /metadata/generate/stream - Generate with SSE progress streaming
+        - POST /metadata/generate/{task_id}/feedback - Inject user feedback
         - POST /metadata/generate/section - Generate single section
         - GET /metadata/health - Health check
+        - GET /metadata/schema - Get input schema
 """
+import asyncio
+import json
+import uuid
+from typing import Any, Dict, Optional, TYPE_CHECKING
+
 from fastapi import APIRouter, HTTPException
-from typing import TYPE_CHECKING
+from fastapi.responses import StreamingResponse
 
 from .models import (
     PaperGenerationRequest,
@@ -17,74 +25,34 @@ from .models import (
     SectionGenerationRequest,
     SectionResult,
 )
+from .progress import ProgressCallback
 
 if TYPE_CHECKING:
     from .metadata_agent import MetaDataAgent
 
 
+# In-memory task registry for active streaming generations
+_active_tasks: Dict[str, Dict[str, Any]] = {}
+
+
 def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
     """
     Create FastAPI router for MetaData Agent
-    
-    Args:
-        agent: MetaDataAgent instance
-    
-    Returns:
-        FastAPI APIRouter with endpoints
+
+    - **Args**:
+        - `agent` (MetaDataAgent): MetaDataAgent instance
+
+    - **Returns**:
+        - `APIRouter`: FastAPI router with all endpoints
     """
     router = APIRouter(prefix="/metadata", tags=["MetaData Paper Generation"])
-    
+
+    # ------------------------------------------------------------------
+    # POST /metadata/generate  (blocking, original behavior)
+    # ------------------------------------------------------------------
     @router.post("/generate", response_model=PaperGenerationResult)
     async def generate_paper(request: PaperGenerationRequest) -> PaperGenerationResult:
-        """
-        Generate complete paper from MetaData
-        
-        **Independent API** - Can be called directly via curl/Postman
-        
-        ## Request Body
-        
-        ```json
-        {
-            "title": "Paper Title",
-            "idea_hypothesis": "Research idea or hypothesis...",
-            "method": "Method description...",
-            "data": "Data or validation method...",
-            "experiments": "Experiment design, results, findings...",
-            "references": ["@article{key, title={...}, ...}", ...],
-            "template_path": "path/to/template.zip",
-            "style_guide": "ICML 2026",
-            "compile_pdf": true,
-            "figures_source_dir": null,
-            "save_output": true,
-            "output_dir": null
-        }
-        ```
-        
-        ## Response
-        
-        ```json
-        {
-            "status": "ok",
-            "paper_title": "...",
-            "sections": [...],
-            "latex_content": "...",
-            "output_path": "results/xxx/",
-            "pdf_path": null,
-            "total_word_count": 5000,
-            "errors": []
-        }
-        ```
-        
-        ## Six-Phase Generation
-        
-        0. **Phase 0 (Planning)**: Create detailed paper plan (if enabled)
-        1. **Phase 1 (Introduction)**: Leader section that sets tone and extracts contributions
-        2. **Phase 2 (Body)**: Method, Experiment, Results, Related Work (can be parallel)
-        3. **Phase 3 (Synthesis)**: Abstract and Conclusion based on prior sections
-        3.5. **Review Loop**: Iterative feedback and revision (if enabled)
-        4. **Phase 4 (PDF)**: Compile to PDF using template (if template_path provided)
-        5. **Phase 5 (VLM Review)**: Check page overflow with VLM (if enable_vlm_review=true)
-        """
+        """Generate complete paper from MetaData (blocking call)."""
         try:
             metadata = request.to_metadata()
             result = await agent.generate_paper(
@@ -103,68 +71,178 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
             return result
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
-    
-    @router.post("/generate/section", response_model=SectionResult)
-    async def generate_single_section(request: SectionGenerationRequest) -> SectionResult:
+
+    # ------------------------------------------------------------------
+    # POST /metadata/generate/stream  (SSE streaming)
+    # ------------------------------------------------------------------
+    @router.post("/generate/stream")
+    async def generate_paper_stream(request: PaperGenerationRequest):
         """
-        Generate a single section (for debugging or incremental generation)
-        
-        ## Request Body
-        
-        ```json
-        {
-            "section_type": "introduction",
-            "metadata": {
-                "title": "...",
-                "idea_hypothesis": "...",
-                "method": "...",
-                "data": "...",
-                "experiments": "...",
-                "references": [...]
-            },
-            "intro_context": null,
-            "prior_sections": null
+        Generate paper with real-time SSE progress streaming.
+
+        Returns a Server-Sent Events stream. Each event is a JSON object
+        with a ``type`` field indicating the event kind.
+        """
+        task_id = str(uuid.uuid4())
+        event_queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+        feedback_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+
+        _active_tasks[task_id] = {
+            "event_queue": event_queue,
+            "feedback_queue": feedback_queue,
+            "status": "running",
         }
-        ```
-        
-        ## Section Types
-        
-        - **Leader**: introduction
-        - **Body**: method, experiment, result, related_work, discussion
-        - **Synthesis**: abstract, conclusion (requires prior_sections)
+
+        async def progress_callback(event: Dict[str, Any]) -> None:
+            event["task_id"] = task_id
+            await event_queue.put(event)
+
+        async def run_generation() -> None:
+            try:
+                metadata = request.to_metadata()
+                await agent.generate_paper(
+                    metadata=metadata,
+                    output_dir=request.output_dir,
+                    save_output=request.save_output,
+                    compile_pdf=request.compile_pdf,
+                    template_path=request.template_path,
+                    figures_source_dir=request.figures_source_dir,
+                    target_pages=request.target_pages,
+                    enable_review=request.enable_review,
+                    max_review_iterations=request.max_review_iterations,
+                    enable_planning=request.enable_planning,
+                    enable_vlm_review=request.enable_vlm_review,
+                    progress_callback=progress_callback,
+                    feedback_queue=feedback_queue,
+                    feedback_timeout=request.feedback_timeout
+                    if hasattr(request, "feedback_timeout")
+                    else 300.0,
+                )
+            except Exception as e:
+                await event_queue.put({
+                    "type": "error",
+                    "task_id": task_id,
+                    "message": str(e),
+                })
+            finally:
+                await event_queue.put(None)
+                _active_tasks.pop(task_id, None)
+
+        gen_task = asyncio.create_task(run_generation())
+        _active_tasks[task_id]["task"] = gen_task
+
+        async def event_stream():
+            # First event: send task_id so the client can use it for feedback
+            yield f"data: {json.dumps({'type': 'task_created', 'task_id': task_id})}\n\n"
+            try:
+                while True:
+                    event = await event_queue.get()
+                    if event is None:
+                        break
+                    yield f"data: {json.dumps(event, default=str)}\n\n"
+            except asyncio.CancelledError:
+                gen_task.cancel()
+            finally:
+                if not gen_task.done():
+                    gen_task.cancel()
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # POST /metadata/generate/{task_id}/feedback
+    # ------------------------------------------------------------------
+    @router.post("/generate/{task_id}/feedback")
+    async def submit_feedback(task_id: str, feedback: Dict[str, Any]):
         """
+        Submit user feedback during review loop.
+
+        - **Args**:
+            - `task_id` (str): Task ID from the ``task_created`` SSE event.
+            - `feedback` (dict): Feedback payload with fields:
+                - ``feedback_text`` (str): User's review comments
+                - ``section_targets`` (list[str], optional): Target sections
+                - ``action`` (str): One of ``continue``, ``accept``, ``stop``
+        """
+        task_info = _active_tasks.get(task_id)
+        if not task_info:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Task {task_id} not found or already completed",
+            )
+        await task_info["feedback_queue"].put(feedback)
+        return {"status": "ok", "task_id": task_id}
+
+    # ------------------------------------------------------------------
+    # POST /metadata/generate/{task_id}/cancel
+    # ------------------------------------------------------------------
+    @router.post("/generate/{task_id}/cancel")
+    async def cancel_generation(task_id: str):
+        """
+        Cancel a running generation task.
+        """
+        task_info = _active_tasks.get(task_id)
+        if not task_info:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Task {task_id} not found or already completed",
+            )
+        gen_task = task_info.get("task")
+        if gen_task and not gen_task.done():
+            gen_task.cancel()
+            task_info["status"] = "cancelled"
+            return {"status": "ok", "task_id": task_id}
+        return {"status": "ok", "message": "Task already completed"}
+
+    # ------------------------------------------------------------------
+    # POST /metadata/generate/section  (single section, unchanged)
+    # ------------------------------------------------------------------
+    @router.post("/generate/section", response_model=SectionResult)
+    async def generate_single_section(
+        request: SectionGenerationRequest,
+    ) -> SectionResult:
+        """Generate a single section (for debugging or incremental generation)."""
         try:
             result = await agent.generate_single_section(request)
             return result
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
-    
+
+    # ------------------------------------------------------------------
+    # GET /metadata/health
+    # ------------------------------------------------------------------
     @router.get("/health")
     async def health_check():
-        """
-        Health check endpoint
-        
-        Returns agent status and configuration info.
-        """
+        """Health check endpoint."""
         return {
             "status": "ok",
             "agent": "metadata_agent",
             "model": agent.model_name,
             "description": "MetaData-based paper generation (Simple Mode)",
+            "active_tasks": len(_active_tasks),
             "endpoints": [
                 "POST /metadata/generate - Generate complete paper",
+                "POST /metadata/generate/stream - Generate with SSE streaming",
+                "POST /metadata/generate/{task_id}/feedback - Submit review feedback",
                 "POST /metadata/generate/section - Generate single section",
                 "GET /metadata/health - Health check",
+                "GET /metadata/schema - Get input schema",
             ],
         }
-    
+
+    # ------------------------------------------------------------------
+    # GET /metadata/schema
+    # ------------------------------------------------------------------
     @router.get("/schema")
     async def get_input_schema():
-        """
-        Get the input schema for paper generation
-        
-        Returns the expected format for PaperGenerationRequest.
-        """
+        """Get the input schema for paper generation."""
         return {
             "input_schema": {
                 "title": {
@@ -216,116 +294,25 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
                     "required": False,
                     "default": True,
                 },
-                "figures_source_dir": {
-                    "type": "string",
-                    "description": "Directory containing figure files",
-                    "required": False,
-                },
                 "save_output": {
                     "type": "boolean",
                     "description": "Whether to save output files to disk",
                     "required": False,
                     "default": True,
                 },
-                "output_dir": {
-                    "type": "string",
-                    "description": "Custom output directory path",
-                    "required": False,
-                },
-                "export_prompt_traces": {
-                    "type": "boolean",
-                    "description": "Whether to export section-level prompt and evidence traces",
-                    "required": False,
-                    "default": False,
-                },
-                "code_repository": {
-                    "type": "object",
-                    "description": "Optional code/docs repository source for section-aware writing support",
-                    "required": False,
-                    "properties": {
-                        "type": {
-                            "type": "string",
-                            "enum": ["local_dir", "git_repo"],
-                            "description": "Source type: local folder or remote git repository",
-                        },
-                        "path": {
-                            "type": "string",
-                            "description": "Required when type=local_dir; local folder path",
-                            "required": False,
-                        },
-                        "url": {
-                            "type": "string",
-                            "description": "Required when type=git_repo; repository URL",
-                            "required": False,
-                        },
-                        "ref": {
-                            "type": "string",
-                            "description": "Optional git branch/tag/commit (default: main)",
-                            "required": False,
-                            "default": "main",
-                        },
-                        "subdir": {
-                            "type": "string",
-                            "description": "Optional sub-directory inside repository to scan",
-                            "required": False,
-                        },
-                        "include_globs": {
-                            "type": "array",
-                            "items": "string",
-                            "description": "Optional include glob patterns",
-                            "required": False,
-                            "default": [],
-                        },
-                        "exclude_globs": {
-                            "type": "array",
-                            "items": "string",
-                            "description": "Optional exclude glob patterns",
-                            "required": False,
-                            "default": [],
-                        },
-                        "max_files": {
-                            "type": "integer",
-                            "description": "Maximum number of files to ingest",
-                            "required": False,
-                            "default": 5000,
-                        },
-                        "max_total_bytes": {
-                            "type": "integer",
-                            "description": "Maximum bytes to ingest across all files",
-                            "required": False,
-                            "default": 200000000,
-                        },
-                        "on_error": {
-                            "type": "string",
-                            "enum": ["fallback", "strict"],
-                            "description": "Failure policy: fallback to normal flow or abort",
-                            "required": False,
-                            "default": "fallback",
-                        },
-                    },
-                },
             },
             "example": {
                 "title": "TransKG: Knowledge Graph Completion with Transformers",
-                "idea_hypothesis": "We hypothesize that pre-trained Transformer models can better capture semantic relationships in knowledge graphs...",
+                "idea_hypothesis": "We hypothesize that pre-trained Transformer models can better capture semantic relationships...",
                 "method": "We propose TransKG, combining BERT with relation-aware attention...",
                 "data": "We evaluate on FB15k-237, WN18RR, and YAGO3-10 datasets...",
                 "experiments": "Compared against TransE, RotatE, achieving 0.391 MRR...",
                 "references": [
-                    "@inproceedings{bordes2013transE, title={Translating embeddings for modeling multi-relational data}, author={Bordes, Antoine}, year={2013}}"
+                    "@inproceedings{bordes2013transE, title={Translating embeddings}, author={Bordes}, year={2013}}"
                 ],
-                "template_path": "example_jsons/icml2026.zip",
                 "style_guide": "ICML",
                 "compile_pdf": True,
-                "code_repository": {
-                    "type": "local_dir",
-                    "path": "examples/project_code",
-                    "include_globs": ["**/*.py", "**/*.md"],
-                    "exclude_globs": ["**/.git/**", "**/venv/**"],
-                    "on_error": "fallback",
-                },
-                "export_prompt_traces": False,
             },
         }
-    
+
     return router

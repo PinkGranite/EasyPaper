@@ -32,6 +32,8 @@ from ..shared.tools import (
 WRITER_SYSTEM_BASE = """You are an expert academic writer specializing in research paper composition.
 Your task is to generate high-quality LaTeX content for a specific section of a research paper.
 
+You have access to UI rendering tools (`show_markdown`, `show_json_data`). Use them to show intermediate thoughts, tabular data, or highlighted literature to the user in the Canvas while generating content.
+
 CRITICAL RULES:
 1. Generate ONLY LaTeX body content - NO document preamble, NO \\documentclass, NO \\begin{document}
 2. Use proper LaTeX formatting for sections, equations, lists, etc.
@@ -337,12 +339,12 @@ class WriterAgent(ReActAgent):
                 f"\\{citation_format}{{reference_id}}",
             )
 
-        # Build tool context for AskTool + PaperSearchTool
+        # Build tool context for AskTool + PaperSearchTool + UI Tools
         tool_context: Dict[str, Any] = {
             "valid_keys": set(state.get("valid_citation_keys", [])),
             "key_points": state.get("key_points", []),
         }
-        tool_names: List[str] = []
+        tool_names: List[str] = ["show_markdown", "show_json_data"]
 
         if memory is not None:
             tool_context["memory"] = memory
