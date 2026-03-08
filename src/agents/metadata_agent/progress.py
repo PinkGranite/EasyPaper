@@ -44,6 +44,7 @@ class EventType:
     REF_ASSIGNED = "ref_assigned"
     LOG = "log"
     GEN_UI = "gen_ui"
+    ARTIFACT_SAVED = "artifact_saved"
 
 
 # Phase identifiers
@@ -230,6 +231,11 @@ class ProgressEmitter:
         iteration: int,
         review_summary: str = "",
         sections_status: Optional[Dict[str, Any]] = None,
+        requires_revision: Optional[Dict[str, list]] = None,
+        section_feedbacks: Optional[list] = None,
+        revision_tasks: Optional[list] = None,
+        current_sections: Optional[Dict[str, str]] = None,
+        checkpoint_path: Optional[str] = None,
         **extra: Any,
     ) -> None:
         await self._emit({
@@ -237,6 +243,11 @@ class ProgressEmitter:
             "iteration": iteration,
             "review_summary": review_summary,
             "sections_status": sections_status,
+            "requires_revision": requires_revision,
+            "section_feedbacks": section_feedbacks,
+            "revision_tasks": revision_tasks,
+            "current_sections": current_sections,
+            "checkpoint_path": checkpoint_path,
             **extra,
         })
 
@@ -306,6 +317,7 @@ class ProgressEmitter:
         review_iterations: int = 0,
         sections_count: int = 0,
         pdf_path: Optional[str] = None,
+        paper_dir: Optional[str] = None,
         **extra: Any,
     ) -> None:
         await self._emit({
@@ -315,6 +327,7 @@ class ProgressEmitter:
             "review_iterations": review_iterations,
             "sections_count": sections_count,
             "pdf_path": pdf_path,
+            "paper_dir": paper_dir,
             **extra,
         })
 
@@ -413,6 +426,41 @@ class ProgressEmitter:
             "message": message,
             "level": level,
             "phase": phase,
+            **extra,
+        })
+
+    async def artifact_saved(
+        self,
+        relative_path: str,
+        absolute_path: str,
+        category: str,
+        size: int,
+        mime_type: str = "application/octet-stream",
+        label: str = "",
+        storage_key: str = "",
+        **extra: Any,
+    ) -> None:
+        """
+        Emit an event indicating that an artifact file was saved.
+
+        - **Args**:
+            - `relative_path` (str): Path relative to paper_dir.
+            - `absolute_path` (str): Absolute filesystem path.
+            - `category` (str): Artifact category (planning, references, section, etc.).
+            - `size` (int): File size in bytes.
+            - `mime_type` (str): MIME type of the file.
+            - `label` (str): Human-readable label for the artifact.
+            - `storage_key` (str): OSS object key if uploaded directly by agentsys.
+        """
+        await self._emit({
+            "type": EventType.ARTIFACT_SAVED,
+            "relative_path": relative_path,
+            "absolute_path": absolute_path,
+            "category": category,
+            "size": size,
+            "mime_type": mime_type,
+            "label": label,
+            "storage_key": storage_key,
             **extra,
         })
 

@@ -6,7 +6,7 @@ Reviewer Agent Models
     - FeedbackResult: Output from individual checkers
     - ReviewResult: Aggregated review result
 """
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Dict, List, Any, Optional
 from enum import Enum
 
@@ -91,6 +91,8 @@ class RevisionTask(BaseModel):
         - Encodes what to revise, why, and what to preserve
         - Used by metadata-layer revision planners and exporters
     """
+    model_config = ConfigDict(use_enum_values=True)
+
     task_id: str = ""
     section_type: str
     level: FeedbackLevel = FeedbackLevel.SECTION
@@ -160,6 +162,8 @@ class SectionFeedback(BaseModel):
         - structural_actions carries structured operation descriptors
         - paragraph_feedbacks provides fine-grained per-paragraph feedback
     """
+    model_config = ConfigDict(use_enum_values=True)
+
     section_type: str
     current_word_count: int
     target_word_count: int

@@ -529,7 +529,6 @@ class ReviewerAgent(BaseAgent):
                     {"role": "user", "content": json.dumps(prompt_payload, ensure_ascii=False)},
                 ],
                 temperature=0.2,
-                max_tokens=2000,
             )
             raw = response.choices[0].message.content or ""
             cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip())

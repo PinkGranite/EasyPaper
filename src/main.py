@@ -142,7 +142,12 @@ async def lifespan(app: FastAPI):
     for agent_cfg in config.agents:
         model = agent_cfg.model
         if model is None:
-            print(f"   {agent_cfg.name:<20} model=(none)")
+            if agent_cfg.name == "vlm_review" and config.vlm_service and config.vlm_service.enabled:
+                vs = config.vlm_service
+                vs_host = vs.base_url.rstrip("/").split("//")[-1].split("/")[0] if vs.base_url else "default"
+                print(f"   {agent_cfg.name:<20} via shared vlm_service  model={vs.model}  base={vs_host}")
+            else:
+                print(f"   {agent_cfg.name:<20} model=(none)")
             continue
         base_host = model.base_url.rstrip("/").split("//")[-1].split("/")[0] if model.base_url else "default"
         extra = ""

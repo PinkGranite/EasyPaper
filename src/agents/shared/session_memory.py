@@ -972,3 +972,47 @@ class SessionMemory:
         self.persist_reviews(output_dir)
         self.persist_readable_reviews(output_dir)
         self.persist_logs(output_dir)
+
+    # ------------------------------------------------------------------
+    # Checkpoint serialization
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Serialize session state to a JSON-safe dict for checkpoint persistence.
+
+        - **Returns**:
+            - `dict`: All session fields in serializable form.
+        """
+        return {
+            "plan": self.plan.model_dump() if hasattr(self.plan, "model_dump") else self.plan,
+            "generated_sections": self.generated_sections,
+            "contributions": self.contributions,
+            "review_history": [r.model_dump() for r in self.review_history],
+            "agent_logs": [e.model_dump() for e in self.agent_logs],
+            "issue_store": self.issue_store,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SessionMemory":
+        """
+        Restore a SessionMemory from a checkpoint dict.
+
+        - **Args**:
+            - `data` (dict): Output of ``to_dict()``.
+
+        - **Returns**:
+            - `SessionMemory`: Restored instance.
+        """
+        mem = cls()
+        mem.plan = data.get("plan")
+        mem.generated_sections = data.get("generated_sections", {})
+        mem.contributions = data.get("contributions", [])
+        mem.review_history = [
+            ReviewRecord(**r) for r in data.get("review_history", [])
+        ]
+        mem.agent_logs = [
+            AgentLogEntry(**e) for e in data.get("agent_logs", [])
+        ]
+        mem.issue_store = data.get("issue_store", {})
+        return mem

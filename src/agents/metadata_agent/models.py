@@ -243,9 +243,15 @@ class PaperGenerationRequest(BaseModel):
     # VLM Review options
     enable_vlm_review: bool = False          # Enable VLM-based PDF review (page overflow detection)
     
+    # User feedback options
+    enable_user_feedback: bool = False       # Pause at review for user feedback (checkpoint-resume)
+    
     # Output options
     save_output: bool = True
     output_dir: Optional[str] = None
+
+    # Storage: when set, artifacts are uploaded directly to OSS under this prefix
+    artifacts_prefix: Optional[str] = None
     
     def to_metadata(self) -> PaperMetaData:
         """Convert request to PaperMetaData"""
@@ -304,6 +310,38 @@ class PaperGenerationResult(BaseModel):
     target_word_count: Optional[int] = None
     review_iterations: int = 0
     errors: List[str] = Field(default_factory=list)
+
+
+class ReviewCheckpoint(BaseModel):
+    """
+    Serialized generation state at a review feedback pause point.
+    - **Description**:
+        - Captures all data needed to resume generation after user feedback.
+        - Saved to disk when ``enable_user_feedback=True`` and the review loop
+          finds issues that need user approval before revision.
+    """
+    task_id: str
+    generated_sections: Dict[str, str]
+    sections_results: List[SectionResult]
+    review_result: Dict[str, Any]
+    metadata: Dict[str, Any]
+    paper_plan: Optional[Dict[str, Any]] = None
+    ref_pool: Dict[str, Any] = Field(default_factory=dict)
+    memory: Dict[str, Any] = Field(default_factory=dict)
+    converted_tables: Dict[str, str] = Field(default_factory=dict)
+    review_iterations: int = 0
+    max_review_iterations: int = 3
+    target_word_count: Optional[int] = None
+    pdf_path: Optional[str] = None
+    template_path: Optional[str] = None
+    figures_source_dir: Optional[str] = None
+    enable_review: bool = True
+    compile_pdf: bool = True
+    enable_vlm_review: bool = False
+    target_pages: Optional[int] = None
+    paper_dir: Optional[str] = None
+    last_vlm_result: Optional[Dict[str, Any]] = None
+    config_hash: str = ""
 
 
 class SectionGenerationRequest(BaseModel):

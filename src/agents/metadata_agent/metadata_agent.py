@@ -24,10 +24,12 @@ MetaData Agent - Simple Mode Paper Generation
 """
 import asyncio
 import json
+import mimetypes
 import re
 import os
 import uuid
 from datetime import datetime
+from functools import partial
 from typing import List, Dict, Any, Optional, Tuple, Set
 from pathlib import Path
 
@@ -197,7 +199,146 @@ class MetaDataAgent(ReActAgent):
         self._reviewer = agents.get("reviewer")
         self._planner = agents.get("planner")
         self._vlm_reviewer = agents.get("vlm_review")
-    
+
+    @staticmethod
+    async def _save_artifact(
+        paper_dir: Path,
+        relative_path: str,
+        content: Any,
+        emitter: "ProgressEmitter",
+        category: str,
+        label: str = "",
+        artifacts_prefix: str = "",
+    ) -> Path:
+        """
+        Write an artifact file, optionally upload to OSS, and emit artifact_saved.
+
+        - **Args**:
+            - `paper_dir` (Path): Root output directory for the task.
+            - `relative_path` (str): Path relative to paper_dir.
+            - `content` (Any): str, bytes, or a JSON-serializable object.
+            - `emitter` (ProgressEmitter): Emitter for SSE events.
+            - `category` (str): Artifact category.
+            - `label` (str): Human-readable label.
+            - `artifacts_prefix` (str): OSS key prefix for direct upload.
+
+        - **Returns**:
+            - `Path`: Absolute path to the written file.
+        """
+        target = paper_dir / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        if isinstance(content, bytes):
+            target.write_bytes(content)
+        elif isinstance(content, str):
+            target.write_text(content, encoding="utf-8")
+        else:
+            target.write_text(
+                json.dumps(content, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+        mime, _ = mimetypes.guess_type(str(target))
+        if mime is None:
+            ext = target.suffix.lower()
+            mime = {
+                ".json": "application/json",
+                ".tex": "text/x-latex",
+                ".bib": "text/x-bibtex",
+                ".md": "text/markdown",
+                ".bst": "text/plain",
+                ".cls": "text/plain",
+            }.get(ext, "application/octet-stream")
+
+        size = target.stat().st_size
+
+        storage_key = ""
+        if artifacts_prefix:
+            candidate_key = f"{artifacts_prefix}/{relative_path}"
+            from ...utils.storage_client import storage_client
+            if await storage_client.upload(candidate_key, target.read_bytes()):
+                storage_key = candidate_key
+
+        await emitter.artifact_saved(
+            relative_path=relative_path,
+            absolute_path=str(target),
+            category=category,
+            size=size,
+            mime_type=mime,
+            label=label or target.name,
+            storage_key=storage_key,
+        )
+        return target
+
+    _COMPILE_EXTS = {
+        ".tex", ".bib", ".bst", ".cls", ".sty", ".bbl",
+        ".png", ".jpg", ".jpeg", ".pdf", ".eps", ".svg", ".gif",
+    }
+
+    @staticmethod
+    async def _save_compilation_output(
+        compile_dir: Path,
+        paper_dir: Path,
+        emitter: "ProgressEmitter",
+        artifacts_prefix: str = "",
+    ) -> None:
+        """
+        Walk a typesetter output directory and emit artifact_saved for every
+        file that is needed for a self-contained LaTeX compilation.
+
+        - **Args**:
+            - `compile_dir` (Path): The iteration_XX output directory produced
+              by typesetter._copy_to_output_dir (contains main.tex, sections/,
+              figures/, template .cls/.bst, references.bib, main.pdf, etc.).
+            - `paper_dir` (Path): Root paper output directory. Artifact paths
+              are stored relative to this directory.
+            - `emitter` (ProgressEmitter): SSE progress emitter.
+            - `artifacts_prefix` (str): OSS key prefix for direct upload.
+        """
+        if not compile_dir or not compile_dir.is_dir():
+            return
+
+        _cat_map = {
+            ".tex": ("section", "Section"),
+            ".bib": ("references", "BibTeX"),
+            ".bst": ("template", "BibTeX Style"),
+            ".cls": ("template", "Document Class"),
+            ".sty": ("template", "Style Package"),
+            ".bbl": ("build", "Compiled Bibliography"),
+            ".pdf": ("output", "PDF"),
+            ".png": ("figure", "Figure"),
+            ".jpg": ("figure", "Figure"),
+            ".jpeg": ("figure", "Figure"),
+            ".eps": ("figure", "Figure"),
+            ".svg": ("figure", "Figure"),
+            ".gif": ("figure", "Figure"),
+        }
+
+        from functools import partial as _partial
+
+        _sa = _partial(
+            MetaDataAgent._save_artifact,
+            artifacts_prefix=artifacts_prefix,
+        )
+
+        for fpath in sorted(compile_dir.rglob("*")):
+            if not fpath.is_file():
+                continue
+            ext = fpath.suffix.lower()
+            if ext not in MetaDataAgent._COMPILE_EXTS:
+                continue
+            rel = str(fpath.relative_to(paper_dir))
+            cat, lbl = _cat_map.get(ext, ("other", fpath.name))
+            if fpath.name == "main.pdf":
+                cat, lbl = "output", "Paper PDF"
+            elif fpath.name == "main.tex":
+                cat, lbl = "root", "Main LaTeX"
+            elif fpath.name.endswith(".bib") and "reference" in fpath.name.lower():
+                cat, lbl = "references", "References BibTeX"
+
+            content = fpath.read_bytes()
+            await _sa(paper_dir, rel, content, emitter, cat, lbl)
+
     @property
     def name(self) -> str:
         """Agent name identifier"""
@@ -996,9 +1137,11 @@ class MetaDataAgent(ReActAgent):
         max_review_iterations: int = 3,
         enable_planning: bool = True,
         enable_vlm_review: bool = False,
+        enable_user_feedback: bool = False,
         progress_callback: Optional[ProgressCallback] = None,
         feedback_queue: Optional[asyncio.Queue] = None,
         feedback_timeout: float = 300.0,
+        artifacts_prefix: str = "",
     ) -> PaperGenerationResult:
         """
         Generate complete paper from MetaData
@@ -1056,7 +1199,17 @@ class MetaDataAgent(ReActAgent):
         code_context: Optional[Dict[str, Any]] = None
         code_summary_markdown: Optional[str] = None
         prompt_traces: List[Dict[str, Any]] = []
-        
+
+        _sa = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
+
+        def _sec_filename(section_type: str) -> str:
+            """Resolve section filename from paper_plan title or fallback."""
+            if paper_plan:
+                titles = paper_plan.get_section_titles()
+                if section_type in titles:
+                    return titles[section_type]
+            return section_type.replace("_", " ").title()
+
         # Initialize Session Memory for cross-agent coordination
         memory = SessionMemory()
         memory.log("metadata", "init", "session_started",
@@ -1302,14 +1455,11 @@ class MetaDataAgent(ReActAgent):
                             if tbl.id in paper_plan.wide_tables and not tbl.wide:
                                 tbl.wide = True
                     
-                    # Save plan to output directory
                     if save_output and paper_dir:
-                        planning_dir = paper_dir / "analysis" / "planning"
-                        planning_dir.mkdir(parents=True, exist_ok=True)
-                        plan_path = planning_dir / "paper_plan.json"
-                        plan_path.write_text(
+                        await self._save_artifact(
+                            paper_dir, "analysis/planning/paper_plan.json",
                             paper_plan.model_dump_json(indent=2),
-                            encoding="utf-8",
+                            emitter, "planning", "Paper Plan",
                         )
 
                     # Reference discovery: Planner searches for relevant papers
@@ -1473,6 +1623,10 @@ class MetaDataAgent(ReActAgent):
                     word_count=intro_result.word_count or 0,
                     phase=Phase.INTRODUCTION,
                 )
+                if save_output and paper_dir:
+                    intro_label = _sec_filename("introduction")
+                    await _sa(paper_dir, f"sections/{intro_label}.tex",
+                              intro_result.latex_content, emitter, "section", f"{intro_label}.tex")
                 memory.log("metadata", "phase1", "introduction_generated",
                            narrative=f"Writer completed the introduction section ({intro_result.word_count} words).",
                            word_count=intro_result.word_count)
@@ -1578,6 +1732,10 @@ class MetaDataAgent(ReActAgent):
                         word_count=result.word_count or 0,
                         phase=Phase.BODY_SECTIONS,
                     )
+                    if save_output and paper_dir:
+                        sec_label = _sec_filename(section_type)
+                        await _sa(paper_dir, f"sections/{sec_label}.tex",
+                                  result.latex_content, emitter, "section", f"{sec_label}.tex")
                     memory.log("metadata", "phase2", f"{section_type}_generated",
                                narrative=f"Writer completed the {section_type} section ({result.word_count} words).",
                                word_count=result.word_count)
@@ -1629,6 +1787,10 @@ class MetaDataAgent(ReActAgent):
                     word_count=abstract_result.word_count or 0,
                     phase=Phase.SYNTHESIS,
                 )
+                if save_output and paper_dir:
+                    abs_label = _sec_filename("abstract")
+                    await _sa(paper_dir, f"sections/{abs_label}.tex",
+                              abstract_result.latex_content, emitter, "section", f"{abs_label}.tex")
                 memory.log("metadata", "phase3", "abstract_generated",
                            narrative=f"Writer completed the abstract ({abstract_result.word_count} words).",
                            word_count=abstract_result.word_count)
@@ -1663,6 +1825,10 @@ class MetaDataAgent(ReActAgent):
                         word_count=conclusion_result.word_count or 0,
                         phase=Phase.SYNTHESIS,
                     )
+                    if save_output and paper_dir:
+                        conc_label = _sec_filename("conclusion")
+                        await _sa(paper_dir, f"sections/{conc_label}.tex",
+                                  conclusion_result.latex_content, emitter, "section", f"{conc_label}.tex")
                     memory.log("metadata", "phase3", "conclusion_generated",
                                narrative=f"Writer completed the conclusion ({conclusion_result.word_count} words).",
                                word_count=conclusion_result.word_count)
@@ -1704,8 +1870,30 @@ class MetaDataAgent(ReActAgent):
                 feedback_queue=feedback_queue,
                 feedback_timeout=feedback_timeout,
                 progress_callback=progress_callback,
+                enable_user_feedback=enable_user_feedback,
+                ref_pool=ref_pool,
+                artifacts_prefix=artifacts_prefix,
             )
             if orchestration_errors:
+                is_paused = any(
+                    e.startswith("__paused_for_feedback__:") for e in orchestration_errors
+                )
+                if is_paused:
+                    ckpt = next(
+                        (e.split(":", 1)[1] for e in orchestration_errors
+                         if e.startswith("__paused_for_feedback__:")),
+                        "",
+                    )
+                    return PaperGenerationResult(
+                        status="paused_for_feedback",
+                        paper_title=metadata.title,
+                        sections=sections_results,
+                        total_word_count=sum(r.word_count for r in sections_results if r.word_count),
+                        target_word_count=target_word_count,
+                        review_iterations=review_iterations,
+                        output_path=str(paper_dir) if paper_dir else None,
+                        errors=[f"checkpoint:{ckpt}"],
+                    )
                 errors.extend(orchestration_errors)
 
             # Recompute citation usage from final post-review content so exports align
@@ -1734,49 +1922,15 @@ class MetaDataAgent(ReActAgent):
             output_path = None
             if save_output and paper_dir:
                 output_path = str(paper_dir)
-                analysis_dir = paper_dir / "analysis"
-                planning_dir = analysis_dir / "planning"
-                research_dir = analysis_dir / "research_context"
-                citation_dir = analysis_dir / "citations"
-                structure_dir = analysis_dir / "structure"
-                review_dir = analysis_dir / "review"
-                references_dir = analysis_dir / "references"
-                code_dir = analysis_dir / "code_context"
-                logs_dir = paper_dir / "logs"
-                traces_dir = logs_dir / "traces"
-                for d in (
-                    analysis_dir,
-                    planning_dir,
-                    research_dir,
-                    citation_dir,
-                    structure_dir,
-                    review_dir,
-                    references_dir,
-                    code_dir,
-                    logs_dir,
-                    traces_dir,
-                ):
-                    d.mkdir(parents=True, exist_ok=True)
-                
-                # Save main.tex
-                tex_path = paper_dir / "main.tex"
-                tex_path.write_text(latex_content, encoding="utf-8")
-                
-                # Save references.bib (uses ref_pool for all accumulated refs)
-                bib_content = ref_pool.to_bibtex()
-                bib_path = paper_dir / "references.bib"
-                bib_path.write_text(bib_content, encoding="utf-8")
-                
-                # Save metadata.json
-                meta_path = paper_dir / "metadata.json"
-                meta_path.write_text(
-                    json.dumps(metadata.model_dump(), indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
 
-                # Save research_context.json (if generated)
+                await _sa(paper_dir, "main.tex", latex_content, emitter, "root", "Main LaTeX")
+                await _sa(paper_dir, "references.bib", ref_pool.to_bibtex(), emitter, "references", "References BibTeX")
+                await _sa(paper_dir, "metadata.json",
+                          json.dumps(metadata.model_dump(), indent=2, ensure_ascii=False),
+                          emitter, "root", "Metadata")
+
+                # Research context artifacts
                 if research_context:
-                    rc_path = research_dir / "research_context.json"
                     context_output = dict(research_context)
                     context_output.pop("_llm_raw_outputs", None)
                     core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
@@ -1787,14 +1941,11 @@ class MetaDataAgent(ReActAgent):
                     context_output["core_ref_ids"] = core_ref_ids
                     context_output["core_refs_with_abstract_count"] = core_refs_with_abstract_count
                     context_output["generated_at"] = datetime.now().isoformat()
-                    rc_path.write_text(
-                        json.dumps(context_output, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Research context saved to: {rc_path}")
+                    await _sa(paper_dir, "analysis/research_context/research_context.json",
+                              json.dumps(context_output, indent=2, ensure_ascii=False),
+                              emitter, "research_context", "Research Context")
 
                 if research_context_v1:
-                    rc_v1_path = research_dir / "research_context_v1.json"
                     rc_v1_payload = dict(research_context_v1)
                     raw_outputs_v1 = rc_v1_payload.pop("_llm_raw_outputs", None)
                     core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
@@ -1805,21 +1956,15 @@ class MetaDataAgent(ReActAgent):
                     rc_v1_payload["core_ref_ids"] = core_ref_ids
                     rc_v1_payload["core_refs_with_abstract_count"] = core_refs_with_abstract_count
                     rc_v1_payload["generated_at"] = datetime.now().isoformat()
-                    rc_v1_path.write_text(
-                        json.dumps(rc_v1_payload, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Research context v1 saved to: {rc_v1_path}")
+                    await _sa(paper_dir, "analysis/research_context/research_context_v1.json",
+                              json.dumps(rc_v1_payload, indent=2, ensure_ascii=False),
+                              emitter, "research_context", "Research Context v1")
                     if raw_outputs_v1:
-                        raw_path = research_dir / "research_context_v1_raw.txt"
-                        raw_path.write_text(
-                            "\n\n---\n\n".join(raw_outputs_v1),
-                            encoding="utf-8",
-                        )
-                        print(f"[MetaDataAgent] Research context v1 raw LLM outputs saved to: {raw_path}")
+                        await _sa(paper_dir, "analysis/research_context/research_context_v1_raw.txt",
+                                  "\n\n---\n\n".join(raw_outputs_v1),
+                                  emitter, "research_context", "Research Context v1 Raw")
 
                 if research_context_v2:
-                    rc_v2_path = research_dir / "research_context_v2.json"
                     rc_v2_payload = dict(research_context_v2)
                     raw_outputs_v2 = rc_v2_payload.pop("_llm_raw_outputs", None)
                     core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
@@ -1830,40 +1975,23 @@ class MetaDataAgent(ReActAgent):
                     rc_v2_payload["core_ref_ids"] = core_ref_ids
                     rc_v2_payload["core_refs_with_abstract_count"] = core_refs_with_abstract_count
                     rc_v2_payload["generated_at"] = datetime.now().isoformat()
-                    rc_v2_path.write_text(
-                        json.dumps(rc_v2_payload, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Research context v2 saved to: {rc_v2_path}")
+                    await _sa(paper_dir, "analysis/research_context/research_context_v2.json",
+                              json.dumps(rc_v2_payload, indent=2, ensure_ascii=False),
+                              emitter, "research_context", "Research Context v2")
                     if raw_outputs_v2:
-                        raw_path = research_dir / "research_context_v2_raw.txt"
-                        raw_path.write_text(
-                            "\n\n---\n\n".join(raw_outputs_v2),
-                            encoding="utf-8",
-                        )
-                        print(f"[MetaDataAgent] Research context v2 raw LLM outputs saved to: {raw_path}")
+                        await _sa(paper_dir, "analysis/research_context/research_context_v2_raw.txt",
+                                  "\n\n---\n\n".join(raw_outputs_v2),
+                                  emitter, "research_context", "Research Context v2 Raw")
 
                 if research_context:
                     cem = research_context.get("claim_evidence_matrix", [])
                     cr = research_context.get("contribution_ranking", {"P0": [], "P1": [], "P2": []})
-                    cem_path = research_dir / "claim_evidence_matrix.json"
-                    cem_path.write_text(
-                        json.dumps(
-                            {"claim_evidence_matrix": cem, "generated_at": datetime.now().isoformat()},
-                            indent=2,
-                            ensure_ascii=False,
-                        ),
-                        encoding="utf-8",
-                    )
-                    cr_path = research_dir / "contribution_ranking.json"
-                    cr_path.write_text(
-                        json.dumps(
-                            {"contribution_ranking": cr, "generated_at": datetime.now().isoformat()},
-                            indent=2,
-                            ensure_ascii=False,
-                        ),
-                        encoding="utf-8",
-                    )
+                    await _sa(paper_dir, "analysis/research_context/claim_evidence_matrix.json",
+                              json.dumps({"claim_evidence_matrix": cem, "generated_at": datetime.now().isoformat()}, indent=2, ensure_ascii=False),
+                              emitter, "research_context", "Claim Evidence Matrix")
+                    await _sa(paper_dir, "analysis/research_context/contribution_ranking.json",
+                              json.dumps({"contribution_ranking": cr, "generated_at": datetime.now().isoformat()}, indent=2, ensure_ascii=False),
+                              emitter, "research_context", "Contribution Ranking")
                     rc_cfg_for_export = (
                         self.tools_config.research_context
                         if self.tools_config and self.tools_config.research_context
@@ -1874,22 +2002,12 @@ class MetaDataAgent(ReActAgent):
                         and rc_cfg_for_export.export_planning_decision_trace
                         and research_context.get("planning_decision_trace")
                     ):
-                        pdt_path = research_dir / "planning_decision_trace.json"
-                        pdt_path.write_text(
-                            json.dumps(
-                                {
-                                    "planning_decision_trace": research_context.get(
-                                        "planning_decision_trace", []
-                                    ),
-                                    "generated_at": datetime.now().isoformat(),
-                                },
-                                indent=2,
-                                ensure_ascii=False,
-                            ),
-                            encoding="utf-8",
-                        )
-                        print(f"[MetaDataAgent] Planning decision trace saved to: {pdt_path}")
+                        await _sa(paper_dir, "analysis/research_context/planning_decision_trace.json",
+                                  json.dumps({"planning_decision_trace": research_context.get("planning_decision_trace", []),
+                                              "generated_at": datetime.now().isoformat()}, indent=2, ensure_ascii=False),
+                                  emitter, "research_context", "Planning Decision Trace")
 
+                # Citation artifacts
                 ps_cfg_for_export = (
                     self.tools_config.paper_search
                     if self.tools_config and self.tools_config.paper_search
@@ -1899,7 +2017,6 @@ class MetaDataAgent(ReActAgent):
                     ps_cfg_for_export and ps_cfg_for_export.citation_budget_export
                 )
                 if budget_export_enabled and paper_plan:
-                    # Keep usage rows in plan section order for stable auditing.
                     usage_by_section = {
                         row.get("section_type"): row
                         for row in citation_budget_usage
@@ -1915,130 +2032,74 @@ class MetaDataAgent(ReActAgent):
                     for sp in paper_plan.sections:
                         if not sp.citation_budget:
                             continue
-                        budget_plan_rows.append(
-                            {
-                                "section_type": sp.section_type,
-                                "citation_budget": sp.citation_budget,
-                                "budget_selected_refs": sp.budget_selected_refs,
-                                "budget_reserve_refs": sp.budget_reserve_refs,
-                                "budget_must_use_refs": sp.budget_must_use_refs,
-                                "assigned_refs": sp.assigned_refs,
-                            }
-                        )
-                    budget_plan_path = citation_dir / "citation_budget_plan.json"
+                        budget_plan_rows.append({
+                            "section_type": sp.section_type,
+                            "citation_budget": sp.citation_budget,
+                            "budget_selected_refs": sp.budget_selected_refs,
+                            "budget_reserve_refs": sp.budget_reserve_refs,
+                            "budget_must_use_refs": sp.budget_must_use_refs,
+                            "assigned_refs": sp.assigned_refs,
+                        })
                     plan_export = {
                         "citation_strategy": paper_plan.citation_strategy if paper_plan else {},
                         "sections": budget_plan_rows,
                         "generated_at": datetime.now().isoformat(),
                     }
-                    budget_plan_path.write_text(
-                        json.dumps(plan_export, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Citation budget plan saved to: {budget_plan_path}")
-
-                    budget_usage_path = citation_dir / "citation_budget_usage.json"
-                    budget_usage_path.write_text(
-                        json.dumps(
-                            {
-                                "sections": ordered_usage,
-                                "generated_at": datetime.now().isoformat(),
-                            },
-                            indent=2,
-                            ensure_ascii=False,
-                        ),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Citation budget usage saved to: {budget_usage_path}")
+                    await _sa(paper_dir, "analysis/citations/citation_budget_plan.json",
+                              json.dumps(plan_export, indent=2, ensure_ascii=False),
+                              emitter, "citations", "Citation Budget Plan")
+                    await _sa(paper_dir, "analysis/citations/citation_budget_usage.json",
+                              json.dumps({"sections": ordered_usage, "generated_at": datetime.now().isoformat()}, indent=2, ensure_ascii=False),
+                              emitter, "citations", "Citation Budget Usage")
 
                     alignment_stats = self._build_citation_plan_alignment_stats(
-                        paper_plan=paper_plan,
-                        usage_rows=ordered_usage,
+                        paper_plan=paper_plan, usage_rows=ordered_usage,
                     )
                     alignment_stats["generated_at"] = datetime.now().isoformat()
-                    alignment_path = citation_dir / "citation_plan_alignment.json"
-                    alignment_path.write_text(
-                        json.dumps(alignment_stats, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Citation plan alignment saved to: {alignment_path}")
-                    citation_repair_stats = self._build_citation_repair_stats(
-                        memory=memory,
-                    )
-                    citation_repair_stats["generated_at"] = datetime.now().isoformat()
-                    citation_repair_path = citation_dir / "citation_repair_stats.json"
-                    citation_repair_path.write_text(
-                        json.dumps(citation_repair_stats, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(
-                        "[MetaDataAgent] Citation repair stats saved to: "
-                        f"{citation_repair_path}"
-                    )
+                    await _sa(paper_dir, "analysis/citations/citation_plan_alignment.json",
+                              json.dumps(alignment_stats, indent=2, ensure_ascii=False),
+                              emitter, "citations", "Citation Plan Alignment")
 
+                    citation_repair_stats = self._build_citation_repair_stats(memory=memory)
+                    citation_repair_stats["generated_at"] = datetime.now().isoformat()
+                    await _sa(paper_dir, "analysis/citations/citation_repair_stats.json",
+                              json.dumps(citation_repair_stats, indent=2, ensure_ascii=False),
+                              emitter, "citations", "Citation Repair Stats")
+
+                # Structure artifacts
                 if paper_plan:
                     structure_alignment = self._build_structure_alignment_stats(
-                        paper_plan=paper_plan,
-                        generated_sections=generated_sections,
+                        paper_plan=paper_plan, generated_sections=generated_sections,
                     )
                     structure_alignment["generated_at"] = datetime.now().isoformat()
-                    structure_alignment_path = structure_dir / "structure_alignment.json"
-                    structure_alignment_path.write_text(
-                        json.dumps(structure_alignment, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(
-                        "[MetaDataAgent] Structure alignment saved to: "
-                        f"{structure_alignment_path}"
-                    )
+                    await _sa(paper_dir, "analysis/structure/structure_alignment.json",
+                              json.dumps(structure_alignment, indent=2, ensure_ascii=False),
+                              emitter, "structure", "Structure Alignment")
+
                     paragraph_alignment = self._build_paragraph_feedback_alignment_report(
-                        memory=memory,
-                        generated_sections=generated_sections,
+                        memory=memory, generated_sections=generated_sections,
                     )
                     paragraph_alignment["generated_at"] = datetime.now().isoformat()
-                    paragraph_alignment_path = (
-                        structure_dir / "paragraph_feedback_alignment.json"
-                    )
-                    paragraph_alignment_path.write_text(
-                        json.dumps(paragraph_alignment, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(
-                        "[MetaDataAgent] Paragraph feedback alignment saved to: "
-                        f"{paragraph_alignment_path}"
-                    )
+                    await _sa(paper_dir, "analysis/structure/paragraph_feedback_alignment.json",
+                              json.dumps(paragraph_alignment, indent=2, ensure_ascii=False),
+                              emitter, "structure", "Paragraph Feedback Alignment")
+
                     subsection_coverage = self._build_explicit_subsection_coverage(
-                        paper_plan=paper_plan,
-                        generated_sections=generated_sections,
+                        paper_plan=paper_plan, generated_sections=generated_sections,
                     )
                     subsection_coverage["generated_at"] = datetime.now().isoformat()
-                    subsection_coverage_path = (
-                        structure_dir / "explicit_subsection_coverage.json"
-                    )
-                    subsection_coverage_path.write_text(
-                        json.dumps(subsection_coverage, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(
-                        "[MetaDataAgent] Explicit subsection coverage saved to: "
-                        f"{subsection_coverage_path}"
-                    )
+                    await _sa(paper_dir, "analysis/structure/explicit_subsection_coverage.json",
+                              json.dumps(subsection_coverage, indent=2, ensure_ascii=False),
+                              emitter, "structure", "Explicit Subsection Coverage")
 
-                reviewer_acceptance_stats = self._build_reviewer_acceptance_stats(
-                    memory=memory,
-                )
+                # Review artifacts
+                reviewer_acceptance_stats = self._build_reviewer_acceptance_stats(memory=memory)
                 reviewer_acceptance_stats["generated_at"] = datetime.now().isoformat()
-                reviewer_acceptance_path = review_dir / "reviewer_acceptance_stats.json"
-                reviewer_acceptance_path.write_text(
-                    json.dumps(reviewer_acceptance_stats, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                print(
-                    "[MetaDataAgent] Reviewer acceptance stats saved to: "
-                    f"{reviewer_acceptance_path}"
-                )
+                await _sa(paper_dir, "analysis/review/reviewer_acceptance_stats.json",
+                          json.dumps(reviewer_acceptance_stats, indent=2, ensure_ascii=False),
+                          emitter, "reviews", "Reviewer Acceptance Stats")
 
-                # Save per-paper planner analysis for auditability
+                # References discovery analysis
                 if discovered_references_by_section:
                     core_ref_id_set = {
                         r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")
@@ -2060,94 +2121,92 @@ class MetaDataAgent(ReActAgent):
                                 "relevance_reason": paper.get("relevance_reason", ""),
                                 "is_core_reference": ref_id in core_ref_id_set,
                             })
-
                     analysis_payload = {
                         "total_sections": len(discovered_references_by_section),
                         "total_papers": len(analysis_rows),
                         "papers": analysis_rows,
                         "generated_at": datetime.now().isoformat(),
                     }
-                    analysis_path = references_dir / "discovered_papers_analysis.json"
-                    analysis_path.write_text(
-                        json.dumps(analysis_payload, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Discovered papers analysis saved to: {analysis_path}")
+                    await _sa(paper_dir, "analysis/references/discovered_papers_analysis.json",
+                              json.dumps(analysis_payload, indent=2, ensure_ascii=False),
+                              emitter, "references", "Discovered Papers Analysis")
 
-                # Save code repository summary markdown (if generated)
+                # Code context artifacts
                 if code_context:
-                    graph_path = code_dir / "code_evidence_graph.json"
-                    graph_path.write_text(
-                        json.dumps(
-                            {
-                                "code_evidence_graph": code_context.get("code_evidence_graph", []),
-                                "generated_at": datetime.now().isoformat(),
-                            },
-                            indent=2,
-                            ensure_ascii=False,
-                        ),
-                        encoding="utf-8",
-                    )
-                    assets_path = code_dir / "writing_assets.json"
-                    assets_path.write_text(
-                        json.dumps(
-                            {
-                                "writing_assets": code_context.get("writing_assets", {}),
-                                "section_asset_packs": code_context.get("section_asset_packs", {}),
-                                "claim_support_candidates": code_context.get("claim_support_candidates", []),
-                                "generated_at": datetime.now().isoformat(),
-                            },
-                            indent=2,
-                            ensure_ascii=False,
-                        ),
-                        encoding="utf-8",
-                    )
+                    await _sa(paper_dir, "analysis/code_context/code_evidence_graph.json",
+                              json.dumps({"code_evidence_graph": code_context.get("code_evidence_graph", []),
+                                          "generated_at": datetime.now().isoformat()}, indent=2, ensure_ascii=False),
+                              emitter, "code_analysis", "Code Evidence Graph")
+                    await _sa(paper_dir, "analysis/code_context/writing_assets.json",
+                              json.dumps({"writing_assets": code_context.get("writing_assets", {}),
+                                          "section_asset_packs": code_context.get("section_asset_packs", {}),
+                                          "claim_support_candidates": code_context.get("claim_support_candidates", []),
+                                          "generated_at": datetime.now().isoformat()}, indent=2, ensure_ascii=False),
+                              emitter, "code_analysis", "Writing Assets")
                     if paper_plan:
                         focus_rows: List[Dict[str, Any]] = []
                         for sp in paper_plan.sections:
                             if not getattr(sp, "code_focus", None):
                                 continue
-                            focus_rows.append(
-                                {
-                                    "section_type": sp.section_type,
-                                    "section_title": sp.section_title,
-                                    "code_focus": sp.code_focus,
-                                }
-                            )
-                        focus_path = code_dir / "section_code_focus_plan.json"
-                        focus_path.write_text(
-                            json.dumps(
-                                {
-                                    "sections": focus_rows,
-                                    "generated_at": datetime.now().isoformat(),
-                                },
-                                indent=2,
-                                ensure_ascii=False,
-                            ),
-                            encoding="utf-8",
-                        )
-                    print(f"[MetaDataAgent] Code analysis artifacts saved to: {code_dir}")
+                            focus_rows.append({
+                                "section_type": sp.section_type,
+                                "section_title": sp.section_title,
+                                "code_focus": sp.code_focus,
+                            })
+                        await _sa(paper_dir, "analysis/code_context/section_code_focus_plan.json",
+                                  json.dumps({"sections": focus_rows, "generated_at": datetime.now().isoformat()},
+                                             indent=2, ensure_ascii=False),
+                                  emitter, "code_analysis", "Section Code Focus Plan")
 
                 if code_summary_markdown:
-                    crs_path = code_dir / "code_repository_summary.md"
-                    crs_path.write_text(code_summary_markdown, encoding="utf-8")
-                    print(f"[MetaDataAgent] Code repository summary saved to: {crs_path}")
+                    await _sa(paper_dir, "analysis/code_context/code_repository_summary.md",
+                              code_summary_markdown, emitter, "code_analysis", "Code Repository Summary")
 
-                # Save prompt/evidence traces (optional)
+                # Prompt traces
                 if metadata.export_prompt_traces and prompt_traces:
-                    traces_path = traces_dir / "prompt_traces.json"
-                    traces_path.write_text(
-                        json.dumps(prompt_traces, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Prompt traces saved to: {traces_path}")
+                    await _sa(paper_dir, "logs/traces/prompt_traces.json",
+                              json.dumps(prompt_traces, indent=2, ensure_ascii=False),
+                              emitter, "logs", "Prompt Traces")
 
-                # Persist session memory (review history + agent logs)
+                # Session memory (review history + agent logs)
                 memory.log("metadata", "final", "paper_assembled",
                            narrative=f"Paper assembled successfully with {total_words} total words.",
                            total_words=total_words, status="assembled")
                 memory.persist_all(paper_dir)
-                
+
+                # Emit artifact events for session memory files
+                for mem_file, cat, lbl in [
+                    ("logs/review/review_history.json", "reviews", "Review History"),
+                    ("logs/review/review_history_readable.json", "reviews", "Review History (Readable)"),
+                    ("logs/agent/agent_logs.json", "logs", "Agent Logs"),
+                ]:
+                    mem_path = paper_dir / mem_file
+                    if mem_path.exists():
+                        mem_storage_key = ""
+                        if artifacts_prefix:
+                            candidate_mem_key = f"{artifacts_prefix}/{mem_file}"
+                            from ...utils.storage_client import storage_client
+                            if await storage_client.upload(candidate_mem_key, mem_path.read_bytes()):
+                                mem_storage_key = candidate_mem_key
+                        await emitter.artifact_saved(
+                            relative_path=mem_file,
+                            absolute_path=str(mem_path),
+                            category=cat,
+                            size=mem_path.stat().st_size,
+                            mime_type="application/json",
+                            label=lbl,
+                            storage_key=mem_storage_key,
+                        )
+
+                if pdf_path:
+                    await _sa(paper_dir, "output.pdf",
+                              Path(pdf_path).read_bytes(), emitter, "output", "Paper PDF")
+                    compile_dir = Path(pdf_path).parent
+                    if compile_dir.is_dir() and compile_dir != paper_dir:
+                        await self._save_compilation_output(
+                            compile_dir, paper_dir, emitter, artifacts_prefix,
+                        )
+
                 print(f"[MetaDataAgent] Output saved to: {output_path}")
             
             # Determine overall status
@@ -2164,6 +2223,7 @@ class MetaDataAgent(ReActAgent):
                 review_iterations=review_iterations,
                 sections_count=len([s for s in sections_results if s.status == "ok"]),
                 pdf_path=pdf_path,
+                paper_dir=str(paper_dir) if paper_dir else None,
             )
             
             return PaperGenerationResult(
@@ -2188,7 +2248,413 @@ class MetaDataAgent(ReActAgent):
                 sections=sections_results,
                 errors=[str(e)],
             )
-    
+
+    async def resume_from_checkpoint(
+        self,
+        checkpoint_path: str,
+        user_feedback: Dict[str, Any],
+        progress_callback: Optional[ProgressCallback] = None,
+        artifacts_prefix: str = "",
+    ) -> PaperGenerationResult:
+        """
+        Resume generation from a checkpoint after user feedback.
+        - **Description**:
+            - Loads a ReviewCheckpoint from disk, injects user feedback as
+              additional RevisionTasks, then continues the review-revision loop.
+
+        - **Args**:
+            - `checkpoint_path` (str): Path to the checkpoint JSON file.
+            - `user_feedback` (dict): User feedback payload with action, global_feedback,
+              and optional section_annotations.
+            - `progress_callback` (ProgressCallback): Callback for streaming events.
+
+        - **Returns**:
+            - `PaperGenerationResult`: Final result after completing revisions.
+        """
+        from .models import ReviewCheckpoint
+        from ..reviewer_agent.models import (
+            ReviewResult as ReviewerReviewResult,
+            RevisionTask,
+            SectionFeedback,
+        )
+        from ..shared.session_memory import SessionMemory
+
+        ckpt_data = Path(checkpoint_path).read_text(encoding="utf-8")
+        ckpt = ReviewCheckpoint.model_validate_json(ckpt_data)
+
+        emitter = ProgressEmitter(progress_callback)
+
+        metadata = PaperMetaData.model_validate(ckpt.metadata)
+        generated_sections = dict(ckpt.generated_sections)
+        sections_results = list(ckpt.sections_results)
+        review_result = ReviewerReviewResult.model_validate(ckpt.review_result)
+        memory = SessionMemory.from_dict(ckpt.memory) if ckpt.memory else SessionMemory()
+        ref_pool = ReferencePool.from_dict(ckpt.ref_pool) if ckpt.ref_pool else ReferencePool([])
+
+        fb_action = user_feedback.get("action", "continue")
+        if fb_action == "stop":
+            print("[ResumeCheckpoint] User requested stop")
+            await emitter.review_feedback_received(
+                feedback_text=user_feedback.get("global_feedback", ""),
+                action=fb_action,
+            )
+            return PaperGenerationResult(
+                status="ok",
+                paper_title=metadata.title,
+                sections=sections_results,
+                total_word_count=sum(r.word_count for r in sections_results if r.word_count),
+                review_iterations=ckpt.review_iterations,
+                output_path=ckpt.paper_dir,
+            )
+        elif fb_action == "accept":
+            review_result.passed = True
+            print("[ResumeCheckpoint] User accepted current state — skipping review loop")
+        else:
+            global_fb = user_feedback.get("global_feedback", "")
+            section_annotations = user_feedback.get("section_annotations", [])
+
+            # Build a lookup for existing section feedbacks so we can merge
+            sf_by_section = {sf.section_type: sf for sf in review_result.section_feedbacks}
+
+            for ann in section_annotations:
+                sec_type = ann.get("section_type", "")
+                if not sec_type:
+                    continue
+                sec_fb = ann.get("feedback", "")
+                para_annotations = ann.get("paragraph_annotations", [])
+                combined_fb_parts = []
+                if sec_fb:
+                    combined_fb_parts.append(f"Section-level: {sec_fb}")
+                for pa in para_annotations:
+                    p_idx = pa.get("paragraph_index", 0)
+                    p_fb = pa.get("feedback", "")
+                    if p_fb:
+                        combined_fb_parts.append(f"Paragraph {p_idx}: {p_fb}")
+                if not combined_fb_parts:
+                    continue
+
+                user_instruction = "USER FEEDBACK (high priority):\n" + "\n".join(
+                    [f"- {part}" for part in combined_fb_parts]
+                )
+
+                # Merge into section_feedbacks so _apply_revisions picks it up
+                if sec_type in sf_by_section:
+                    sf = sf_by_section[sec_type]
+                    sf.revision_prompt = (
+                        user_instruction + "\n\n" + (sf.revision_prompt or "")
+                    ).strip()
+                    if sf.action == "ok":
+                        sf.action = "refine_paragraphs"
+                else:
+                    new_sf = SectionFeedback(
+                        section_type=sec_type,
+                        current_word_count=0,
+                        target_word_count=0,
+                        action="refine_paragraphs",
+                        delta_words=0,
+                        revision_prompt=user_instruction,
+                    )
+                    review_result.section_feedbacks.append(new_sf)
+                    sf_by_section[sec_type] = new_sf
+
+                # Also add as revision task for completeness
+                review_result.revision_tasks.append(
+                    RevisionTask(
+                        section_type=sec_type,
+                        target_id=sec_type,
+                        instruction=f"User feedback: {'; '.join(combined_fb_parts)}",
+                    )
+                )
+
+            if global_fb:
+                global_instruction = f"USER GLOBAL FEEDBACK (high priority): {global_fb}"
+                targets = list(review_result.requires_revision.keys())[:3] or list(sf_by_section.keys())[:3]
+                for sec_type in targets:
+                    if sec_type in sf_by_section:
+                        sf = sf_by_section[sec_type]
+                        sf.revision_prompt = (
+                            global_instruction + "\n\n" + (sf.revision_prompt or "")
+                        ).strip()
+                        if sf.action == "ok":
+                            sf.action = "refine_paragraphs"
+                    else:
+                        new_sf = SectionFeedback(
+                            section_type=sec_type,
+                            current_word_count=0,
+                            target_word_count=0,
+                            action="refine_paragraphs",
+                            delta_words=0,
+                            revision_prompt=global_instruction,
+                        )
+                        review_result.section_feedbacks.append(new_sf)
+                        sf_by_section[sec_type] = new_sf
+                    review_result.revision_tasks.append(
+                        RevisionTask(
+                            section_type=sec_type,
+                            target_id=sec_type,
+                            instruction=f"User global feedback: {global_fb}",
+                        )
+                    )
+
+        await emitter.review_feedback_received(
+            feedback_text=user_feedback.get("global_feedback", ""),
+            action=fb_action,
+        )
+
+        paper_plan = None
+        if ckpt.paper_plan:
+            try:
+                paper_plan = PaperPlan.model_validate(ckpt.paper_plan)
+            except Exception:
+                paper_plan = None
+
+        paper_dir = Path(ckpt.paper_dir) if ckpt.paper_dir else None
+
+        if fb_action == "accept":
+            # Skip review loop entirely — go straight to finalization
+            try:
+                pdf_path = ckpt.pdf_path
+                review_iterations = ckpt.review_iterations
+                target_word_count = ckpt.target_word_count
+                final_dir = None
+
+                if ckpt.compile_pdf and ckpt.template_path and paper_dir:
+                    await emitter.phase_start(Phase.PDF_COMPILE, "Final PDF compilation")
+                    await emitter.compile_start(iteration=review_iterations)
+                    final_dir = paper_dir / f"iteration_{review_iterations:02d}_accepted"
+                    final_dir.mkdir(parents=True, exist_ok=True)
+                    figure_base_path = os.getcwd()
+                    figure_paths = self._collect_figure_paths(metadata.figures, base_path=figure_base_path)
+                    final_pdf, _, final_errors, _ = await self._compile_pdf(
+                        generated_sections=generated_sections,
+                        template_path=ckpt.template_path,
+                        references=ref_pool.get_all_refs(),
+                        output_dir=final_dir,
+                        paper_title=metadata.title,
+                        figures_source_dir=ckpt.figures_source_dir,
+                        figure_paths=figure_paths,
+                        converted_tables=ckpt.converted_tables,
+                        paper_plan=paper_plan,
+                        figures=metadata.figures,
+                        metadata_tables=metadata.tables,
+                    )
+                    if final_pdf:
+                        pdf_path = str(final_pdf)
+                        await emitter.compile_complete(success=True, pdf_path=pdf_path)
+                    else:
+                        await emitter.compile_complete(success=False, pdf_path=None)
+
+                latex_content = self._assemble_paper(
+                    title=metadata.title,
+                    sections=generated_sections,
+                    references=ref_pool.get_all_refs(),
+                    valid_citation_keys=ref_pool.valid_citation_keys,
+                )
+                total_words = sum(r.word_count for r in sections_results if r.word_count)
+
+                _sa_accept = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
+
+                if paper_dir:
+                    tex_path = paper_dir / "main.tex"
+                    tex_path.write_text(latex_content, encoding="utf-8")
+                    await _sa_accept(paper_dir, "main.tex", latex_content, emitter, "root", "Main LaTeX")
+                    await _sa_accept(paper_dir, "references.bib",
+                                     ref_pool.to_bibtex(), emitter, "references", "References BibTeX")
+                    if pdf_path:
+                        await _sa_accept(paper_dir, "output.pdf",
+                                         Path(pdf_path).read_bytes(), emitter, "output", "Paper PDF")
+                    for sec_type, sec_content in generated_sections.items():
+                        sec_label = sec_type.replace(" ", "_")
+                        await _sa_accept(paper_dir, f"sections/{sec_label}.tex",
+                                         sec_content, emitter, "section", f"{sec_label}.tex")
+
+                if final_dir and final_dir.is_dir():
+                    await self._save_compilation_output(
+                        final_dir, paper_dir, emitter, artifacts_prefix,
+                    )
+
+                await emitter.completed(
+                    status="ok",
+                    total_words=total_words,
+                    sections_count=len(sections_results),
+                    pdf_path=pdf_path,
+                    review_iterations=review_iterations,
+                )
+
+                return PaperGenerationResult(
+                    status="ok",
+                    paper_title=metadata.title,
+                    sections=sections_results,
+                    latex_content=latex_content,
+                    output_path=str(paper_dir) if paper_dir else None,
+                    pdf_path=pdf_path,
+                    total_word_count=total_words,
+                    target_word_count=target_word_count,
+                    review_iterations=review_iterations,
+                )
+            except Exception as e:
+                print(f"[ResumeCheckpoint] Accept finalization error: {e}")
+                await emitter.error(message=str(e), phase="accept_finalization")
+                return PaperGenerationResult(
+                    status="error",
+                    paper_title=metadata.title,
+                    sections=sections_results,
+                    errors=[str(e)],
+                )
+
+        # fb_action == "continue": apply user-feedback revisions then re-enter review loop
+        if review_result.revision_tasks:
+            print(
+                f"[ResumeCheckpoint] Applying {len(review_result.revision_tasks)} "
+                f"revision task(s) from user feedback before re-review"
+            )
+            valid_keys = self._extract_valid_citation_keys(ref_pool.get_all_refs())
+            revised = await self._apply_revisions(
+                review_result=review_result,
+                generated_sections=generated_sections,
+                sections_results=sections_results,
+                valid_citation_keys=valid_keys,
+                metadata=metadata,
+                memory=memory,
+            )
+            if revised:
+                print(f"[ResumeCheckpoint] Revised sections: {sorted(revised)}")
+                for rev_sec in revised:
+                    await emitter.revision_applied(
+                        section_type=rev_sec,
+                        iteration=ckpt.review_iterations,
+                    )
+                    if paper_dir and rev_sec in generated_sections:
+                        _plan_titles = paper_plan.get_section_titles() if paper_plan else {}
+                        sec_label = _plan_titles.get(rev_sec, rev_sec.replace("_", " ").title())
+                        _sa_resume = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
+                        await _sa_resume(paper_dir, f"sections/{sec_label}.tex",
+                                         generated_sections[rev_sec], emitter, "section", f"{sec_label}.tex")
+            else:
+                print("[ResumeCheckpoint] No sections were revised")
+
+        remaining_iterations = max(1, ckpt.max_review_iterations - ckpt.review_iterations)
+        print(
+            f"[ResumeCheckpoint] Resuming review loop: "
+            f"{ckpt.review_iterations} done, {remaining_iterations} remaining"
+        )
+        try:
+            (
+                generated_sections,
+                sections_results,
+                review_iterations,
+                target_word_count,
+                pdf_path,
+                orchestration_errors,
+            ) = await self._run_review_orchestration(
+                generated_sections=generated_sections,
+                sections_results=sections_results,
+                metadata=metadata,
+                parsed_refs=ref_pool.get_all_refs(),
+                paper_plan=paper_plan,
+                template_path=ckpt.template_path,
+                figures_source_dir=ckpt.figures_source_dir,
+                converted_tables=ckpt.converted_tables,
+                max_review_iterations=remaining_iterations,
+                enable_review=ckpt.enable_review,
+                compile_pdf=ckpt.compile_pdf,
+                enable_vlm_review=ckpt.enable_vlm_review,
+                target_pages=ckpt.target_pages,
+                paper_dir=paper_dir,
+                memory=memory,
+                emitter=emitter,
+                progress_callback=progress_callback,
+                enable_user_feedback=True,
+                ref_pool=ref_pool,
+                artifacts_prefix=artifacts_prefix,
+            )
+            review_iterations += ckpt.review_iterations
+
+            errors: List[str] = []
+            if orchestration_errors:
+                is_paused = any(
+                    e.startswith("__paused_for_feedback__:") for e in orchestration_errors
+                )
+                if is_paused:
+                    ckpt_new = next(
+                        (e.split(":", 1)[1] for e in orchestration_errors
+                         if e.startswith("__paused_for_feedback__:")),
+                        "",
+                    )
+                    return PaperGenerationResult(
+                        status="paused_for_feedback",
+                        paper_title=metadata.title,
+                        sections=sections_results,
+                        total_word_count=sum(r.word_count for r in sections_results if r.word_count),
+                        target_word_count=target_word_count,
+                        review_iterations=review_iterations,
+                        output_path=str(paper_dir) if paper_dir else None,
+                        errors=[f"checkpoint:{ckpt_new}"],
+                    )
+                errors.extend(orchestration_errors)
+
+            latex_content = self._assemble_paper(
+                title=metadata.title,
+                sections=generated_sections,
+                references=ref_pool.get_all_refs(),
+                valid_citation_keys=ref_pool.valid_citation_keys,
+            )
+            total_words = sum(r.word_count for r in sections_results if r.word_count)
+
+            _sa_cont = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
+
+            if paper_dir:
+                tex_path = paper_dir / "main.tex"
+                tex_path.write_text(latex_content, encoding="utf-8")
+                await _sa_cont(paper_dir, "main.tex", latex_content, emitter, "root", "Main LaTeX")
+                await _sa_cont(paper_dir, "references.bib",
+                               ref_pool.to_bibtex(), emitter, "references", "References BibTeX")
+                if pdf_path:
+                    await _sa_cont(paper_dir, "output.pdf",
+                                   Path(pdf_path).read_bytes(), emitter, "output", "Paper PDF")
+                for sec_type, sec_content in generated_sections.items():
+                    sec_label = sec_type.replace(" ", "_")
+                    await _sa_cont(paper_dir, f"sections/{sec_label}.tex",
+                                   sec_content, emitter, "section", f"{sec_label}.tex")
+
+                if pdf_path:
+                    compile_dir = Path(pdf_path).parent
+                    if compile_dir.is_dir() and compile_dir != paper_dir:
+                        await self._save_compilation_output(
+                            compile_dir, paper_dir, emitter, artifacts_prefix,
+                        )
+
+            status = "ok" if not errors else "partial"
+            await emitter.completed(
+                status=status,
+                total_words=total_words,
+                sections_count=len(sections_results),
+                pdf_path=pdf_path,
+                review_iterations=review_iterations,
+            )
+
+            return PaperGenerationResult(
+                status=status,
+                paper_title=metadata.title,
+                sections=sections_results,
+                latex_content=latex_content,
+                output_path=str(paper_dir) if paper_dir else None,
+                pdf_path=pdf_path,
+                total_word_count=total_words,
+                target_word_count=target_word_count,
+                review_iterations=review_iterations,
+                errors=errors,
+            )
+        except Exception as e:
+            print(f"[ResumeCheckpoint] Error: {e}")
+            await emitter.error(message=str(e), phase="resume_from_checkpoint")
+            return PaperGenerationResult(
+                status="error",
+                paper_title=metadata.title,
+                sections=sections_results,
+                errors=[str(e)],
+            )
+
     async def generate_single_section(
         self,
         request: SectionGenerationRequest,
@@ -6086,7 +6552,26 @@ class MetaDataAgent(ReActAgent):
             hasher.update(sections[section_type].encode("utf-8"))
             hasher.update(b"\n")
         return hasher.hexdigest()
-    
+
+    @staticmethod
+    def _compute_config_hash(metadata: "PaperMetaData") -> str:
+        """
+        Compute an integrity hash from metadata for checkpoint validation.
+
+        - **Args**:
+            - `metadata` (PaperMetaData): Paper metadata
+
+        - **Returns**:
+            - `str`: SHA-256 hex digest
+        """
+        import hashlib
+        hasher = hashlib.sha256()
+        hasher.update(metadata.title.encode("utf-8"))
+        hasher.update((metadata.style_guide or "").encode("utf-8"))
+        hasher.update(metadata.idea_hypothesis.encode("utf-8"))
+        hasher.update(metadata.method.encode("utf-8"))
+        return hasher.hexdigest()
+
     async def _run_review_orchestration(
         self,
         generated_sections: Dict[str, str],
@@ -6108,6 +6593,9 @@ class MetaDataAgent(ReActAgent):
         feedback_queue: Optional[asyncio.Queue] = None,
         feedback_timeout: float = 300.0,
         progress_callback: Optional[ProgressCallback] = None,
+        enable_user_feedback: bool = False,
+        ref_pool: Optional[Any] = None,
+        artifacts_prefix: str = "",
     ) -> Tuple[Dict[str, str], List[SectionResult], int, Optional[int], Optional[str], List[str]]:
         """
         Run unified review orchestration across reviewer and VLM.
@@ -6148,10 +6636,14 @@ class MetaDataAgent(ReActAgent):
         last_fingerprint = self._get_sections_fingerprint(generated_sections)
         last_compiled_fingerprint = last_fingerprint  # track what was last compiled
         last_vlm_result = None
-        
+
+        if enable_user_feedback:
+            max_review_iterations = max(max_review_iterations, 99)
+
         if enable_review:
-            await emitter.phase_start(Phase.REVIEW_LOOP, f"Review loop (max {max_review_iterations} iterations)")
-            print(f"[MetaDataAgent] Unified Review Loop (max {max_review_iterations} iterations)...")
+            label = "Review loop (user-controlled)" if enable_user_feedback else f"Review loop (max {max_review_iterations} iterations)"
+            await emitter.phase_start(Phase.REVIEW_LOOP, label)
+            print(f"[MetaDataAgent] Unified Review Loop (max {max_review_iterations} iterations, user_feedback={enable_user_feedback})...")
         baseline_gap_audit = self._perform_baseline_gap_audit(
             generated_sections=generated_sections,
             enable_review=enable_review,
@@ -6279,7 +6771,125 @@ class MetaDataAgent(ReActAgent):
                     )
 
                     # User feedback injection point
-                    if feedback_queue is not None and not review_result.passed:
+                    if enable_user_feedback and not review_result.passed:
+                        # Compile PDF before pausing so the user can preview it
+                        if compile_pdf and template_path and paper_dir:
+                            await emitter.compile_start(iteration=review_iterations)
+                            pre_fb_dir = paper_dir / f"iteration_{review_iterations:02d}"
+                            pre_fb_dir.mkdir(parents=True, exist_ok=True)
+                            figure_base_path = os.getcwd()
+                            figure_paths = self._collect_figure_paths(metadata.figures, base_path=figure_base_path)
+                            pre_fb_pdf, _, _, _ = await self._compile_pdf(
+                                generated_sections=generated_sections,
+                                template_path=template_path,
+                                references=parsed_refs,
+                                output_dir=pre_fb_dir,
+                                paper_title=metadata.title,
+                                figures_source_dir=figures_source_dir,
+                                figure_paths=figure_paths,
+                                converted_tables=converted_tables,
+                                paper_plan=paper_plan,
+                                figures=metadata.figures,
+                                metadata_tables=metadata.tables,
+                            )
+                            if pre_fb_pdf:
+                                pdf_path = pre_fb_pdf
+                                await emitter.compile_complete(success=True, pdf_path=pdf_path)
+                                _sa_pre = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
+                                await _sa_pre(paper_dir, "output.pdf",
+                                              Path(pre_fb_pdf).read_bytes(), emitter, "output", "Paper PDF")
+                            else:
+                                await emitter.compile_complete(success=False, pdf_path=None)
+
+                        # Save intermediate artifacts so FileTree is populated
+                        if paper_dir:
+                            _sa_pre = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
+                            latex_content = self._assemble_paper(
+                                title=metadata.title,
+                                sections=generated_sections,
+                                references=parsed_refs,
+                                valid_citation_keys=self._extract_valid_citation_keys(parsed_refs),
+                            )
+                            await _sa_pre(paper_dir, "main.tex", latex_content, emitter, "root", "Main LaTeX")
+                            if ref_pool:
+                                await _sa_pre(paper_dir, "references.bib",
+                                              ref_pool.to_bibtex(), emitter, "references", "References BibTeX")
+                            for sec_type, sec_content in generated_sections.items():
+                                sec_label = sec_type.replace(" ", "_")
+                                await _sa_pre(paper_dir, f"sections/{sec_label}.tex",
+                                              sec_content, emitter, "section", f"{sec_label}.tex")
+                            if pre_fb_dir and pre_fb_dir.is_dir():
+                                await self._save_compilation_output(
+                                    pre_fb_dir, paper_dir, emitter, artifacts_prefix,
+                                )
+
+                        sections_status_map = {
+                            sr.section_type: {
+                                "word_count": sr.word_count,
+                                "status": sr.status,
+                            }
+                            for sr in sections_results if sr.status == "ok"
+                        }
+                        sf_dicts = [sf.model_dump() for sf in review_result.section_feedbacks]
+                        rt_dicts = [
+                            {"target": t.target_id or t.section_type, "instruction": t.instruction}
+                            for t in review_result.revision_tasks
+                        ]
+                        from .models import ReviewCheckpoint
+                        checkpoint = ReviewCheckpoint(
+                            task_id="",
+                            generated_sections=generated_sections,
+                            sections_results=sections_results,
+                            review_result=review_result.model_dump(),
+                            metadata=metadata.model_dump(),
+                            paper_plan=paper_plan.model_dump() if paper_plan and hasattr(paper_plan, "model_dump") else None,
+                            ref_pool=ref_pool.to_dict() if ref_pool else {},
+                            memory=memory.to_dict() if memory else {},
+                            converted_tables=converted_tables,
+                            review_iterations=review_iterations,
+                            max_review_iterations=max_review_iterations,
+                            target_word_count=target_word_count,
+                            pdf_path=str(pdf_path) if pdf_path else None,
+                            template_path=template_path,
+                            figures_source_dir=figures_source_dir,
+                            enable_review=enable_review,
+                            compile_pdf=compile_pdf,
+                            enable_vlm_review=enable_vlm_review,
+                            target_pages=target_pages,
+                            paper_dir=str(paper_dir) if paper_dir else None,
+                            last_vlm_result=last_vlm_result,
+                            config_hash=self._compute_config_hash(metadata),
+                        )
+                        ckpt_path = None
+                        if paper_dir:
+                            ckpt_dir = Path(paper_dir) / "checkpoints"
+                            ckpt_dir.mkdir(parents=True, exist_ok=True)
+                            ckpt_path = ckpt_dir / f"checkpoint_{review_iterations}.json"
+                            ckpt_path.write_text(
+                                checkpoint.model_dump_json(indent=2),
+                                encoding="utf-8",
+                            )
+                            print(f"[ReviewLoop] Checkpoint saved: {ckpt_path}")
+
+                        await emitter.review_feedback_request(
+                            iteration=review_iterations,
+                            review_summary=review_result.orchestrator_summary or "",
+                            sections_status=sections_status_map,
+                            requires_revision={k: v for k, v in review_result.requires_revision.items()},
+                            section_feedbacks=sf_dicts,
+                            revision_tasks=rt_dicts,
+                            current_sections=dict(generated_sections),
+                            checkpoint_path=str(ckpt_path) if ckpt_path else None,
+                        )
+                        return (
+                            generated_sections,
+                            sections_results,
+                            review_iterations,
+                            target_word_count,
+                            str(pdf_path) if pdf_path else None,
+                            [f"__paused_for_feedback__:{ckpt_path or ''}"],
+                        )
+                    elif feedback_queue is not None and not review_result.passed:
                         sections_status_map = {
                             sr.section_type: {
                                 "word_count": sr.word_count,
@@ -6361,6 +6971,12 @@ class MetaDataAgent(ReActAgent):
                         section_type=rev_sec,
                         iteration=review_iterations,
                     )
+                    if paper_dir and rev_sec in generated_sections:
+                        _plan_titles = paper_plan.get_section_titles() if paper_plan else {}
+                        sec_label = _plan_titles.get(rev_sec, rev_sec.replace("_", " ").title())
+                        _sa_review = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
+                        await _sa_review(paper_dir, f"sections/{sec_label}.tex",
+                                         generated_sections[rev_sec], emitter, "section", f"{sec_label}.tex")
             self._resolve_section_feedbacks(
                 section_feedbacks=review_result.section_feedbacks,
                 revised_sections=reviewer_revised_sections,
@@ -6585,6 +7201,13 @@ class MetaDataAgent(ReActAgent):
             if post_compile_revised:
                 sources = "VLM/Typesetter" if not compile_succeeded else "VLM"
                 print(f"[ReviewLoop] {sources} revised: {sorted(post_compile_revised)}")
+                for rev_sec in post_compile_revised:
+                    if paper_dir and rev_sec in generated_sections:
+                        _plan_titles = paper_plan.get_section_titles() if paper_plan else {}
+                        sec_label = _plan_titles.get(rev_sec, rev_sec.replace("_", " ").title())
+                        _sa_review = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
+                        await _sa_review(paper_dir, f"sections/{sec_label}.tex",
+                                         generated_sections[rev_sec], emitter, "section", f"{sec_label}.tex")
             self._resolve_section_feedbacks(
                 section_feedbacks=review_result.section_feedbacks,
                 revised_sections=post_compile_revised,

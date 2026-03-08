@@ -188,7 +188,7 @@ class _CompletionsProxy:
         if ctx and ctx.get("callback"):
             try:
                 model_name = kwargs.get("model", "")
-                preview = (clean or "")[:200] if clean else ""
+                preview = ((clean or "")[:200] + ("…" if len(clean) > 200 else "")) if clean else ""
                 event = {
                     "type": "llm_response",
                     "agent": ctx.get("agent", ""),

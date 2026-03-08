@@ -675,3 +675,40 @@ class ReferencePool:
         """
         entries = ReferencePool._split_bibtex_entries(combined)
         return entries.get(key)
+
+    # ------------------------------------------------------------------
+    # Checkpoint serialization
+    # ------------------------------------------------------------------
+
+    def to_dict(self) -> Dict[str, Any]:
+        """
+        Serialize pool state to a JSON-safe dict for checkpoint persistence.
+
+        - **Returns**:
+            - `dict`: Contains ``core_refs`` and ``discovered_refs``.
+        """
+        return {
+            "core_refs": self._core_refs,
+            "discovered_refs": self._discovered_refs,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ReferencePool":
+        """
+        Restore a ReferencePool from a checkpoint dict.
+
+        - **Args**:
+            - `data` (dict): Output of ``to_dict()``.
+
+        - **Returns**:
+            - `ReferencePool`: Restored instance.
+        """
+        pool = cls.__new__(cls)
+        pool._core_refs = data.get("core_refs", [])
+        pool._discovered_refs = data.get("discovered_refs", [])
+        pool._all_keys = {
+            r["ref_id"]
+            for r in pool._core_refs + pool._discovered_refs
+            if r.get("ref_id")
+        }
+        return pool

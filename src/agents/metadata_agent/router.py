@@ -112,11 +112,13 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
                     max_review_iterations=request.max_review_iterations,
                     enable_planning=request.enable_planning,
                     enable_vlm_review=request.enable_vlm_review,
+                    enable_user_feedback=request.enable_user_feedback,
                     progress_callback=progress_callback,
                     feedback_queue=feedback_queue,
                     feedback_timeout=request.feedback_timeout
                     if hasattr(request, "feedback_timeout")
                     else 300.0,
+                    artifacts_prefix=request.artifacts_prefix or "",
                 )
             except Exception as e:
                 await event_queue.put({
@@ -200,6 +202,88 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
             task_info["status"] = "cancelled"
             return {"status": "ok", "task_id": task_id}
         return {"status": "ok", "message": "Task already completed"}
+
+    # ------------------------------------------------------------------
+    # POST /metadata/generate/{task_id}/resume
+    # ------------------------------------------------------------------
+    @router.post("/generate/{task_id}/resume")
+    async def resume_generation(task_id: str, feedback: Dict[str, Any]):
+        """
+        Resume generation from checkpoint after user feedback.
+
+        - **Description**:
+            - Loads the checkpoint saved during the feedback pause, injects user
+              annotations, and returns a new SSE stream for the remaining work.
+
+        - **Args**:
+            - `task_id` (str): Original task ID.
+            - `feedback` (dict): Enhanced feedback payload with action,
+              global_feedback, section_annotations.
+        """
+        checkpoint_path = feedback.get("checkpoint_path", "")
+        if not checkpoint_path:
+            raise HTTPException(status_code=400, detail="checkpoint_path is required")
+
+        import os
+        if not os.path.isfile(checkpoint_path):
+            raise HTTPException(status_code=404, detail=f"Checkpoint not found: {checkpoint_path}")
+
+        new_task_id = task_id
+        event_queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+
+        _active_tasks[new_task_id] = {
+            "event_queue": event_queue,
+            "status": "running",
+        }
+
+        async def progress_callback(event: Dict[str, Any]) -> None:
+            event["task_id"] = new_task_id
+            await event_queue.put(event)
+
+        async def run_resumed() -> None:
+            try:
+                await agent.resume_from_checkpoint(
+                    checkpoint_path=checkpoint_path,
+                    user_feedback=feedback,
+                    progress_callback=progress_callback,
+                    artifacts_prefix=feedback.get("artifacts_prefix", ""),
+                )
+            except Exception as e:
+                await event_queue.put({
+                    "type": "error",
+                    "task_id": new_task_id,
+                    "message": str(e),
+                })
+            finally:
+                await event_queue.put(None)
+                _active_tasks.pop(new_task_id, None)
+
+        gen_task = asyncio.create_task(run_resumed())
+        _active_tasks[new_task_id]["task"] = gen_task
+
+        async def event_stream():
+            yield f"data: {json.dumps({'type': 'task_resumed', 'task_id': new_task_id})}\n\n"
+            try:
+                while True:
+                    event = await event_queue.get()
+                    if event is None:
+                        break
+                    yield f"data: {json.dumps(event, default=str)}\n\n"
+            except asyncio.CancelledError:
+                gen_task.cancel()
+            finally:
+                if not gen_task.done():
+                    gen_task.cancel()
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     # ------------------------------------------------------------------
     # POST /metadata/generate/section  (single section, unchanged)
