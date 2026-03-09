@@ -47,6 +47,3 @@ asyncio_mode = "auto"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["easypaper", "easypaper.*"]
-
-[tool.uv.workspace]
-members = ["user_case"]
