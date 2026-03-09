@@ -763,6 +763,180 @@ class CommanderAgent(BaseAgent):
             parts.append(f"  Content: {content[:500]}")
         return "\n".join(parts)
 
+    async def extract_metadata(self, canvas_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract structured metadata from a full research canvas using LLM.
+        - **Description**:
+            - Receives raw canvas data (nodes, edges, references)
+            - Uses LLM to synthesize research content into the 5 metadata fields
+            - Directly extracts PaperSection nodes as section_hints
+            - Directly extracts Start node venue as style_guide
+
+        - **Args**:
+            - `canvas_data` (dict): Contains 'nodes', 'edges', 'references'
+
+        - **Returns**:
+            - `dict`: Contains 'metadata' (CanvasMetadata)
+        """
+        from .models import CanvasMetadata, SectionHint
+
+        nodes = canvas_data.get("nodes", [])
+        edges = canvas_data.get("edges", [])
+        references = canvas_data.get("references", [])
+
+        node_map = self._build_node_map(nodes)
+
+        title = ""
+        style_guide = None
+        section_hints: List[Dict[str, Any]] = []
+        ref_strings: List[str] = []
+        content_blocks: List[str] = []
+
+        for node_id, node in node_map.items():
+            node_type = node.get("type", "")
+            data = node.get("data", {})
+            inputs = data.get("inputsValues", {})
+            node_title = data.get("title", "")
+
+            if node_type == "start":
+                paper_title = inputs.get("PaperTitle", {}).get("content", "")
+                if paper_title:
+                    title = paper_title
+                venue = inputs.get("TargetVenue", {}).get("content", "")
+                if venue:
+                    style_guide = venue
+
+            elif node_type == "paper_section":
+                sec_type = inputs.get("SectionType", {}).get("content", "custom")
+                sec_title = inputs.get("SectionTitle", {}).get("content", "")
+                sec_prompt = inputs.get("user_prompt", {}).get("content", "")
+                wc_raw = inputs.get("word_count_limit", {}).get("content", 0)
+                wc = int(wc_raw) if wc_raw else None
+                section_hints.append({
+                    "section_type": sec_type,
+                    "title": sec_title,
+                    "user_prompt": sec_prompt,
+                    "word_count_limit": wc if wc and wc > 0 else None,
+                })
+
+            elif node_type == "end":
+                pass
+
+            elif node_type == "literature":
+                summary = inputs.get("Summary", {}).get("content", "")
+                lit_title = inputs.get("Title", {}).get("content", "") or node_title
+                if lit_title:
+                    ref_strings.append(lit_title)
+                if summary:
+                    content_blocks.append(f"[LITERATURE: {lit_title}] {summary}")
+
+            else:
+                ctx = self._node_to_context(node)
+                content = ctx.get("content", "")
+                if content and content.strip():
+                    label = node_type.upper()
+                    content_blocks.append(f"[{label}: {node_title}] {content}")
+
+        for ref in references:
+            r_title = ref.get("title", "")
+            r_authors = ref.get("authors", "")
+            r_year = ref.get("year", "")
+            bibtex = ref.get("bibtex", "")
+            if bibtex:
+                ref_strings.append(bibtex)
+            elif r_title:
+                parts = []
+                if r_authors:
+                    parts.append(r_authors)
+                parts.append(r_title)
+                if r_year:
+                    parts.append(f"({r_year})")
+                ref_strings.append(". ".join(parts))
+
+        edge_descriptions = []
+        for edge in edges:
+            src = edge.get("sourceNodeID", "")
+            tgt = edge.get("targetNodeID", "")
+            src_node = node_map.get(src)
+            tgt_node = node_map.get(tgt)
+            if src_node and tgt_node:
+                src_label = src_node.get("data", {}).get("title", src)
+                tgt_label = tgt_node.get("data", {}).get("title", tgt)
+                edge_descriptions.append(f"  {src_label} -> {tgt_label}")
+
+        canvas_text = "\n\n".join(content_blocks)
+        edges_text = "\n".join(edge_descriptions) if edge_descriptions else "(no edges)"
+
+        system_prompt = (
+            "You are an expert research analyst. Given a research canvas containing "
+            "various research elements (ideas, methods, data, experiments, results, etc.) "
+            "and their relationships, extract structured metadata for academic paper generation.\n\n"
+            "Return a JSON object with exactly these 5 fields:\n"
+            "- idea_hypothesis: The core research idea, hypothesis, or question (comprehensive paragraph)\n"
+            "- method: The methodology, approach, or algorithm (comprehensive paragraph)\n"
+            "- data: The datasets, data sources, or materials used (concise paragraph)\n"
+            "- experiments: The experimental results, findings, and analysis (comprehensive paragraph)\n\n"
+            "Synthesize information from multiple nodes into coherent paragraphs. "
+            "Do NOT simply list node contents; weave them into a unified narrative. "
+            "Return ONLY valid JSON, no markdown fences."
+        )
+
+        user_msg = (
+            f"Paper title: {title or '(not specified)'}\n\n"
+            f"=== RESEARCH ELEMENTS ===\n{canvas_text}\n\n"
+            f"=== RELATIONSHIPS ===\n{edges_text}"
+        )
+
+        idea_hypothesis = ""
+        method = ""
+        data_field = ""
+        experiments = ""
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.3,
+            )
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0]
+            parsed = json.loads(raw)
+            idea_hypothesis = parsed.get("idea_hypothesis", "")
+            method = parsed.get("method", "")
+            data_field = parsed.get("data", "")
+            experiments = parsed.get("experiments", "")
+        except Exception as e:
+            print(f"Warning: LLM extraction failed, falling back to rule-based: {e}")
+            for node_id, node in node_map.items():
+                ntype = node.get("type", "")
+                ctx = self._node_to_context(node)
+                c = ctx.get("content", "") or ""
+                if ntype in ("idea", "question", "hypothesis"):
+                    idea_hypothesis += c + "\n"
+                elif ntype == "method":
+                    method += c + "\n"
+                elif ntype == "data":
+                    data_field += c + "\n"
+                elif ntype in ("experiment", "result", "finding"):
+                    experiments += c + "\n"
+
+        metadata = CanvasMetadata(
+            title=title or "Untitled Paper",
+            idea_hypothesis=idea_hypothesis.strip(),
+            method=method.strip(),
+            data=data_field.strip(),
+            experiments=experiments.strip(),
+            references=ref_strings[:50],
+            section_hints=[SectionHint(**h) for h in section_hints],
+            style_guide=style_guide,
+        )
+
+        return {"metadata": metadata}
+
     async def run(self, 
                   work_id: str,
                   section_type: str,
@@ -826,6 +1000,13 @@ class CommanderAgent(BaseAgent):
                 "method": "POST",
                 "description": "Prepare context and prompt for paper section generation",
                 "input_model": "CommanderPayload",
-                "output_model": "CommanderResult"
-            }
+                "output_model": "CommanderResult",
+            },
+            {
+                "path": "/agent/commander/extract-metadata",
+                "method": "POST",
+                "description": "Extract structured metadata from research canvas for full paper generation",
+                "input_model": "ExtractMetadataPayload",
+                "output_model": "ExtractMetadataResult",
+            },
         ]

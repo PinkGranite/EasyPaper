@@ -2,13 +2,18 @@
 Router for Commander Agent endpoints
 - **Description**:
     - Commander converts FlowGram.ai data to unified SectionWritePayload
-    - The output can be directly passed to Writer Agent
+    - Also supports full canvas metadata extraction for paper generation
 """
 from fastapi import APIRouter, HTTPException, status
 from typing import Optional, Any, Dict
 import time
 import logging
-from .models import CommanderPayload, CommanderResult
+from .models import (
+    CommanderPayload,
+    CommanderResult,
+    ExtractMetadataPayload,
+    ExtractMetadataResult,
+)
 from ..writer_agent.section_models import SectionWritePayload
 
 
@@ -28,22 +33,11 @@ def create_commander_router(agent_instance):
     async def prepare_section(payload: CommanderPayload):
         """
         Prepare unified SectionWritePayload for Writer Agent
-        - **Description**:
-            - Collects context from FlowGram.ai research graph
-            - Outputs SectionWritePayload that Writer can directly consume
-            - This is the interface between FlowGram.ai and the Writer
-
-        - **Args**:
-            - `payload` (CommanderPayload): Request payload with work_id and section info
-
-        - **Returns**:
-            - `CommanderResult`: Contains section_write_payload for Writer
         """
         start = time.time()
         logger.info("commander.prepare.request %s user=%s", payload.request_id, payload.user_id)
 
         try:
-            # Extract parameters from payload
             work_id = payload.payload.get("work_id")
             section_type = payload.payload.get("section_type", "introduction")
             section_title = payload.payload.get("section_title", "")
@@ -58,7 +52,6 @@ def create_commander_router(agent_instance):
                     detail="work_id must be provided"
                 )
 
-            # Run the agent
             agent_result = await agent_instance.run(
                 work_id=work_id,
                 section_type=section_type,
@@ -69,11 +62,10 @@ def create_commander_router(agent_instance):
                 word_count_limit=word_count_limit,
             )
 
-            # Extract the unified SectionWritePayload
             section_write_payload = agent_result.get("section_write_payload")
-            
+
             latency = time.time() - start
-            logger.info("commander.prepare.complete %s latency=%.3f section=%s", 
+            logger.info("commander.prepare.complete %s latency=%.3f section=%s",
                        payload.request_id, latency, section_type)
 
             return CommanderResult(
@@ -84,12 +76,49 @@ def create_commander_router(agent_instance):
 
         except Exception as e:
             latency = time.time() - start
-            logger.error("commander.prepare.error %s latency=%.3f error=%s", 
+            logger.error("commander.prepare.error %s latency=%.3f error=%s",
                         payload.request_id, latency, str(e))
             return CommanderResult(
                 request_id=payload.request_id,
                 status="error",
                 error=str(e)
+            )
+
+    @router.post("/agent/commander/extract-metadata", response_model=ExtractMetadataResult, status_code=status.HTTP_200_OK)
+    async def extract_metadata(payload: ExtractMetadataPayload):
+        """
+        Extract structured metadata from a research canvas using LLM.
+        - **Description**:
+            - Receives full canvas data (nodes, edges, references)
+            - Uses LLM to understand research structure and synthesize metadata
+            - Returns CanvasMetadata ready for MetaDataAgent pipeline
+        """
+        start = time.time()
+        logger.info("commander.extract-metadata.request %s user=%s",
+                    payload.request_id, payload.user_id)
+
+        try:
+            result = await agent_instance.extract_metadata(payload.canvas_data)
+            metadata = result.get("metadata")
+
+            latency = time.time() - start
+            logger.info("commander.extract-metadata.complete %s latency=%.3f",
+                       payload.request_id, latency)
+
+            return ExtractMetadataResult(
+                request_id=payload.request_id,
+                status="ok",
+                metadata=metadata,
+            )
+
+        except Exception as e:
+            latency = time.time() - start
+            logger.error("commander.extract-metadata.error %s latency=%.3f error=%s",
+                        payload.request_id, latency, str(e))
+            return ExtractMetadataResult(
+                request_id=payload.request_id,
+                status="error",
+                error=str(e),
             )
 
     return router
