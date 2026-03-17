@@ -1,0 +1,8 @@
+{
+  "name": "easypaper",
+  "description": "AI-powered academic paper generation. Generate LaTeX papers from metadata interactively.",
+  "author": {
+    "name": "PinkGranite",
+    "email": "pinkgranite@example.com"
+  }
+}

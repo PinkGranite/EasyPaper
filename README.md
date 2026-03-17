@@ -223,3 +223,44 @@ Additional top-level sections:
 - `scripts/` — CLI utilities and demos
 - `user_case/` — standalone usage example (independent environment)
 - `economist_example/` — sample metadata input
+
+## Claude Code Plugin Market
+
+This repository is also a **Claude Code plugin market** containing AI-powered academic paper generation tools.
+
+### Installation
+
+Add this market to Claude Code:
+
+```bash
+/plugin market add https://github.com/your-username/easypaper
+```
+
+Then install individual plugins:
+
+```bash
+/plugin install easypaper
+```
+
+### Available Plugins
+
+| Plugin | Description |
+|--------|-------------|
+| easypaper | Generate AI-powered academic papers from metadata interactively |
+
+### Usage
+
+After installation, use the command:
+
+```
+/easypaper
+```
+
+This will guide you through an interactive workflow to generate your academic paper.
+
+### Prerequisites
+
+- Python 3.11+
+- `easypaper` package installed (`pip install easypaper`)
+- LaTeX toolchain (pdflatex + bibtex) for PDF compilation
+- API key for LLM provider (configured via config file)
