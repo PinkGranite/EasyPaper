@@ -127,8 +127,8 @@ curl -X POST http://localhost:8000/metadata/generate \
 ## Skills
 
 EasyPaper includes a pluggable **Skills** system that injects writing constraints, venue-specific
-formatting rules, and reviewer checkers into the generation pipeline. The repository ships
-pre-built skills in [`skills/`](skills/):
+formatting rules, and reviewer checkers into the generation pipeline. Built-in skills are bundled
+as static assets inside the `easypaper` package:
 
 | Category | Skills | Description |
 |---|---|---|
@@ -138,25 +138,17 @@ pre-built skills in [`skills/`](skills/):
 
 ### Enabling skills
 
-Add a `skills` section to your config YAML and point `skills_dir` to a directory containing
-`.yaml` skill files:
+Built-in skills are loaded by default. You only need `enabled`/`active_skills` in config:
 
 ```yaml
 skills:
   enabled: true
-  skills_dir: "./skills"    # path to skill YAML files
   active_skills:
     - "*"                   # "*" = load all skills; or list specific names
 ```
 
-To use the built-in skills, copy the [`skills/`](skills/) directory into your project:
-
-```bash
-cp -r /path/to/easypaper/skills ./skills
-```
-
-If `skills_dir` does not exist or `skills.enabled` is `false`, skills are silently skipped —
-no configuration is required for basic usage.
+If you add `skills.skills_dir`, EasyPaper **merges** bundled skills with that directory:
+same skill `name` → your file wins. If the path is missing, bundled skills still load and a warning is logged.
 
 ### Venue profiles
 
@@ -195,7 +187,7 @@ anti_patterns:
 ```
 
 Drop the file into your `skills_dir` and it will be automatically loaded on the next run.
-See the built-in skills in [`skills/`](skills/) for complete examples.
+See the built-in skills in `easypaper/assets/skills/` for complete examples.
 
 ## Config
 

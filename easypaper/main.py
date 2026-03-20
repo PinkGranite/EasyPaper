@@ -116,10 +116,16 @@ async def lifespan(app: FastAPI):
     skills_config = config.skills or SkillsConfig()
     if skills_config.enabled:
         loader = SkillLoader()
-        skills = loader.load_directory(Path(skills_config.skills_dir))
+        skills = loader.load_merged(skills_config.skills_dir)
         for skill in skills:
             skill_registry.register(skill)
-        print(f"   Skills system: {len(skill_registry)} skills loaded from {skills_config.skills_dir}")
+        if skills_config.skills_dir and Path(skills_config.skills_dir).exists():
+            src = f"builtin merged with {skills_config.skills_dir}"
+        elif skills_config.skills_dir:
+            src = f"builtin only (user skills_dir missing: {skills_config.skills_dir})"
+        else:
+            src = "builtin"
+        print(f"   Skills system: {len(skill_registry)} skills loaded ({src})")
     app.state.skill_registry = skill_registry
 
     # Initialize agents (pass skill_registry for ReviewerAgent / MetaDataAgent,

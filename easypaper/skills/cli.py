@@ -123,6 +123,10 @@ def cmd_remove(args):
 
 
 def main():
+    from .loader import SkillLoader
+
+    builtin_skills_dir = str(SkillLoader.default_skills_dir())
+
     parser = argparse.ArgumentParser(
         description="EasyPaper Skills CLI",
         prog="python -m src.skills.cli",
@@ -140,7 +144,7 @@ def main():
 
     # list
     list_parser = subparsers.add_parser("list", help="List all skills")
-    list_parser.add_argument("--skills-dir", default="./skills", help="Skills directory")
+    list_parser.add_argument("--skills-dir", default=builtin_skills_dir, help="Skills directory")
     list_parser.set_defaults(func=cmd_list)
 
     # remove

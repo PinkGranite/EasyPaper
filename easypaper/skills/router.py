@@ -81,7 +81,7 @@ def create_skills_router(registry: SkillRegistry, config) -> APIRouter:
             )
 
         skills_dir = Path("./skills")
-        if config.skills:
+        if config.skills and config.skills.skills_dir:
             skills_dir = Path(config.skills.skills_dir)
 
         client = LLMClient(

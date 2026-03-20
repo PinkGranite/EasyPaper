@@ -1,34 +1,62 @@
-Run the EasyPaper end-to-end metadata workflow.
+Run the EasyPaper end-to-end paper generation workflow with guided setup and metadata collection.
 
 ## Execution contract
 
-1. Confirm API base URL (default `http://localhost:8000`).
-2. Collect or validate metadata fields:
-   - `title`
-   - `idea_hypothesis`
-   - `method`
-   - `data`
-   - `experiments`
-   - `references`
-3. Collect optional fields when provided:
-   - `style_guide`
-   - `target_pages`
-   - `template_path`
-   - `compile_pdf`
-   - `enable_review`
-   - `max_review_iterations`
-4. Build a JSON payload that matches `PaperGenerationRequest`.
-5. Call `POST /metadata/generate`.
-6. Summarize output status, generated sections, and output artifacts.
+### Phase 1: Environment Setup (First-time only)
 
-## If service is not running
+1. **Check if environment is set up**:
+   - Check if `.easypaper-env` directory exists
+   - Check if `easypaper` package is importable: `python -c "import easypaper"`
+   - Check if `pdflatex` command is available
 
-Tell the user to start the server:
+2. **If environment is not ready**:
+   - Use the `setup-environment` skill to automatically:
+     - Create isolated virtual environment (prefer `uv`, fallback to `venv`)
+     - Install easypaper package
+     - Check and guide LaTeX installation
+     - Verify all components are working
 
-```bash
-uv run uvicorn easypaper.main:app --reload --port 8000
-```
+### Phase 2: Paper Generation
 
-Then retry the request.
+3. **Use the `paper-from-metadata` skill** which handles:
+   - **Check for existing metadata**: Ask user if they have complete metadata file/JSON
+   - **Collect metadata if needed**: If missing or incomplete, interactively collect all required fields:
+     - Required: `title`, `idea_hypothesis`, `method`, `data`, `experiments`, `references`
+     - Optional: `style_guide`, `target_pages`, `template_path` (absolute path), `compile_pdf`, `enable_review`, `max_review_iterations`
+     - Advanced: `figures` (with absolute file_path), `tables`, `code_repository` (with absolute path if local_dir), `output_dir` (absolute path)
+   - **Path handling**: Ensure all paths are absolute - convert relative paths to absolute using `pathlib.Path.resolve()`
+   - **Review and confirm**: Display summary, allow edits, save to file, get confirmation
+   - **Generate paper**: Use EasyPaper Python SDK directly:
+     ```python
+     from easypaper import EasyPaper, PaperMetaData
+     from pathlib import Path
+     
+     # Config path should be absolute
+     config_path = Path("configs/openrouter.yaml").resolve()
+     ep = EasyPaper(config_path=str(config_path))
+     result = await ep.generate(metadata, **options)
+     ```
+   - **Report results**: Show status, output files, absolute paths, summary
+
+## Path Requirements
+
+**IMPORTANT**: All paths in metadata must be absolute paths:
+- `template_path`: Absolute path to LaTeX template file/directory
+- `figures[].file_path`: Absolute paths to figure image files
+- `code_repository.path`: Absolute path (if type is `local_dir`)
+- `output_dir`: Absolute path to output directory
+- `config_path`: Absolute path to EasyPaper config file
+
+The skill will automatically convert relative paths to absolute paths, but users should be encouraged to provide absolute paths.
+
+## User Experience Guidelines
+
+- **First-time users**: Automatically trigger environment setup without asking
+- **Clear progress**: Show what step you're on (e.g., "Step 1/2: Setting up environment...")
+- **Error handling**: If any step fails, explain clearly and provide next steps
+- **Flexibility**: Allow users to provide complete metadata or collect interactively
+- **Path conversion**: Automatically convert relative paths to absolute and inform user
+- **Reference**: When users ask about structure, reference `examples/meta.json` as the template (note: paths should be absolute)
+- **Direct import**: Use EasyPaper as Python SDK - no API server needed
 
 $ARGUMENTS

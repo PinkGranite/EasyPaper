@@ -4,7 +4,7 @@ Repository-level instructions for coding agents working on EasyPaper.
 
 ## Project Scope
 
-- EasyPaper is a metadata-to-paper generation system with Python SDK and FastAPI API.
+- EasyPaper is a metadata-to-paper generation system with Python SDK (primary usage) and optional FastAPI API.
 - This repository also publishes a Claude Code plugin marketplace.
 - The installable plugin root is `plugins/easypaper/`.
 
@@ -16,16 +16,27 @@ Repository-level instructions for coding agents working on EasyPaper.
 - Plugin skills: `plugins/easypaper/skills/`
 - OpenCode/OpenClaw config: `.opencode/opencode.json`
 
-## EasyPaper API Workflow
+## EasyPaper Workflow
 
-For end-to-end paper generation, use the metadata agent API:
+For end-to-end paper generation, use the Python SDK directly:
 
-1. Ensure service is running:
+1. **Use the `paper-from-metadata` skill** (in `plugins/easypaper/skills/paper-from-metadata/SKILL.md`):
+   - Check if user has complete metadata (file or JSON)
+   - If missing, collect interactively (title, idea_hypothesis, method, data, experiments, references)
+   - Generate paper using EasyPaper SDK:
+     ```python
+     from easypaper import EasyPaper, PaperMetaData
+     ep = EasyPaper(config_path="configs/openrouter.yaml")
+     result = await ep.generate(metadata, **options)
+     ```
+
+2. **For Claude Code plugin usage**:
+   - Use `/easypaper` command which handles environment setup and metadata collection automatically
+   - No API server needed - uses Python SDK directly
+
+3. **Optional FastAPI server** (for external integrations):
    - `uv run uvicorn easypaper.main:app --reload --port 8000`
-2. Submit request:
-   - `POST /metadata/generate`
-3. Optional section-only generation:
-   - `POST /metadata/generate/section`
+   - Endpoints: `POST /metadata/generate`, `POST /metadata/generate/section`
 
 ## Required Metadata Fields
 
@@ -42,6 +53,11 @@ Optional fields include `style_guide`, `target_pages`, `template_path`, `compile
 
 - Backend YAML skills remain under `skills/` and are loaded by Python service config.
 - Claude/OpenCode skill prompts live under `plugins/easypaper/skills/*/SKILL.md`.
+- Main skills:
+  - `paper-from-metadata`: Unified skill for metadata collection and paper generation
+  - `setup-environment`: Automatic environment setup (Python, LaTeX)
+  - `venue-selection`: Venue-specific formatting
+  - `academic-writing-rules`: Academic writing conventions
 
 ## Validation Checklist
 

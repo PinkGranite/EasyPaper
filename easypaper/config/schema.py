@@ -118,7 +118,7 @@ class AgentConfig(BaseModel):
 class SkillsConfig(BaseModel):
     """Skills system configuration."""
     enabled: bool = True
-    skills_dir: str = "./skills"
+    skills_dir: Optional[str] = None
     active_skills: List[str] = Field(default_factory=lambda: ["*"])  # "*" = all
     venue_profile: Optional[str] = None  # "neurips", "icml", etc.
 

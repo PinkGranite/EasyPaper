@@ -1,0 +1,60 @@
+# Nature Venue Profile
+# Style constraints for Nature / Nature Portfolio-like manuscripts.
+
+name: nature
+description: >
+  Venue profile for Nature-style papers.
+  Emphasizes broad significance, concise high-information writing,
+  and restrained section/subsection structure.
+version: "1.0.0"
+tags:
+  - venue
+  - nature
+  - nature-portfolio
+  - high-impact
+type: venue_profile
+target_sections:
+  - "*"
+priority: 15
+
+system_prompt_append: |
+  ## Nature-Style Guidelines
+  - Prioritize conceptual novelty and broad scientific relevance.
+  - Keep statements precise, evidence-backed, and non-speculative.
+  - Favor concise, high-information sentences over procedural detail in main text.
+  - In the main narrative, focus on "what is new" and "why it matters".
+  - Use a lean section architecture. Typical Nature-style main text is:
+    Introduction (often unlabeled) -> Results (with thematic subsections) -> Discussion.
+  - Do NOT force a standalone "Conclusion" section unless the user explicitly requests it.
+  - Integrate conclusion-like synthesis into the final Discussion paragraphs.
+  - Keep Methods detail compact in main text; move protocol-heavy detail to Methods/Supplementary where possible.
+  - Avoid excessive subsection fragmentation unless major topic shifts require it.
+  - For Results and Discussion, foreground effect size, robustness, and implications.
+  - Results should be organized around 2-5 claim-driven subsection blocks, each tied to a figure/table.
+  - Begin with the key finding, then supporting evidence, then interpretation/limitation boundary.
+  - Prefer active, direct scientific prose; avoid inflated transitions and repetitive framing.
+  - Maintain a cohesive narrative arc suitable for interdisciplinary readers.
+
+venue_config:
+  style: "nature"
+  abstract_limit: 200
+  words_per_page: 850
+  subsection_policy: "minimal_but_clear"
+  audience: "broad_interdisciplinary"
+  preferred_main_sections:
+    - introduction
+    - results
+    - discussion
+    - methods
+  discouraged_main_sections:
+    - conclusion
+    - related_work
+  conclusion_policy: "integrate_into_discussion"
+  results_subsection_target: "2-5_claim_driven_blocks"
+  methods_policy: "compact_in_maintext_detailed_in_methods_or_supplement"
+  title_style: "short_specific_high_impact"
+  emphasis:
+    - novelty
+    - rigor
+    - significance
+    - mechanistic_or_causal_clarity
