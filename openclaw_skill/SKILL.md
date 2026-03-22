@@ -98,27 +98,22 @@ sudo dnf install poppler-utils
 
 ## Quick Start
 
-**Recommended workflow:** Prepare a `metadata.json` (see [`examples/meta.json`](https://github.com/PinkGranite/EasyPaper/blob/master/examples/meta.json)), then load it and run. Generation options such as `output_dir`, `enable_vlm_review`, `max_review_iterations` are not fields of `PaperMetaData`; pass them to `generate()` when your JSON includes them.
+**Recommended workflow:** Prepare a `metadata.json` (see [`examples/meta.json`](https://github.com/PinkGranite/EasyPaper/blob/master/examples/meta.json)), parse it as `PaperGenerationRequest`, then run with `to_metadata()` + `to_generate_options()`.
 
 ### Load from file and generate
 
 ```python
 import asyncio
-import json
 from pathlib import Path
-from easypaper import EasyPaper, PaperMetaData
+from easypaper import EasyPaper, PaperGenerationRequest
 
 async def main():
     ep = EasyPaper(config_path=str(Path("configs/dev.yaml").resolve()))
     
-    # Load metadata from JSON (see examples/meta.json for full schema)
-    metadata = PaperMetaData.model_validate_json_file("metadata.json")
-    
-    # If JSON includes generation options (e.g. output_dir, enable_vlm_review), pass them
-    with open("metadata.json", encoding="utf-8") as f:
-        data = json.load(f)
-    options = {k: data[k] for k in ("output_dir", "save_output", "enable_vlm_review", "max_review_iterations") if k in data}
-    
+    request = PaperGenerationRequest.model_validate_json_file("metadata.json")
+    metadata = request.to_metadata()
+    options = request.to_generate_options()
+
     result = await ep.generate(metadata, **options)
     print(f"Status: {result.status}, Words: {result.total_word_count}")
 
@@ -182,7 +177,7 @@ When working with EasyPaper, refer to these files in the repository:
 **Optional**:
 - `style_guide` (venue name), `target_pages`, `template_path`, `figures`, `tables`, `code_repository`, `export_prompt_traces`
 
-See [`examples/meta.json`](https://github.com/PinkGranite/EasyPaper/blob/master/examples/meta.json) and [`economist_example/metadata.json`](https://github.com/PinkGranite/EasyPaper/blob/master/economist_example/metadata.json) for full examples. A JSON like `examples/meta.json` is fully supported: `PaperMetaData` accepts all content fields (title, idea_hypothesis, method, data, experiments, references, figures, tables, template_path, style_guide, target_pages, code_repository, export_prompt_traces). Fields such as `output_dir`, `save_output`, `enable_vlm_review`, `max_review_iterations` are generation options; pass them to `ep.generate(metadata, **options)` (see Quick Start above).
+See [`examples/meta.json`](https://github.com/PinkGranite/EasyPaper/blob/master/examples/meta.json) and [`economist_example/metadata.json`](https://github.com/PinkGranite/EasyPaper/blob/master/economist_example/metadata.json) for full examples. Treat `examples/meta.json` as a full `PaperGenerationRequest` sample: use `request = PaperGenerationRequest.model_validate_json_file(...)`, then `request.to_metadata()` and `request.to_generate_options()` for SDK generation.
 
 ## Streaming Generation
 

@@ -8,6 +8,7 @@ MetaData Agent Models
 from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List, Dict, Any
 from enum import Enum
+from pathlib import Path
 
 
 class OutputFormat(str, Enum):
@@ -184,6 +185,23 @@ class PaperMetaData(BaseModel):
     code_repository: Optional[CodeRepositorySpec] = None
     export_prompt_traces: bool = False
 
+    @classmethod
+    def model_validate_json_file(cls, file_path: str | Path) -> "PaperMetaData":
+        """
+        Load and validate metadata from a JSON file.
+        - **Description**:
+            - Convenience helper for SDK file-first usage.
+            - Reads UTF-8 JSON text from disk and validates via Pydantic.
+
+        - **Args**:
+            - `file_path` (str | Path): Path to the metadata JSON file.
+
+        - **Returns**:
+            - `PaperMetaData`: Validated metadata model.
+        """
+        text = Path(file_path).read_text(encoding="utf-8")
+        return cls.model_validate_json(text)
+
 
 class PaperGenerationRequest(BaseModel):
     """
@@ -246,6 +264,23 @@ class PaperGenerationRequest(BaseModel):
     # Output options
     save_output: bool = True
     output_dir: Optional[str] = None
+
+    @classmethod
+    def model_validate_json_file(cls, file_path: str | Path) -> "PaperGenerationRequest":
+        """
+        Load and validate generation request from a JSON file.
+        - **Description**:
+            - Convenience helper for SDK and API-aligned file parsing.
+            - Reads UTF-8 JSON text from disk and validates via Pydantic.
+
+        - **Args**:
+            - `file_path` (str | Path): Path to the request JSON file.
+
+        - **Returns**:
+            - `PaperGenerationRequest`: Validated request model.
+        """
+        text = Path(file_path).read_text(encoding="utf-8")
+        return cls.model_validate_json(text)
     
     def to_metadata(self) -> PaperMetaData:
         """Convert request to PaperMetaData"""
@@ -264,6 +299,30 @@ class PaperGenerationRequest(BaseModel):
             code_repository=self.code_repository,
             export_prompt_traces=self.export_prompt_traces,
         )
+
+    def to_generate_options(self) -> Dict[str, Any]:
+        """
+        Convert request to SDK generate() runtime options.
+        - **Description**:
+            - Returns only non-metadata runtime options used by
+              `MetaDataAgent.generate_paper`.
+            - Intended for SDK file-first flow:
+              parse `PaperGenerationRequest` -> `to_metadata()` + `to_generate_options()`.
+
+        - **Returns**:
+            - `options` (Dict[str, Any]): Runtime options for `EasyPaper.generate()`.
+        """
+        return {
+            "output_dir": self.output_dir,
+            "save_output": self.save_output,
+            "compile_pdf": self.compile_pdf,
+            "figures_source_dir": self.figures_source_dir,
+            "target_pages": self.target_pages,
+            "enable_review": self.enable_review,
+            "max_review_iterations": self.max_review_iterations,
+            "enable_planning": self.enable_planning,
+            "enable_vlm_review": self.enable_vlm_review,
+        }
 
 
 class SectionResult(BaseModel):

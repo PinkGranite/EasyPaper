@@ -57,20 +57,18 @@ asyncio.run(main())
 ```
 
 **Load metadata from a JSON file (recommended):**  
-Prepare a `metadata.json` (see [`examples/meta.json`](examples/meta.json) for the full schema). You can load it directly into `PaperMetaData` and run generation. A file like `examples/meta.json` is fully supported: all content fields (title, idea_hypothesis, method, data, experiments, references, figures, tables, template_path, style_guide, target_pages, code_repository, export_prompt_traces) are part of `PaperMetaData`; generation options (`output_dir`, `save_output`, `enable_vlm_review`, `max_review_iterations`) are not—pass them to `generate()` when your JSON includes them.
+Prepare a `metadata.json` (see [`examples/meta.json`](examples/meta.json) for the full schema). The clean SDK flow is to parse as `PaperGenerationRequest`, then split into content metadata and runtime options:
 
 ```python
 import asyncio
-import json
-from easypaper import EasyPaper, PaperMetaData
+from easypaper import EasyPaper, PaperGenerationRequest
 
 async def main():
     ep = EasyPaper(config_path="config.yaml")
 
-    with open("metadata.json", encoding="utf-8") as f:
-        data = json.load(f)
-    metadata = PaperMetaData.model_validate(data)  # extra keys ignored
-    options = {k: data[k] for k in ("output_dir", "save_output", "enable_vlm_review", "max_review_iterations") if k in data}
+    request = PaperGenerationRequest.model_validate_json_file("metadata.json")
+    metadata = request.to_metadata()
+    options = request.to_generate_options()
 
     result = await ep.generate(metadata, **options)
     print(result.status, result.total_word_count)
@@ -78,7 +76,7 @@ async def main():
 asyncio.run(main())
 ```
 
-For a minimal metadata-only JSON (no `output_dir` etc.), you can use:
+For a minimal metadata-only JSON (no runtime options), you can use:
 
 ```python
 metadata = PaperMetaData.model_validate_json_file("metadata.json")

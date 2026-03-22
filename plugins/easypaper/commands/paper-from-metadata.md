@@ -3,8 +3,9 @@ Generate a paper directly from metadata using EasyPaper Python SDK.
 ## Execution contract
 
 1. **Recommended**: Have the user prepare a `metadata.json` (see `examples/meta.json` for schema), then load and run:
-   - Load metadata: `PaperMetaData.model_validate_json_file("metadata.json")`
-   - If the JSON includes generation options (`output_dir`, `save_output`, `enable_vlm_review`, `max_review_iterations`), pass them to `ep.generate(metadata, **options)`.
+   - Parse request: `request = PaperGenerationRequest.model_validate_json_file("metadata.json")`
+   - Build SDK inputs: `metadata = request.to_metadata()` and `options = request.to_generate_options()`
+   - Generate: `result = await ep.generate(metadata, **options)`
    - Ensure all paths in the file are absolute (or convert with `Path(...).resolve()`).
 
 2. **Use the `paper-from-metadata` skill** which handles the complete workflow:
@@ -15,9 +16,9 @@ Generate a paper directly from metadata using EasyPaper Python SDK.
    - Generate paper using EasyPaper SDK directly
 
 3. **The skill will**:
-   - Import EasyPaper: `from easypaper import EasyPaper, PaperMetaData`
+   - Import EasyPaper: `from easypaper import EasyPaper, PaperMetaData, PaperGenerationRequest`
    - Initialize with config: `ep = EasyPaper(config_path="...")` (config path should be absolute)
-   - Prefer loading from file: `metadata = PaperMetaData.model_validate_json_file(path)` when user has a metadata file; otherwise build or convert to `PaperMetaData` (with all paths absolute).
+   - Prefer loading from file via `PaperGenerationRequest.model_validate_json_file(path)`, then use `to_metadata()` + `to_generate_options()`; otherwise build or convert to `PaperMetaData` (with all paths absolute).
    - Generate: `result = await ep.generate(metadata, **options)`
    - Report results with absolute file paths and summary
 
