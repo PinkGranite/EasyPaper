@@ -31,7 +31,38 @@ class NarrativeStyle(str, Enum):
 
 
 # =========================================================================
-# New paragraph-level models
+# Sentence-level models
+# =========================================================================
+
+class SentenceRole(str, Enum):
+    """Functional role of a sentence within a paragraph."""
+    TOPIC = "topic"
+    EVIDENCE = "evidence"
+    ANALYSIS = "analysis"
+    TRANSITION = "transition"
+    CONCLUSION = "conclusion"
+
+
+class SentencePlan(BaseModel):
+    """
+    Explicit plan for a single sentence within a paragraph.
+    - **Description**:
+        - Upgrades the coarse ``approx_sentences`` integer into a list of
+          concrete sentence-level instructions.
+        - Each sentence carries its own claim/evidence binding and role.
+        - The ``template`` field is reserved for template-slot filling
+          (Phase 2, Task 2.4).
+    """
+    sentence_id: str = ""
+    claim_id: str = ""
+    evidence_ids: List[str] = Field(default_factory=list)
+    role: SentenceRole = SentenceRole.EVIDENCE
+    approx_words: int = 20
+    template: str = ""
+
+
+# =========================================================================
+# Paragraph-level models
 # =========================================================================
 
 class ParagraphPlan(BaseModel):
@@ -40,6 +71,9 @@ class ParagraphPlan(BaseModel):
     - **Description**:
         - Replaces flat key_points + target_words with fine-grained guidance
         - Each paragraph has a clear role and estimated length
+        - claim_id and bound_evidence_ids link to the EvidenceDAG
+        - sentence_plans provides explicit per-sentence instructions when the
+          EvidenceDAG is available; approx_sentences serves as fallback.
     """
     key_point: str = ""
     supporting_points: List[str] = Field(default_factory=list)
@@ -48,6 +82,18 @@ class ParagraphPlan(BaseModel):
     references_to_cite: List[str] = Field(default_factory=list)
     figures_to_reference: List[str] = Field(default_factory=list)
     tables_to_reference: List[str] = Field(default_factory=list)
+    # Evidence DAG bindings (populated by DAGBuilder)
+    claim_id: str = ""
+    bound_evidence_ids: List[str] = Field(default_factory=list)
+    # Explicit sentence plans (populated when DAG is available)
+    sentence_plans: List[SentencePlan] = Field(default_factory=list)
+    # Template for degraded generation (populated by template-slot filling)
+    paragraph_template: Optional[Dict[str, Any]] = None
+
+    @property
+    def effective_sentence_count(self) -> int:
+        """Return explicit plan length when available, else the estimate."""
+        return len(self.sentence_plans) if self.sentence_plans else self.approx_sentences
 
 
 class FigurePlacement(BaseModel):
@@ -116,8 +162,8 @@ class SectionPlan(BaseModel):
     order: int = 0
 
     def get_total_sentences(self) -> int:
-        """Sum of approx_sentences across all paragraphs."""
-        return sum(p.approx_sentences for p in self.paragraphs)
+        """Sum of effective sentence counts across all paragraphs."""
+        return sum(p.effective_sentence_count for p in self.paragraphs)
 
     def get_estimated_words(self) -> int:
         """Rough word estimate from sentence count."""
@@ -164,6 +210,8 @@ class PaperPlan(BaseModel):
     wide_figures: List[str] = Field(default_factory=list)
     wide_tables: List[str] = Field(default_factory=list)
     citation_strategy: Dict[str, Any] = Field(default_factory=dict)
+    # Serialised EvidenceDAG (populated by DAGBuilder, use EvidenceDAG.from_serializable to restore)
+    evidence_dag: Optional[Dict[str, Any]] = None
 
     def get_section(self, section_type: str) -> Optional[SectionPlan]:
         """Get section plan by type."""
@@ -203,6 +251,42 @@ class PaperPlan(BaseModel):
     def get_total_estimated_words(self) -> int:
         """Total word estimate from sentence counts."""
         return self.get_total_sentences() * WORDS_PER_SENTENCE
+
+    def to_document_spec(self) -> "DocumentSpec":
+        """
+        Convert paper-specific plan to the generic DocumentSpec interface.
+        - **Description**:
+            - Maps SectionPlan → ContentSection with paragraph dicts
+            - Preserves contributions, terminology, evidence_dag, and rationale
+            - Enables the generation pipeline to work with any document type
+
+        - **Returns**:
+            - `DocumentSpec`: Generic document specification
+        """
+        from ...models.document_spec import DocumentSpec, ContentSection
+
+        doc_sections = []
+        for sp in self.sections:
+            para_dicts = [p.model_dump() for p in sp.paragraphs]
+            doc_sections.append(ContentSection(
+                section_id=sp.section_type,
+                title=sp.section_title,
+                content_sources=list(sp.content_sources),
+                paragraphs=para_dicts,
+                depends_on=list(sp.depends_on),
+                figures=[f.model_dump() for f in sp.figures],
+                tables=[t.model_dump() for t in sp.tables],
+                order=sp.order,
+            ))
+        return DocumentSpec(
+            title=self.title,
+            document_type="paper",
+            sections=doc_sections,
+            contributions=list(self.contributions),
+            terminology=dict(self.terminology),
+            structure_rationale=self.structure_rationale,
+            evidence_dag=self.evidence_dag,
+        )
 
 
 # =========================================================================

@@ -25,6 +25,8 @@ from .models import (
     TablePlacement,
     PaperType,
     NarrativeStyle,
+    SentencePlan,
+    SentenceRole,
     DEFAULT_EMPIRICAL_SECTIONS,
     ELEMENT_PAGE_COST,
     WORDS_PER_SENTENCE,
@@ -36,6 +38,10 @@ from .models import (
 
 logger = logging.getLogger("uvicorn.error")
 
+from ...prompts import PromptLoader as _PromptLoader
+
+_prompt_loader = _PromptLoader()
+
 
 # =========================================================================
 # LLM Prompts
@@ -46,9 +52,12 @@ logger = logging.getLogger("uvicorn.error")
 # =========================================================================
 
 # --- STEP 1: Structure Decision ---
-STEP1_STRUCTURE_SYSTEM = """You are an expert academic paper planner.
+_STEP1_STRUCTURE_SYSTEM_DEFAULT = """You are an expert academic paper planner.
 Given a paper's metadata and target venue, decide the high-level structure.
 Output ONLY a JSON object. No markdown, no explanation."""
+STEP1_STRUCTURE_SYSTEM = _prompt_loader.load(
+    "planner", "step1_structure", default=_STEP1_STRUCTURE_SYSTEM_DEFAULT
+)
 
 STEP1_STRUCTURE_USER = """Decide the structure for this paper:
 
@@ -85,9 +94,12 @@ IMPORTANT:
 Output valid JSON only."""
 
 # --- STEP 2: Citation Strategy ---
-STEP2_CITATION_SYSTEM = """You are an expert academic citation strategist.
+_STEP2_CITATION_SYSTEM_DEFAULT = """You are an expert academic citation strategist.
 Given a paper's structure and venue, decide the total citation count and
 per-section allocation. Output ONLY a JSON object."""
+STEP2_CITATION_SYSTEM = _prompt_loader.load(
+    "planner", "step2_citation", default=_STEP2_CITATION_SYSTEM_DEFAULT
+)
 
 STEP2_CITATION_USER = """Decide the citation strategy for this paper:
 
@@ -116,9 +128,12 @@ Abstract and conclusion typically need 0 citations.
 Output valid JSON only."""
 
 # --- STEP 3: Section Planning (called per section) ---
-STEP3_SECTION_SYSTEM = """You are an expert academic section planner.
+_STEP3_SECTION_SYSTEM_DEFAULT = """You are an expert academic section planner.
 Given a section's role in the paper, plan its paragraphs in detail.
 Output ONLY a JSON object."""
+STEP3_SECTION_SYSTEM = _prompt_loader.load(
+    "planner", "step3_section", default=_STEP3_SECTION_SYSTEM_DEFAULT
+)
 
 STEP3_SECTION_USER = """Plan the **{section_title}** ({section_type}) section:
 
@@ -1516,6 +1531,8 @@ class PlannerAgent(BaseAgent):
         core_ref_keys: List[str],
         planner_budget: Optional[Dict[str, Any]] = None,
         topdown_target: Optional[int] = None,
+        evidence_dag: Optional[Any] = None,
+        section_plan: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         Infer per-section citation budget, prioritizing planner-provided budget.
@@ -1524,9 +1541,27 @@ class PlannerAgent(BaseAgent):
           - `topdown_target` (int | None): Target derived from the global
             citation_strategy (top-down distribution).  Used as fallback
             when planner_budget is absent.
+          - `evidence_dag` (EvidenceDAG | None): When available, DAG-derived
+            citation refs are mixed into must_use_refs.
+          - `section_plan` (SectionPlan | None): Current section's plan,
+            used to extract paragraph-level bound_evidence_ids.
         """
         candidate_keys = [p.get("ref_id", "") for p in candidate_refs if p.get("ref_id")]
         allowed_key_set = set(candidate_keys) | set(core_ref_keys)
+
+        # DAG-derived citation refs: extract evidence IDs bound to paragraphs
+        dag_citation_refs: List[str] = []
+        if evidence_dag is not None and section_plan is not None:
+            try:
+                for para in getattr(section_plan, "paragraphs", []):
+                    for eid in getattr(para, "bound_evidence_ids", []):
+                        node = evidence_dag.get_node(eid)
+                        if node is not None:
+                            ref_id = getattr(node, "ref_id", "") or ""
+                            if ref_id and ref_id in allowed_key_set and ref_id not in dag_citation_refs:
+                                dag_citation_refs.append(ref_id)
+            except Exception:
+                pass
         planner_hint_refs = [r for r in planner_hint_refs if r in allowed_key_set]
         high_quality = [
             p for p in candidate_refs
@@ -1560,10 +1595,14 @@ class PlannerAgent(BaseAgent):
             max_refs = max(target_refs, min_refs, candidate_count)
 
         must_use_refs: List[str] = []
+        # DAG-derived refs get highest priority
+        for rid in dag_citation_refs:
+            if rid and rid not in must_use_refs:
+                must_use_refs.append(rid)
         for rid in planner_hint_refs:
             if rid and rid not in must_use_refs:
                 must_use_refs.append(rid)
-            if len(must_use_refs) >= 3:
+            if len(must_use_refs) >= 3 + len(dag_citation_refs):
                 break
         for p in high_quality:
             rid = p.get("ref_id", "")
@@ -1608,6 +1647,80 @@ class PlannerAgent(BaseAgent):
             "planner_hint_refs": planner_hint_refs[:8],
             "planner_budget_used": bool(budget_target is not None),
         }
+
+    @staticmethod
+    def _generate_sentence_plans(
+        paragraph_plan: "ParagraphPlan",
+        evidence_dag: Optional[Any] = None,
+    ) -> List["SentencePlan"]:
+        """
+        Generate explicit sentence-level plans for a paragraph.
+
+        - **Description**:
+            - When an EvidenceDAG is available and the paragraph has
+              bound_evidence_ids, each evidence node becomes one EVIDENCE
+              sentence and the first / last slots are TOPIC / CONCLUSION.
+            - When no DAG is available, falls back to a uniform distribution
+              of ``approx_sentences`` EVIDENCE sentences.
+
+        - **Args**:
+            - ``paragraph_plan``: ParagraphPlan instance.
+            - ``evidence_dag``: Optional EvidenceDAG for binding evidence nodes.
+
+        - **Returns**:
+            - List of SentencePlan objects.
+        """
+        bound_ids = list(getattr(paragraph_plan, "bound_evidence_ids", []) or [])
+        claim_id = getattr(paragraph_plan, "claim_id", "")
+        n_sentences = getattr(paragraph_plan, "approx_sentences", 5)
+
+        plans: List[SentencePlan] = []
+        prefix = claim_id or "p"
+
+        if bound_ids and evidence_dag is not None:
+            plans.append(SentencePlan(
+                sentence_id=f"{prefix}.s0",
+                claim_id=claim_id,
+                role=SentenceRole.TOPIC,
+                approx_words=25,
+            ))
+            for i, eid in enumerate(bound_ids):
+                ev_ids = [eid]
+                approx_w = 20
+                try:
+                    node = evidence_dag.get_node(eid)
+                    if node is not None:
+                        approx_w = min(40, max(15, len(str(getattr(node, "content", ""))) // 5))
+                except Exception:
+                    pass
+                plans.append(SentencePlan(
+                    sentence_id=f"{prefix}.s{i + 1}",
+                    claim_id=claim_id,
+                    evidence_ids=ev_ids,
+                    role=SentenceRole.EVIDENCE,
+                    approx_words=approx_w,
+                ))
+            plans.append(SentencePlan(
+                sentence_id=f"{prefix}.s{len(bound_ids) + 1}",
+                claim_id=claim_id,
+                role=SentenceRole.CONCLUSION,
+                approx_words=20,
+            ))
+        else:
+            for i in range(n_sentences):
+                if i == 0:
+                    role = SentenceRole.TOPIC
+                elif i == n_sentences - 1:
+                    role = SentenceRole.CONCLUSION
+                else:
+                    role = SentenceRole.EVIDENCE
+                plans.append(SentencePlan(
+                    sentence_id=f"{prefix}.s{i}",
+                    claim_id=claim_id,
+                    role=role,
+                    approx_words=20,
+                ))
+        return plans
 
     def _build_context_fallback_payload(
         self,

@@ -1,0 +1,6 @@
+You are writing the Conclusion section of a research paper.
+This section should:
+- Summarize the main contributions concisely
+- Restate key findings and their significance
+- Discuss broader impact and applications
+- End with forward-looking perspective.

@@ -110,12 +110,22 @@ class RevisionTask(BaseModel):
     issue_type: IssueType = IssueType.OTHER
     acceptance_criteria: List[str] = Field(default_factory=list)
 
+    def to_unified_action(self) -> "Action":
+        """Convert to the unified Action model from ``src.models``."""
+        from ...models.action_space import from_legacy_action
+        return from_legacy_action(
+            self.action,
+            target_id=self.target_id,
+            section=self.section_type,
+        )
+
 
 class ConflictResolutionRecord(BaseModel):
     """
     Conflict resolution output for competing suggestions.
     - **Description**:
         - Captures what conflicted and why a decision was selected
+        - Records multi-objective scores and Pareto front info when available
     """
     section_type: str = ""
     target_id: str = ""
@@ -124,6 +134,9 @@ class ConflictResolutionRecord(BaseModel):
     selected_source: str = ""
     reason: str = ""
     applied_guardrail: Optional[str] = None
+    objective_scores: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
+    pareto_front_size: int = 0
+    resolution_method: str = ""
 
 
 class SemanticCheckRecord(BaseModel):
@@ -179,6 +192,16 @@ class SectionFeedback(BaseModel):
     target_id: str = ""  # e.g. "method" or "method.p3"
     issue_type: IssueType = IssueType.OTHER
     acceptance_criteria: List[str] = Field(default_factory=list)
+
+    def to_unified_action(self) -> "Action":
+        """Convert to the unified Action model from ``src.models``."""
+        from ...models.action_space import from_legacy_action
+        return from_legacy_action(
+            self.action,
+            target_id=self.target_id or self.section_type,
+            section=self.section_type,
+            estimated_impact=float(self.delta_words),
+        )
 
 
 class ReviewContext(BaseModel):

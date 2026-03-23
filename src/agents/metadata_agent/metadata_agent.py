@@ -37,6 +37,8 @@ import httpx
 from pydantic import BaseModel
 from fastapi import APIRouter
 
+from .progress import ProgressEmitter, ProgressCallback, EventType, Phase
+from ..shared.llm_client import set_llm_progress_context, clear_llm_progress_context
 from ..react_base import ReActAgent
 from ...config.schema import ModelConfig, ToolsConfig
 from ..shared.reference_pool import ReferencePool
@@ -54,6 +56,7 @@ from .models import (
 from ..shared.prompt_compiler import (
     compile_introduction_prompt,
     compile_body_section_prompt,
+    compile_paragraph_prompt,
     compile_synthesis_prompt,
     extract_contributions_from_intro,
     SECTION_PROMPTS,
@@ -71,14 +74,14 @@ from ..planner_agent.models import (
 )
 from ..shared.table_converter import convert_tables
 from ..shared.session_memory import SessionMemory, ReviewRecord
-from .progress import ProgressEmitter, ProgressCallback, EventType, Phase
-from ..shared.llm_client import set_llm_progress_context, clear_llm_progress_context
 from ..shared.code_context import (
     CodeContextBuilder,
     format_code_context_for_prompt,
     format_code_context_for_planner,
     render_code_repository_summary_markdown,
 )
+from ...evidence.dag_builder import DAGBuilder
+from ...models.evidence_graph import EvidenceDAG
 from ..reviewer_agent.models import (
     ReviewResult,
     FeedbackResult,
@@ -87,12 +90,19 @@ from ..reviewer_agent.models import (
     RevisionTask,
     ConflictResolutionRecord,
     SemanticCheckRecord,
+    HierarchicalFeedbackItem,
+    FeedbackLevel,
 )
 from .models import FigureSpec, TableSpec, StructuralAction, SpaceEstimate
+from .orchestrator import ReviewOrchestrator
+from .revision_executor import RevisionExecutor
+from .conflict_resolver import ConflictResolver, LATEX_ERROR_FIXES as _CR_LATEX_ERROR_FIXES
+from ...prompts import PromptLoader as _PromptLoader
 
+_prompt_loader = _PromptLoader()
 
-# System prompt for pure content generation (no tools attached)
-GENERATION_SYSTEM_PROMPT = """\
+# Original inline constant kept as fallback
+_GENERATION_SYSTEM_PROMPT_DEFAULT = """\
 You are an expert academic writer specializing in research paper composition.
 Use present tense for methods, no contractions (it is, do not, cannot),
 no possessives on method names (the performance of X, not X's performance).
@@ -106,9 +116,11 @@ CITATION RULES:
 OUTPUT FORMAT:
 Return ONLY the LaTeX content for the section. Do not include explanations outside the LaTeX."""
 
+GENERATION_SYSTEM_PROMPT = _prompt_loader.load(
+    "metadata", "generation_system", default=_GENERATION_SYSTEM_PROMPT_DEFAULT
+)
 
-# System prompt for pre-generation search judgment
-SEARCH_JUDGMENT_PROMPT = """\
+_SEARCH_JUDGMENT_PROMPT_DEFAULT = """\
 You are an academic research assistant. Your task is to analyze whether the existing \
 references are sufficient for writing a specific section of a research paper, or whether \
 additional references should be searched.
@@ -135,6 +147,10 @@ a sub-topic with zero refs), set need_search to true.
 Respond with ONLY a JSON object, no other text:
 {{"need_search": true/false, "reason": "...", "queries": ["...", "..."]}}\
 """
+
+SEARCH_JUDGMENT_PROMPT = _prompt_loader.load(
+    "metadata", "search_judgment", default=_SEARCH_JUDGMENT_PROMPT_DEFAULT
+)
 
 
 class MetaDataAgent(ReActAgent):
@@ -175,7 +191,10 @@ class MetaDataAgent(ReActAgent):
         super().__init__(config, tools_config)
         self.results_dir = Path(__file__).parent.parent.parent.parent / "results"
         self.results_dir.mkdir(parents=True, exist_ok=True)
-        self._router = self._create_router()
+        try:
+            self._router = self._create_router()
+        except Exception:
+            self._router = None
         # Skill registry — injected post-construction by agents/__init__.py
         self._skill_registry = None
         # Peer agent references — injected post-construction via set_peers()
@@ -183,6 +202,10 @@ class MetaDataAgent(ReActAgent):
         self._reviewer = None
         self._planner = None
         self._vlm_reviewer = None
+        # Sub-modules — initialised here; they access peers lazily via self (host)
+        self._orchestrator = ReviewOrchestrator(self)
+        self._executor = RevisionExecutor(self)
+        self._resolver = ConflictResolver(self)
 
     def set_peers(self, agents: Dict[str, "BaseAgent"]) -> None:
         """
@@ -212,18 +235,6 @@ class MetaDataAgent(ReActAgent):
     ) -> Path:
         """
         Write an artifact file, optionally upload to OSS, and emit artifact_saved.
-
-        - **Args**:
-            - `paper_dir` (Path): Root output directory for the task.
-            - `relative_path` (str): Path relative to paper_dir.
-            - `content` (Any): str, bytes, or a JSON-serializable object.
-            - `emitter` (ProgressEmitter): Emitter for SSE events.
-            - `category` (str): Artifact category.
-            - `label` (str): Human-readable label.
-            - `artifacts_prefix` (str): OSS key prefix for direct upload.
-
-        - **Returns**:
-            - `Path`: Absolute path to the written file.
         """
         target = paper_dir / relative_path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -285,15 +296,6 @@ class MetaDataAgent(ReActAgent):
         """
         Walk a typesetter output directory and emit artifact_saved for every
         file that is needed for a self-contained LaTeX compilation.
-
-        - **Args**:
-            - `compile_dir` (Path): The iteration_XX output directory produced
-              by typesetter._copy_to_output_dir (contains main.tex, sections/,
-              figures/, template .cls/.bst, references.bib, main.pdf, etc.).
-            - `paper_dir` (Path): Root paper output directory. Artifact paths
-              are stored relative to this directory.
-            - `emitter` (ProgressEmitter): SSE progress emitter.
-            - `artifacts_prefix` (str): OSS key prefix for direct upload.
         """
         if not compile_dir or not compile_dir.is_dir():
             return
@@ -487,73 +489,106 @@ class MetaDataAgent(ReActAgent):
         self,
         research_context: Optional[Dict[str, Any]],
         section_type: str,
+        evidence_dag: Optional[EvidenceDAG] = None,
     ) -> str:
         """
         Format research context into a compact writer-consumable brief.
+
+        - **Description**:
+            - When an EvidenceDAG is available, appends a structured
+              claim-evidence binding section that shows exactly which
+              evidence nodes support each claim in this section.
         """
-        if not research_context:
+        if not research_context and not evidence_dag:
             return ""
 
         lines: List[str] = ["## Research Context Brief"]
-        area = str(research_context.get("research_area", "")).strip()
-        summary = str(research_context.get("summary", "")).strip()
-        if area:
-            lines.append(f"- Area: {area}")
-        if summary:
-            lines.append(f"- Landscape: {summary}")
 
-        trends = research_context.get("research_trends", []) or []
-        if trends:
-            lines.append("- Trends:")
-            for t in trends[:3]:
-                lines.append(f"  - {t}")
+        if research_context:
+            area = str(research_context.get("research_area", "")).strip()
+            summary = str(research_context.get("summary", "")).strip()
+            if area:
+                lines.append(f"- Area: {area}")
+            if summary:
+                lines.append(f"- Landscape: {summary}")
 
-        gaps = research_context.get("gaps", []) or []
-        if gaps:
-            lines.append("- Gaps to address:")
-            for g in gaps[:3]:
-                lines.append(f"  - {g}")
+            trends = research_context.get("research_trends", []) or []
+            if trends:
+                lines.append("- Trends:")
+                for t in trends[:3]:
+                    lines.append(f"  - {t}")
 
-        key_papers = research_context.get("key_papers", []) or []
-        if key_papers:
-            lines.append("- Key papers and why they matter:")
-            for kp in key_papers[:5]:
-                title = kp.get("title", "")
-                contribution = kp.get("contribution", "")
-                if title:
-                    lines.append(f"  - {title}: {contribution}")
+            gaps = research_context.get("gaps", []) or []
+            if gaps:
+                lines.append("- Gaps to address:")
+                for g in gaps[:3]:
+                    lines.append(f"  - {g}")
 
-        claim_matrix = research_context.get("claim_evidence_matrix", []) or []
-        section_claims = [
-            c for c in claim_matrix
-            if c.get("section_type") in {section_type, "global", "", None}
-        ]
-        if section_claims:
-            lines.append("- Claim-evidence priorities:")
-            for c in section_claims[:6]:
-                claim = c.get("claim", "")
-                refs = c.get("support_refs", []) or []
-                priority = c.get("priority", "")
-                reason = c.get("reason", "")
-                ref_text = ", ".join(refs[:4]) if refs else "none"
-                lines.append(
-                    f"  - [{priority}] Claim: {claim} | Evidence refs: {ref_text} | Why: {reason}"
-                )
+            key_papers = research_context.get("key_papers", []) or []
+            if key_papers:
+                lines.append("- Key papers and why they matter:")
+                for kp in key_papers[:5]:
+                    title = kp.get("title", "")
+                    contribution = kp.get("contribution", "")
+                    if title:
+                        lines.append(f"  - {title}: {contribution}")
 
-        ranking = research_context.get("contribution_ranking", {}) or {}
-        if ranking:
-            lines.append("- Contribution ranking:")
-            for band in ("P0", "P1", "P2"):
-                items = ranking.get(band, []) or []
-                if not items:
-                    continue
-                for item in items[:3]:
-                    contribution = item.get("contribution", "")
-                    why = item.get("why_it_matters", "")
-                    sections = item.get("suggested_sections", []) or []
-                    section_hint = ", ".join(sections[:3]) if sections else "n/a"
+            claim_matrix = research_context.get("claim_evidence_matrix", []) or []
+            section_claims = [
+                c for c in claim_matrix
+                if c.get("section_type") in {section_type, "global", "", None}
+            ]
+            if section_claims and evidence_dag is None:
+                lines.append("- Claim-evidence priorities:")
+                for c in section_claims[:6]:
+                    claim = c.get("claim", "")
+                    refs = c.get("support_refs", []) or []
+                    priority = c.get("priority", "")
+                    reason = c.get("reason", "")
+                    ref_text = ", ".join(refs[:4]) if refs else "none"
                     lines.append(
-                        f"  - {band}: {contribution} | Why: {why} | Suggested sections: {section_hint}"
+                        f"  - [{priority}] Claim: {claim} | Evidence refs: {ref_text} | Why: {reason}"
+                    )
+
+            ranking = research_context.get("contribution_ranking", {}) or {}
+            if ranking:
+                lines.append("- Contribution ranking:")
+                for band in ("P0", "P1", "P2"):
+                    items = ranking.get(band, []) or []
+                    if not items:
+                        continue
+                    for item in items[:3]:
+                        contribution = item.get("contribution", "")
+                        why = item.get("why_it_matters", "")
+                        sections = item.get("suggested_sections", []) or []
+                        section_hint = ", ".join(sections[:3]) if sections else "n/a"
+                        lines.append(
+                            f"  - {band}: {contribution} | Why: {why} | Suggested sections: {section_hint}"
+                        )
+
+        # --- DAG-based claim-evidence bindings (replaces raw matrix when available) ---
+        if evidence_dag is not None:
+            section_claims = evidence_dag.get_claims_for_section(section_type)
+            if section_claims:
+                lines.append("")
+                lines.append("## Claim-Evidence Bindings (from Evidence DAG)")
+                lines.append(
+                    "(Each claim MUST be supported ONLY by its bound evidence. "
+                    "Do NOT introduce unsupported claims.)"
+                )
+                for claim in section_claims[:10]:
+                    ev_nodes = evidence_dag.get_evidence_for_claim(claim.node_id)
+                    ev_desc_parts: List[str] = []
+                    for ev in ev_nodes[:5]:
+                        label = f"{ev.node_id}({ev.node_type.value})"
+                        if ev.source_path:
+                            label += f"[{ev.source_path}]"
+                        ev_desc_parts.append(label)
+                    ev_text = ", ".join(ev_desc_parts) if ev_desc_parts else "UNSUPPORTED"
+                    lines.append(
+                        f"  - [{claim.priority}] {claim.node_id}: "
+                        f"{claim.statement[:200]} "
+                        f"| Bound evidence: {ev_text}"
                     )
 
         if len(lines) <= 1:
@@ -862,7 +897,7 @@ class MetaDataAgent(ReActAgent):
                 int(x) for x in (feedback.get("target_paragraphs", []) or [])
                 if str(x).strip().lstrip("-").isdigit()
             ]
-            final_paragraphs = self._split_section_paragraphs(
+            final_paragraphs = self._executor._split_section_paragraphs(
                 generated_sections.get(section_type, "") or ""
             )
             final_count = len(final_paragraphs)
@@ -1172,19 +1207,23 @@ class MetaDataAgent(ReActAgent):
         if template_path is None:
             template_path = metadata.template_path
 
-        # Fallback: resolve from style_guide when no explicit template is given
-        if template_path is None and compile_pdf:
-            from src.default_templates import resolve_default_template
-            template_path = resolve_default_template(
-                getattr(metadata, "style_guide", None)
-            )
+        # Resolve default template if none provided
+        if not template_path and not metadata.template_path:
+            try:
+                from src.default_templates import resolve_default_template
+                resolved = resolve_default_template(metadata.style_guide)
+                if resolved:
+                    template_path = resolved
+            except ImportError:
+                pass
 
         # Use target_pages from metadata if not provided
         if target_pages is None:
             target_pages = metadata.target_pages
 
         # Progress emitter for real-time streaming
-        emitter = ProgressEmitter(progress_callback)
+        emitter = ProgressEmitter(callback=progress_callback)
+        set_llm_progress_context(emitter)
         await emitter.generation_started(
             title=metadata.title,
             target_pages=target_pages,
@@ -1206,6 +1245,7 @@ class MetaDataAgent(ReActAgent):
         code_context: Optional[Dict[str, Any]] = None
         code_summary_markdown: Optional[str] = None
         prompt_traces: List[Dict[str, Any]] = []
+        evidence_dag: Optional[EvidenceDAG] = None
 
         _sa = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
 
@@ -1281,8 +1321,8 @@ class MetaDataAgent(ReActAgent):
             # Phase 0e-pre: Code repository understanding (optional, pre-plan)
             # =================================================================
             if metadata.code_repository:
-                await emitter.phase_start(Phase.CODE_CONTEXT, "Building code repository context")
                 print("[MetaDataAgent] Phase 0e-pre: Building code repository context...")
+                await emitter.phase_start(Phase.CODE_CONTEXT, "Building code repository context")
                 try:
                     code_context = await self._build_code_repository_context(metadata)
                     if code_context:
@@ -1319,8 +1359,8 @@ class MetaDataAgent(ReActAgent):
             # Phase 0: Planning (if enabled)
             # =================================================================
             if enable_planning:
-                await emitter.phase_start(Phase.PLANNING, "Creating paper plan")
                 print(f"[MetaDataAgent] Phase 0: Creating Paper Plan...")
+                await emitter.phase_start(Phase.PLANNING, "Creating paper plan")
                 search_cfg = {}
                 if self.tools_config and self.tools_config.paper_search:
                     ps = self.tools_config.paper_search
@@ -1371,20 +1411,15 @@ class MetaDataAgent(ReActAgent):
                             "[MetaDataAgent] Core refs in pre-plan context: "
                             f"{len(core_refs_for_context)} total, {core_with_abstract} with abstract"
                         )
-                        if progress_callback:
-                            set_llm_progress_context(progress_callback, "PlannerAgent", Phase.PLANNING)
-                        try:
-                            seed_discovered_references = await self._planner.discover_seed_references(
-                                title=metadata.title,
-                                idea_hypothesis=metadata.idea_hypothesis,
-                                method=metadata.method,
-                                data=metadata.data,
-                                experiments=metadata.experiments,
-                                existing_ref_keys=list(ref_pool.valid_citation_keys),
-                                paper_search_config=search_cfg,
-                            )
-                        finally:
-                            clear_llm_progress_context()
+                        seed_discovered_references = await self._planner.discover_seed_references(
+                            title=metadata.title,
+                            idea_hypothesis=metadata.idea_hypothesis,
+                            method=metadata.method,
+                            data=metadata.data,
+                            experiments=metadata.experiments,
+                            existing_ref_keys=list(ref_pool.valid_citation_keys),
+                            paper_search_config=search_cfg,
+                        )
                         for paper in seed_discovered_references:
                             ref_pool.add_discovered(
                                 paper.get("ref_id", ""),
@@ -1408,16 +1443,13 @@ class MetaDataAgent(ReActAgent):
                     except Exception as e:
                         print(f"[MetaDataAgent] Warning: Failed to build research context v1: {e}")
 
-                if progress_callback:
-                    set_llm_progress_context(progress_callback, "PlannerAgent", Phase.PLANNING)
-                paper_plan = await self._create_paper_plan(
+                paper_plan = await self._orchestrator._create_paper_plan(
                     metadata=metadata,
                     target_pages=target_pages,
                     style_guide=metadata.style_guide,
                     research_context=research_context_v1,
                     code_context=code_context,
                 )
-                clear_llm_progress_context()
                 if paper_plan:
                     memory.plan = paper_plan
                     if self.tools_config and not getattr(
@@ -1434,20 +1466,6 @@ class MetaDataAgent(ReActAgent):
                                sections=len(paper_plan.sections),
                                estimated_words=paper_plan.get_total_estimated_words())
                     print(f"[MetaDataAgent] Plan created: {len(paper_plan.sections)} sections, ~{paper_plan.get_total_estimated_words()} words (est.)")
-                    await emitter.plan_created(
-                        sections=len(paper_plan.sections),
-                        estimated_words=paper_plan.get_total_estimated_words(),
-                        plan_summary={
-                            "sections": [
-                                {
-                                    "type": s.section_type,
-                                    "title": s.section_title,
-                                    "estimated_words": s.get_estimated_words(),
-                                }
-                                for s in paper_plan.sections
-                            ],
-                        },
-                    )
                     
                     # Apply auto-detected wide flags from plan to metadata figures/tables
                     if paper_plan.wide_figures:
@@ -1462,24 +1480,23 @@ class MetaDataAgent(ReActAgent):
                             if tbl.id in paper_plan.wide_tables and not tbl.wide:
                                 tbl.wide = True
                     
+                    # Save plan to output directory
                     if save_output and paper_dir:
-                        await self._save_artifact(
-                            paper_dir, "analysis/planning/paper_plan.json",
+                        planning_dir = paper_dir / "analysis" / "planning"
+                        planning_dir.mkdir(parents=True, exist_ok=True)
+                        plan_path = planning_dir / "paper_plan.json"
+                        plan_path.write_text(
                             paper_plan.model_dump_json(indent=2),
-                            emitter, "planning", "Paper Plan",
+                            encoding="utf-8",
                         )
 
                     # Reference discovery: Planner searches for relevant papers
                     print("[MetaDataAgent] Phase 0b: Discovering references...")
-                    await emitter.phase_start(Phase.REF_DISCOVERY, "Discovering references via academic search")
-                    if progress_callback:
-                        set_llm_progress_context(progress_callback, "PlannerAgent", Phase.REF_DISCOVERY)
                     discovered = await self._planner.discover_references(
                         plan=paper_plan,
                         existing_ref_keys=list(ref_pool.valid_citation_keys),
                         paper_search_config=search_cfg,
                     )
-                    clear_llm_progress_context()
                     discovered_references_by_section = discovered
                     disc_count = 0
                     for sec_type, papers in discovered.items():
@@ -1489,22 +1506,14 @@ class MetaDataAgent(ReActAgent):
                             )
                             if added:
                                 disc_count += 1
-                        if papers:
-                            await emitter.search_result(
-                                found=len(papers), section=sec_type,
-                                query=f"Reference discovery for {sec_type}",
-                            )
-                    await emitter.phase_complete(Phase.PLANNING, f"Plan created with {len(paper_plan.sections)} sections")
                     if disc_count:
                         print(f"[MetaDataAgent] Discovered {disc_count} new references (pool: {ref_pool.summary()})")
-                        await emitter.references_discovered(count=disc_count, total_pool=len(ref_pool.valid_citation_keys))
                         memory.log("planner", "phase0b", "references_discovered",
                                    narrative=f"Planner discovered {disc_count} additional references via academic search to support the paper plan.",
                                    count=disc_count)
 
                     # Phase 0c: Assign references to sections
                     print("[MetaDataAgent] Phase 0c: Assigning references to sections...")
-                    await emitter.phase_start(Phase.REF_ASSIGNMENT, "Assigning references to sections")
                     self._planner.assign_references(
                         plan=paper_plan,
                         discovered=discovered,
@@ -1515,8 +1524,6 @@ class MetaDataAgent(ReActAgent):
                     for sp in paper_plan.sections:
                         if sp.assigned_refs:
                             print(f"  [{sp.section_type}] {len(sp.assigned_refs)} refs assigned")
-                            await emitter.ref_assigned(section=sp.section_type, count=len(sp.assigned_refs))
-                    await emitter.phase_complete(Phase.REF_ASSIGNMENT, "References assigned to sections")
 
                     # Phase 0d: Generate research context (if enabled)
                     if rc_enabled and discovered:
@@ -1539,8 +1546,86 @@ class MetaDataAgent(ReActAgent):
                                 )
                         except Exception as e:
                             print(f"[MetaDataAgent] Warning: Failed to generate research context: {e}")
+                    await emitter.plan_created(
+                        sections=len(paper_plan.sections),
+                        estimated_words=paper_plan.get_total_estimated_words(),
+                    )
+                    await emitter.phase_complete(Phase.PLANNING, f"Plan created with {len(paper_plan.sections)} sections")
                 else:
                     print(f"[MetaDataAgent] Planning skipped or failed, using defaults")
+
+            # =================================================================
+            # Phase 0d.5: Build Evidence DAG
+            # =================================================================
+            if paper_plan:
+                try:
+                    dag_builder = DAGBuilder()
+                    evidence_dag = dag_builder.build(
+                        code_context=code_context,
+                        research_context=research_context,
+                        figures=metadata.figures,
+                        tables=metadata.tables,
+                        paper_plan=paper_plan,
+                    )
+                    paper_plan.evidence_dag = evidence_dag.to_serializable()
+
+                    # Write DAG bindings back to paragraph plans
+                    for sp in paper_plan.sections:
+                        for pidx, para in enumerate(sp.paragraphs):
+                            if not para.claim_id:
+                                for claim in evidence_dag.claim_nodes.values():
+                                    meta = claim.metadata
+                                    if (
+                                        meta.get("section_type") == sp.section_type
+                                        and meta.get("paragraph_index") == pidx
+                                    ):
+                                        para.claim_id = claim.node_id
+                                        para.bound_evidence_ids = (
+                                            evidence_dag.get_bound_evidence_ids_for_claim(claim.node_id)
+                                        )
+                                        break
+
+                    # Generate sentence plans for each paragraph with DAG bindings
+                    from ..planner_agent.planner_agent import PlannerAgent as _PA
+                    total_sp = 0
+                    for sp in paper_plan.sections:
+                        for pidx, para in enumerate(sp.paragraphs):
+                            if para.claim_id and not para.sentence_plans:
+                                para.sentence_plans = _PA._generate_sentence_plans(
+                                    para, pidx, evidence_dag=evidence_dag,
+                                )
+                                total_sp += len(para.sentence_plans)
+                    if total_sp:
+                        print(f"[MetaDataAgent] Generated {total_sp} sentence plans from DAG bindings")
+
+                    dag_summary = evidence_dag.summary()
+                    print(
+                        f"[MetaDataAgent] Evidence DAG built: "
+                        f"{dag_summary['evidence_count']} evidence, "
+                        f"{dag_summary['claim_count']} claims, "
+                        f"{dag_summary['bound_edge_count']} bindings, "
+                        f"{dag_summary['unsupported_claims']} unsupported"
+                    )
+                    memory.log(
+                        "metadata", "phase0d5", "evidence_dag_built",
+                        narrative=(
+                            f"Evidence DAG constructed with {dag_summary['evidence_count']} evidence nodes "
+                            f"and {dag_summary['claim_count']} claim nodes."
+                        ),
+                        **dag_summary,
+                    )
+
+                    if save_output and paper_dir:
+                        dag_path = paper_dir / "analysis" / "planning" / "evidence_dag.json"
+                        dag_path.parent.mkdir(parents=True, exist_ok=True)
+                        import json
+                        dag_path.write_text(
+                            json.dumps(evidence_dag.to_serializable(), indent=2, ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+                except Exception as e:
+                    print(f"[MetaDataAgent] Warning: Evidence DAG construction failed: {e}")
+                    evidence_dag = None
 
             # =================================================================
             # Phase 0e: Code repository understanding (optional)
@@ -1587,6 +1672,8 @@ class MetaDataAgent(ReActAgent):
             converted_tables: Dict[str, str] = {}
             if metadata.tables:
                 print(f"[MetaDataAgent] Phase 0.5: Converting {len(metadata.tables)} tables...")
+                await emitter.phase_start(Phase.TABLE_CONVERSION,
+                                         f"Converting {len(metadata.tables)} tables to LaTeX")
                 # Determine base path for resolving file paths
                 base_path = None
                 if save_output and paper_dir:
@@ -1603,13 +1690,11 @@ class MetaDataAgent(ReActAgent):
             # =================================================================
             # Phase 1: Introduction (Leader Section)
             # =================================================================
+            print(f"[MetaDataAgent] Phase 1: Generating Introduction...")
             await emitter.phase_start(Phase.INTRODUCTION, "Generating introduction")
             await emitter.section_start("introduction", phase=Phase.INTRODUCTION)
-            print(f"[MetaDataAgent] Phase 1: Generating Introduction...")
             await emitter.agent_step(agent="WriterAgent", description="Generating introduction section", section="introduction", phase=Phase.INTRODUCTION)
             intro_plan = paper_plan.get_section("introduction") if paper_plan else None
-            if progress_callback:
-                set_llm_progress_context(progress_callback, "WriterAgent", Phase.INTRODUCTION, "introduction")
             intro_result = await self._generate_introduction(
                 metadata, ref_pool, section_plan=intro_plan,
                 figures=metadata.figures, tables=metadata.tables,
@@ -1617,26 +1702,22 @@ class MetaDataAgent(ReActAgent):
                 research_context=research_context,
                 prompt_traces=prompt_traces,
                 memory=memory,
+                evidence_dag=evidence_dag,
             )
-            clear_llm_progress_context()
             sections_results.append(intro_result)
             print(f"[MetaDataAgent] After introduction: {ref_pool.summary()}")
             
             if intro_result.status == "ok":
                 generated_sections["introduction"] = intro_result.latex_content
-                await emitter.section_content(
-                    section_type="introduction",
-                    content=intro_result.latex_content,
-                    word_count=intro_result.word_count or 0,
-                    phase=Phase.INTRODUCTION,
-                )
-                if save_output and paper_dir:
-                    intro_label = _sec_filename("introduction")
-                    await _sa(paper_dir, f"sections/{intro_label}.tex",
-                              intro_result.latex_content, emitter, "section", f"{intro_label}.tex")
                 memory.log("metadata", "phase1", "introduction_generated",
                            narrative=f"Writer completed the introduction section ({intro_result.word_count} words).",
                            word_count=intro_result.word_count)
+                await emitter.section_content(
+                    section_type="introduction",
+                    content=intro_result.latex_content,
+                    word_count=intro_result.word_count,
+                    phase=Phase.INTRODUCTION,
+                )
                 if intro_plan:
                     intro_valid_keys = list(
                         dict.fromkeys(
@@ -1687,8 +1768,8 @@ class MetaDataAgent(ReActAgent):
             # =================================================================
             # Phase 2: Body Sections (can be parallel)
             # =================================================================
-            await emitter.phase_start(Phase.BODY_SECTIONS, "Generating body sections")
             print(f"[MetaDataAgent] Phase 2: Generating Body Sections...")
+            await emitter.phase_start(Phase.BODY_SECTIONS, "Generating body sections")
             # Dynamic: read body section types from the plan (no hardcoding)
             if paper_plan:
                 body_section_types = paper_plan.get_body_section_types()
@@ -1698,15 +1779,12 @@ class MetaDataAgent(ReActAgent):
             
             # Generate body sections sequentially (ref_pool accumulates across sections)
             for section_type in body_section_types:
-                await emitter.section_start(section_type, phase=Phase.BODY_SECTIONS)
-                await emitter.agent_step(agent="WriterAgent", description=f"Generating {section_type} section", section=section_type, phase=Phase.BODY_SECTIONS)
                 section_plan = paper_plan.get_section(section_type) if paper_plan else None
+                # Filter figures/tables for this section
                 section_figures = [f for f in metadata.figures if f.section == section_type or not f.section]
                 section_tables = [t for t in metadata.tables if t.section == section_type or not t.section]
                 
                 try:
-                    if progress_callback:
-                        set_llm_progress_context(progress_callback, "WriterAgent", Phase.BODY_SECTIONS, section_type)
                     result = await self._generate_body_section(
                         section_type=section_type,
                         metadata=metadata,
@@ -1721,8 +1799,8 @@ class MetaDataAgent(ReActAgent):
                         research_context=research_context,
                         prompt_traces=prompt_traces,
                         memory=memory,
+                        evidence_dag=evidence_dag,
                     )
-                    clear_llm_progress_context()
                 except Exception as e:
                     result = SectionResult(
                         section_type=section_type,
@@ -1733,19 +1811,15 @@ class MetaDataAgent(ReActAgent):
                 sections_results.append(result)
                 if result.status == "ok":
                     generated_sections[section_type] = result.latex_content
-                    await emitter.section_content(
-                        section_type=section_type,
-                        content=result.latex_content,
-                        word_count=result.word_count or 0,
-                        phase=Phase.BODY_SECTIONS,
-                    )
-                    if save_output and paper_dir:
-                        sec_label = _sec_filename(section_type)
-                        await _sa(paper_dir, f"sections/{sec_label}.tex",
-                                  result.latex_content, emitter, "section", f"{sec_label}.tex")
                     memory.log("metadata", "phase2", f"{section_type}_generated",
                                narrative=f"Writer completed the {section_type} section ({result.word_count} words).",
                                word_count=result.word_count)
+                    await emitter.section_content(
+                        section_type=section_type,
+                        content=result.latex_content,
+                        word_count=result.word_count,
+                        phase=Phase.BODY_SECTIONS,
+                    )
                     if section_plan:
                         section_valid_keys = list(
                             dict.fromkeys(
@@ -1767,13 +1841,10 @@ class MetaDataAgent(ReActAgent):
             # =================================================================
             # Phase 3: Synthesis Sections (Abstract + Conclusion)
             # =================================================================
-            await emitter.phase_start(Phase.SYNTHESIS, "Generating synthesis sections (abstract, conclusion)")
             print(f"[MetaDataAgent] Phase 3: Generating Synthesis Sections...")
+            await emitter.phase_start(Phase.SYNTHESIS, "Generating synthesis sections (abstract, conclusion)")
             
             # Generate Abstract
-            await emitter.agent_step(agent="WriterAgent", description="Generating abstract", section="abstract", phase=Phase.SYNTHESIS)
-            if progress_callback:
-                set_llm_progress_context(progress_callback, "WriterAgent", Phase.SYNTHESIS, "abstract")
             abstract_result = await self._generate_synthesis_section(
                 section_type="abstract",
                 paper_title=metadata.title,
@@ -1784,23 +1855,18 @@ class MetaDataAgent(ReActAgent):
                 prompt_traces=prompt_traces,
                 memory=memory,
             )
-            clear_llm_progress_context()
             sections_results.insert(0, abstract_result)  # Abstract goes first
             if abstract_result.status == "ok":
                 generated_sections["abstract"] = abstract_result.latex_content
-                await emitter.section_content(
-                    section_type="abstract",
-                    content=abstract_result.latex_content,
-                    word_count=abstract_result.word_count or 0,
-                    phase=Phase.SYNTHESIS,
-                )
-                if save_output and paper_dir:
-                    abs_label = _sec_filename("abstract")
-                    await _sa(paper_dir, f"sections/{abs_label}.tex",
-                              abstract_result.latex_content, emitter, "section", f"{abs_label}.tex")
                 memory.log("metadata", "phase3", "abstract_generated",
                            narrative=f"Writer completed the abstract ({abstract_result.word_count} words).",
                            word_count=abstract_result.word_count)
+                await emitter.section_content(
+                    section_type="abstract",
+                    content=abstract_result.latex_content,
+                    word_count=abstract_result.word_count,
+                    phase=Phase.SYNTHESIS,
+                )
             else:
                 errors.append(f"Abstract generation failed: {abstract_result.error}")
             
@@ -1809,9 +1875,6 @@ class MetaDataAgent(ReActAgent):
                 paper_plan and paper_plan.get_section("conclusion") is not None
             )
             if should_generate_conclusion:
-                await emitter.agent_step(agent="WriterAgent", description="Generating conclusion", section="conclusion", phase=Phase.SYNTHESIS)
-                if progress_callback:
-                    set_llm_progress_context(progress_callback, "WriterAgent", Phase.SYNTHESIS, "conclusion")
                 conclusion_result = await self._generate_synthesis_section(
                     section_type="conclusion",
                     paper_title=metadata.title,
@@ -1822,23 +1885,18 @@ class MetaDataAgent(ReActAgent):
                     prompt_traces=prompt_traces,
                     memory=memory,
                 )
-                clear_llm_progress_context()
                 sections_results.append(conclusion_result)
                 if conclusion_result.status == "ok":
                     generated_sections["conclusion"] = conclusion_result.latex_content
-                    await emitter.section_content(
-                        section_type="conclusion",
-                        content=conclusion_result.latex_content,
-                        word_count=conclusion_result.word_count or 0,
-                        phase=Phase.SYNTHESIS,
-                    )
-                    if save_output and paper_dir:
-                        conc_label = _sec_filename("conclusion")
-                        await _sa(paper_dir, f"sections/{conc_label}.tex",
-                                  conclusion_result.latex_content, emitter, "section", f"{conc_label}.tex")
                     memory.log("metadata", "phase3", "conclusion_generated",
                                narrative=f"Writer completed the conclusion ({conclusion_result.word_count} words).",
                                word_count=conclusion_result.word_count)
+                    await emitter.section_content(
+                        section_type="conclusion",
+                        content=conclusion_result.latex_content,
+                        word_count=conclusion_result.word_count,
+                        phase=Phase.SYNTHESIS,
+                    )
                 else:
                     errors.append(f"Conclusion generation failed: {conclusion_result.error}")
             
@@ -1850,6 +1908,8 @@ class MetaDataAgent(ReActAgent):
             # =================================================================
             # Unified Review Orchestration (Reviewer + VLM)
             # =================================================================
+            if enable_review:
+                await emitter.phase_start(Phase.REVIEW_LOOP, "Starting review loop")
             (
                 generated_sections,
                 sections_results,
@@ -1857,7 +1917,7 @@ class MetaDataAgent(ReActAgent):
                 target_word_count,
                 pdf_path,
                 orchestration_errors,
-            ) = await self._run_review_orchestration(
+            ) = await self._orchestrator._run_review_orchestration(
                 generated_sections=generated_sections,
                 sections_results=sections_results,
                 metadata=metadata,
@@ -1873,35 +1933,12 @@ class MetaDataAgent(ReActAgent):
                 target_pages=target_pages,
                 paper_dir=paper_dir,
                 memory=memory,
-                emitter=emitter,
-                feedback_queue=feedback_queue,
-                feedback_timeout=feedback_timeout,
-                progress_callback=progress_callback,
-                enable_user_feedback=enable_user_feedback,
-                ref_pool=ref_pool,
-                artifacts_prefix=artifacts_prefix,
+                evidence_dag=evidence_dag,
             )
             if orchestration_errors:
-                is_paused = any(
-                    e.startswith("__paused_for_feedback__:") for e in orchestration_errors
-                )
-                if is_paused:
-                    ckpt = next(
-                        (e.split(":", 1)[1] for e in orchestration_errors
-                         if e.startswith("__paused_for_feedback__:")),
-                        "",
-                    )
-                    return PaperGenerationResult(
-                        status="paused_for_feedback",
-                        paper_title=metadata.title,
-                        sections=sections_results,
-                        total_word_count=sum(r.word_count for r in sections_results if r.word_count),
-                        target_word_count=target_word_count,
-                        review_iterations=review_iterations,
-                        output_path=str(paper_dir) if paper_dir else None,
-                        errors=[f"checkpoint:{ckpt}"],
-                    )
                 errors.extend(orchestration_errors)
+            if enable_review:
+                await emitter.phase_complete(Phase.REVIEW_LOOP, f"Review completed ({review_iterations} iterations)")
 
             # Recompute citation usage from final post-review content so exports align
             # with the delivered manuscript instead of pre-review drafts.
@@ -1929,15 +1966,49 @@ class MetaDataAgent(ReActAgent):
             output_path = None
             if save_output and paper_dir:
                 output_path = str(paper_dir)
+                analysis_dir = paper_dir / "analysis"
+                planning_dir = analysis_dir / "planning"
+                research_dir = analysis_dir / "research_context"
+                citation_dir = analysis_dir / "citations"
+                structure_dir = analysis_dir / "structure"
+                review_dir = analysis_dir / "review"
+                references_dir = analysis_dir / "references"
+                code_dir = analysis_dir / "code_context"
+                logs_dir = paper_dir / "logs"
+                traces_dir = logs_dir / "traces"
+                for d in (
+                    analysis_dir,
+                    planning_dir,
+                    research_dir,
+                    citation_dir,
+                    structure_dir,
+                    review_dir,
+                    references_dir,
+                    code_dir,
+                    logs_dir,
+                    traces_dir,
+                ):
+                    d.mkdir(parents=True, exist_ok=True)
+                
+                # Save main.tex
+                tex_path = paper_dir / "main.tex"
+                tex_path.write_text(latex_content, encoding="utf-8")
+                
+                # Save references.bib (uses ref_pool for all accumulated refs)
+                bib_content = ref_pool.to_bibtex()
+                bib_path = paper_dir / "references.bib"
+                bib_path.write_text(bib_content, encoding="utf-8")
+                
+                # Save metadata.json
+                meta_path = paper_dir / "metadata.json"
+                meta_path.write_text(
+                    json.dumps(metadata.model_dump(), indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
 
-                await _sa(paper_dir, "main.tex", latex_content, emitter, "root", "Main LaTeX")
-                await _sa(paper_dir, "references.bib", ref_pool.to_bibtex(), emitter, "references", "References BibTeX")
-                await _sa(paper_dir, "metadata.json",
-                          json.dumps(metadata.model_dump(), indent=2, ensure_ascii=False),
-                          emitter, "root", "Metadata")
-
-                # Research context artifacts
+                # Save research_context.json (if generated)
                 if research_context:
+                    rc_path = research_dir / "research_context.json"
                     context_output = dict(research_context)
                     context_output.pop("_llm_raw_outputs", None)
                     core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
@@ -1948,11 +2019,14 @@ class MetaDataAgent(ReActAgent):
                     context_output["core_ref_ids"] = core_ref_ids
                     context_output["core_refs_with_abstract_count"] = core_refs_with_abstract_count
                     context_output["generated_at"] = datetime.now().isoformat()
-                    await _sa(paper_dir, "analysis/research_context/research_context.json",
-                              json.dumps(context_output, indent=2, ensure_ascii=False),
-                              emitter, "research_context", "Research Context")
+                    rc_path.write_text(
+                        json.dumps(context_output, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Research context saved to: {rc_path}")
 
                 if research_context_v1:
+                    rc_v1_path = research_dir / "research_context_v1.json"
                     rc_v1_payload = dict(research_context_v1)
                     raw_outputs_v1 = rc_v1_payload.pop("_llm_raw_outputs", None)
                     core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
@@ -1963,15 +2037,21 @@ class MetaDataAgent(ReActAgent):
                     rc_v1_payload["core_ref_ids"] = core_ref_ids
                     rc_v1_payload["core_refs_with_abstract_count"] = core_refs_with_abstract_count
                     rc_v1_payload["generated_at"] = datetime.now().isoformat()
-                    await _sa(paper_dir, "analysis/research_context/research_context_v1.json",
-                              json.dumps(rc_v1_payload, indent=2, ensure_ascii=False),
-                              emitter, "research_context", "Research Context v1")
+                    rc_v1_path.write_text(
+                        json.dumps(rc_v1_payload, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Research context v1 saved to: {rc_v1_path}")
                     if raw_outputs_v1:
-                        await _sa(paper_dir, "analysis/research_context/research_context_v1_raw.txt",
-                                  "\n\n---\n\n".join(raw_outputs_v1),
-                                  emitter, "research_context", "Research Context v1 Raw")
+                        raw_path = research_dir / "research_context_v1_raw.txt"
+                        raw_path.write_text(
+                            "\n\n---\n\n".join(raw_outputs_v1),
+                            encoding="utf-8",
+                        )
+                        print(f"[MetaDataAgent] Research context v1 raw LLM outputs saved to: {raw_path}")
 
                 if research_context_v2:
+                    rc_v2_path = research_dir / "research_context_v2.json"
                     rc_v2_payload = dict(research_context_v2)
                     raw_outputs_v2 = rc_v2_payload.pop("_llm_raw_outputs", None)
                     core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
@@ -1982,23 +2062,40 @@ class MetaDataAgent(ReActAgent):
                     rc_v2_payload["core_ref_ids"] = core_ref_ids
                     rc_v2_payload["core_refs_with_abstract_count"] = core_refs_with_abstract_count
                     rc_v2_payload["generated_at"] = datetime.now().isoformat()
-                    await _sa(paper_dir, "analysis/research_context/research_context_v2.json",
-                              json.dumps(rc_v2_payload, indent=2, ensure_ascii=False),
-                              emitter, "research_context", "Research Context v2")
+                    rc_v2_path.write_text(
+                        json.dumps(rc_v2_payload, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Research context v2 saved to: {rc_v2_path}")
                     if raw_outputs_v2:
-                        await _sa(paper_dir, "analysis/research_context/research_context_v2_raw.txt",
-                                  "\n\n---\n\n".join(raw_outputs_v2),
-                                  emitter, "research_context", "Research Context v2 Raw")
+                        raw_path = research_dir / "research_context_v2_raw.txt"
+                        raw_path.write_text(
+                            "\n\n---\n\n".join(raw_outputs_v2),
+                            encoding="utf-8",
+                        )
+                        print(f"[MetaDataAgent] Research context v2 raw LLM outputs saved to: {raw_path}")
 
                 if research_context:
                     cem = research_context.get("claim_evidence_matrix", [])
                     cr = research_context.get("contribution_ranking", {"P0": [], "P1": [], "P2": []})
-                    await _sa(paper_dir, "analysis/research_context/claim_evidence_matrix.json",
-                              json.dumps({"claim_evidence_matrix": cem, "generated_at": datetime.now().isoformat()}, indent=2, ensure_ascii=False),
-                              emitter, "research_context", "Claim Evidence Matrix")
-                    await _sa(paper_dir, "analysis/research_context/contribution_ranking.json",
-                              json.dumps({"contribution_ranking": cr, "generated_at": datetime.now().isoformat()}, indent=2, ensure_ascii=False),
-                              emitter, "research_context", "Contribution Ranking")
+                    cem_path = research_dir / "claim_evidence_matrix.json"
+                    cem_path.write_text(
+                        json.dumps(
+                            {"claim_evidence_matrix": cem, "generated_at": datetime.now().isoformat()},
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    cr_path = research_dir / "contribution_ranking.json"
+                    cr_path.write_text(
+                        json.dumps(
+                            {"contribution_ranking": cr, "generated_at": datetime.now().isoformat()},
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
                     rc_cfg_for_export = (
                         self.tools_config.research_context
                         if self.tools_config and self.tools_config.research_context
@@ -2009,12 +2106,22 @@ class MetaDataAgent(ReActAgent):
                         and rc_cfg_for_export.export_planning_decision_trace
                         and research_context.get("planning_decision_trace")
                     ):
-                        await _sa(paper_dir, "analysis/research_context/planning_decision_trace.json",
-                                  json.dumps({"planning_decision_trace": research_context.get("planning_decision_trace", []),
-                                              "generated_at": datetime.now().isoformat()}, indent=2, ensure_ascii=False),
-                                  emitter, "research_context", "Planning Decision Trace")
+                        pdt_path = research_dir / "planning_decision_trace.json"
+                        pdt_path.write_text(
+                            json.dumps(
+                                {
+                                    "planning_decision_trace": research_context.get(
+                                        "planning_decision_trace", []
+                                    ),
+                                    "generated_at": datetime.now().isoformat(),
+                                },
+                                indent=2,
+                                ensure_ascii=False,
+                            ),
+                            encoding="utf-8",
+                        )
+                        print(f"[MetaDataAgent] Planning decision trace saved to: {pdt_path}")
 
-                # Citation artifacts
                 ps_cfg_for_export = (
                     self.tools_config.paper_search
                     if self.tools_config and self.tools_config.paper_search
@@ -2024,6 +2131,7 @@ class MetaDataAgent(ReActAgent):
                     ps_cfg_for_export and ps_cfg_for_export.citation_budget_export
                 )
                 if budget_export_enabled and paper_plan:
+                    # Keep usage rows in plan section order for stable auditing.
                     usage_by_section = {
                         row.get("section_type"): row
                         for row in citation_budget_usage
@@ -2039,74 +2147,130 @@ class MetaDataAgent(ReActAgent):
                     for sp in paper_plan.sections:
                         if not sp.citation_budget:
                             continue
-                        budget_plan_rows.append({
-                            "section_type": sp.section_type,
-                            "citation_budget": sp.citation_budget,
-                            "budget_selected_refs": sp.budget_selected_refs,
-                            "budget_reserve_refs": sp.budget_reserve_refs,
-                            "budget_must_use_refs": sp.budget_must_use_refs,
-                            "assigned_refs": sp.assigned_refs,
-                        })
+                        budget_plan_rows.append(
+                            {
+                                "section_type": sp.section_type,
+                                "citation_budget": sp.citation_budget,
+                                "budget_selected_refs": sp.budget_selected_refs,
+                                "budget_reserve_refs": sp.budget_reserve_refs,
+                                "budget_must_use_refs": sp.budget_must_use_refs,
+                                "assigned_refs": sp.assigned_refs,
+                            }
+                        )
+                    budget_plan_path = citation_dir / "citation_budget_plan.json"
                     plan_export = {
                         "citation_strategy": paper_plan.citation_strategy if paper_plan else {},
                         "sections": budget_plan_rows,
                         "generated_at": datetime.now().isoformat(),
                     }
-                    await _sa(paper_dir, "analysis/citations/citation_budget_plan.json",
-                              json.dumps(plan_export, indent=2, ensure_ascii=False),
-                              emitter, "citations", "Citation Budget Plan")
-                    await _sa(paper_dir, "analysis/citations/citation_budget_usage.json",
-                              json.dumps({"sections": ordered_usage, "generated_at": datetime.now().isoformat()}, indent=2, ensure_ascii=False),
-                              emitter, "citations", "Citation Budget Usage")
+                    budget_plan_path.write_text(
+                        json.dumps(plan_export, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Citation budget plan saved to: {budget_plan_path}")
+
+                    budget_usage_path = citation_dir / "citation_budget_usage.json"
+                    budget_usage_path.write_text(
+                        json.dumps(
+                            {
+                                "sections": ordered_usage,
+                                "generated_at": datetime.now().isoformat(),
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Citation budget usage saved to: {budget_usage_path}")
 
                     alignment_stats = self._build_citation_plan_alignment_stats(
-                        paper_plan=paper_plan, usage_rows=ordered_usage,
+                        paper_plan=paper_plan,
+                        usage_rows=ordered_usage,
                     )
                     alignment_stats["generated_at"] = datetime.now().isoformat()
-                    await _sa(paper_dir, "analysis/citations/citation_plan_alignment.json",
-                              json.dumps(alignment_stats, indent=2, ensure_ascii=False),
-                              emitter, "citations", "Citation Plan Alignment")
-
-                    citation_repair_stats = self._build_citation_repair_stats(memory=memory)
+                    alignment_path = citation_dir / "citation_plan_alignment.json"
+                    alignment_path.write_text(
+                        json.dumps(alignment_stats, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Citation plan alignment saved to: {alignment_path}")
+                    citation_repair_stats = self._build_citation_repair_stats(
+                        memory=memory,
+                    )
                     citation_repair_stats["generated_at"] = datetime.now().isoformat()
-                    await _sa(paper_dir, "analysis/citations/citation_repair_stats.json",
-                              json.dumps(citation_repair_stats, indent=2, ensure_ascii=False),
-                              emitter, "citations", "Citation Repair Stats")
+                    citation_repair_path = citation_dir / "citation_repair_stats.json"
+                    citation_repair_path.write_text(
+                        json.dumps(citation_repair_stats, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(
+                        "[MetaDataAgent] Citation repair stats saved to: "
+                        f"{citation_repair_path}"
+                    )
 
-                # Structure artifacts
                 if paper_plan:
                     structure_alignment = self._build_structure_alignment_stats(
-                        paper_plan=paper_plan, generated_sections=generated_sections,
+                        paper_plan=paper_plan,
+                        generated_sections=generated_sections,
                     )
                     structure_alignment["generated_at"] = datetime.now().isoformat()
-                    await _sa(paper_dir, "analysis/structure/structure_alignment.json",
-                              json.dumps(structure_alignment, indent=2, ensure_ascii=False),
-                              emitter, "structure", "Structure Alignment")
-
+                    structure_alignment_path = structure_dir / "structure_alignment.json"
+                    structure_alignment_path.write_text(
+                        json.dumps(structure_alignment, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(
+                        "[MetaDataAgent] Structure alignment saved to: "
+                        f"{structure_alignment_path}"
+                    )
                     paragraph_alignment = self._build_paragraph_feedback_alignment_report(
-                        memory=memory, generated_sections=generated_sections,
+                        memory=memory,
+                        generated_sections=generated_sections,
                     )
                     paragraph_alignment["generated_at"] = datetime.now().isoformat()
-                    await _sa(paper_dir, "analysis/structure/paragraph_feedback_alignment.json",
-                              json.dumps(paragraph_alignment, indent=2, ensure_ascii=False),
-                              emitter, "structure", "Paragraph Feedback Alignment")
-
+                    paragraph_alignment_path = (
+                        structure_dir / "paragraph_feedback_alignment.json"
+                    )
+                    paragraph_alignment_path.write_text(
+                        json.dumps(paragraph_alignment, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(
+                        "[MetaDataAgent] Paragraph feedback alignment saved to: "
+                        f"{paragraph_alignment_path}"
+                    )
                     subsection_coverage = self._build_explicit_subsection_coverage(
-                        paper_plan=paper_plan, generated_sections=generated_sections,
+                        paper_plan=paper_plan,
+                        generated_sections=generated_sections,
                     )
                     subsection_coverage["generated_at"] = datetime.now().isoformat()
-                    await _sa(paper_dir, "analysis/structure/explicit_subsection_coverage.json",
-                              json.dumps(subsection_coverage, indent=2, ensure_ascii=False),
-                              emitter, "structure", "Explicit Subsection Coverage")
+                    subsection_coverage_path = (
+                        structure_dir / "explicit_subsection_coverage.json"
+                    )
+                    subsection_coverage_path.write_text(
+                        json.dumps(subsection_coverage, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(
+                        "[MetaDataAgent] Explicit subsection coverage saved to: "
+                        f"{subsection_coverage_path}"
+                    )
 
-                # Review artifacts
-                reviewer_acceptance_stats = self._build_reviewer_acceptance_stats(memory=memory)
+                reviewer_acceptance_stats = self._build_reviewer_acceptance_stats(
+                    memory=memory,
+                )
                 reviewer_acceptance_stats["generated_at"] = datetime.now().isoformat()
-                await _sa(paper_dir, "analysis/review/reviewer_acceptance_stats.json",
-                          json.dumps(reviewer_acceptance_stats, indent=2, ensure_ascii=False),
-                          emitter, "reviews", "Reviewer Acceptance Stats")
+                reviewer_acceptance_path = review_dir / "reviewer_acceptance_stats.json"
+                reviewer_acceptance_path.write_text(
+                    json.dumps(reviewer_acceptance_stats, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                print(
+                    "[MetaDataAgent] Reviewer acceptance stats saved to: "
+                    f"{reviewer_acceptance_path}"
+                )
 
-                # References discovery analysis
+                # Save per-paper planner analysis for auditability
                 if discovered_references_by_section:
                     core_ref_id_set = {
                         r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")
@@ -2128,92 +2292,94 @@ class MetaDataAgent(ReActAgent):
                                 "relevance_reason": paper.get("relevance_reason", ""),
                                 "is_core_reference": ref_id in core_ref_id_set,
                             })
+
                     analysis_payload = {
                         "total_sections": len(discovered_references_by_section),
                         "total_papers": len(analysis_rows),
                         "papers": analysis_rows,
                         "generated_at": datetime.now().isoformat(),
                     }
-                    await _sa(paper_dir, "analysis/references/discovered_papers_analysis.json",
-                              json.dumps(analysis_payload, indent=2, ensure_ascii=False),
-                              emitter, "references", "Discovered Papers Analysis")
+                    analysis_path = references_dir / "discovered_papers_analysis.json"
+                    analysis_path.write_text(
+                        json.dumps(analysis_payload, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Discovered papers analysis saved to: {analysis_path}")
 
-                # Code context artifacts
+                # Save code repository summary markdown (if generated)
                 if code_context:
-                    await _sa(paper_dir, "analysis/code_context/code_evidence_graph.json",
-                              json.dumps({"code_evidence_graph": code_context.get("code_evidence_graph", []),
-                                          "generated_at": datetime.now().isoformat()}, indent=2, ensure_ascii=False),
-                              emitter, "code_analysis", "Code Evidence Graph")
-                    await _sa(paper_dir, "analysis/code_context/writing_assets.json",
-                              json.dumps({"writing_assets": code_context.get("writing_assets", {}),
-                                          "section_asset_packs": code_context.get("section_asset_packs", {}),
-                                          "claim_support_candidates": code_context.get("claim_support_candidates", []),
-                                          "generated_at": datetime.now().isoformat()}, indent=2, ensure_ascii=False),
-                              emitter, "code_analysis", "Writing Assets")
+                    graph_path = code_dir / "code_evidence_graph.json"
+                    graph_path.write_text(
+                        json.dumps(
+                            {
+                                "code_evidence_graph": code_context.get("code_evidence_graph", []),
+                                "generated_at": datetime.now().isoformat(),
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
+                    assets_path = code_dir / "writing_assets.json"
+                    assets_path.write_text(
+                        json.dumps(
+                            {
+                                "writing_assets": code_context.get("writing_assets", {}),
+                                "section_asset_packs": code_context.get("section_asset_packs", {}),
+                                "claim_support_candidates": code_context.get("claim_support_candidates", []),
+                                "generated_at": datetime.now().isoformat(),
+                            },
+                            indent=2,
+                            ensure_ascii=False,
+                        ),
+                        encoding="utf-8",
+                    )
                     if paper_plan:
                         focus_rows: List[Dict[str, Any]] = []
                         for sp in paper_plan.sections:
                             if not getattr(sp, "code_focus", None):
                                 continue
-                            focus_rows.append({
-                                "section_type": sp.section_type,
-                                "section_title": sp.section_title,
-                                "code_focus": sp.code_focus,
-                            })
-                        await _sa(paper_dir, "analysis/code_context/section_code_focus_plan.json",
-                                  json.dumps({"sections": focus_rows, "generated_at": datetime.now().isoformat()},
-                                             indent=2, ensure_ascii=False),
-                                  emitter, "code_analysis", "Section Code Focus Plan")
+                            focus_rows.append(
+                                {
+                                    "section_type": sp.section_type,
+                                    "section_title": sp.section_title,
+                                    "code_focus": sp.code_focus,
+                                }
+                            )
+                        focus_path = code_dir / "section_code_focus_plan.json"
+                        focus_path.write_text(
+                            json.dumps(
+                                {
+                                    "sections": focus_rows,
+                                    "generated_at": datetime.now().isoformat(),
+                                },
+                                indent=2,
+                                ensure_ascii=False,
+                            ),
+                            encoding="utf-8",
+                        )
+                    print(f"[MetaDataAgent] Code analysis artifacts saved to: {code_dir}")
 
                 if code_summary_markdown:
-                    await _sa(paper_dir, "analysis/code_context/code_repository_summary.md",
-                              code_summary_markdown, emitter, "code_analysis", "Code Repository Summary")
+                    crs_path = code_dir / "code_repository_summary.md"
+                    crs_path.write_text(code_summary_markdown, encoding="utf-8")
+                    print(f"[MetaDataAgent] Code repository summary saved to: {crs_path}")
 
-                # Prompt traces
+                # Save prompt/evidence traces (optional)
                 if metadata.export_prompt_traces and prompt_traces:
-                    await _sa(paper_dir, "logs/traces/prompt_traces.json",
-                              json.dumps(prompt_traces, indent=2, ensure_ascii=False),
-                              emitter, "logs", "Prompt Traces")
+                    traces_path = traces_dir / "prompt_traces.json"
+                    traces_path.write_text(
+                        json.dumps(prompt_traces, indent=2, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    print(f"[MetaDataAgent] Prompt traces saved to: {traces_path}")
 
-                # Session memory (review history + agent logs)
+                # Persist session memory (review history + agent logs)
                 memory.log("metadata", "final", "paper_assembled",
                            narrative=f"Paper assembled successfully with {total_words} total words.",
                            total_words=total_words, status="assembled")
                 memory.persist_all(paper_dir)
-
-                # Emit artifact events for session memory files
-                for mem_file, cat, lbl in [
-                    ("logs/review/review_history.json", "reviews", "Review History"),
-                    ("logs/review/review_history_readable.json", "reviews", "Review History (Readable)"),
-                    ("logs/agent/agent_logs.json", "logs", "Agent Logs"),
-                ]:
-                    mem_path = paper_dir / mem_file
-                    if mem_path.exists():
-                        mem_storage_key = ""
-                        if artifacts_prefix:
-                            candidate_mem_key = f"{artifacts_prefix}/{mem_file}"
-                            from ...utils.storage_client import storage_client
-                            if await storage_client.upload(candidate_mem_key, mem_path.read_bytes()):
-                                mem_storage_key = candidate_mem_key
-                        await emitter.artifact_saved(
-                            relative_path=mem_file,
-                            absolute_path=str(mem_path),
-                            category=cat,
-                            size=mem_path.stat().st_size,
-                            mime_type="application/json",
-                            label=lbl,
-                            storage_key=mem_storage_key,
-                        )
-
-                if pdf_path:
-                    await _sa(paper_dir, "output.pdf",
-                              Path(pdf_path).read_bytes(), emitter, "output", "Paper PDF")
-                    compile_dir = Path(pdf_path).parent
-                    if compile_dir.is_dir() and compile_dir != paper_dir:
-                        await self._save_compilation_output(
-                            compile_dir, paper_dir, emitter, artifacts_prefix,
-                        )
-
+                
                 print(f"[MetaDataAgent] Output saved to: {output_path}")
             
             # Determine overall status
@@ -2223,17 +2389,8 @@ class MetaDataAgent(ReActAgent):
                 status = "partial"
             else:
                 status = "error"
-
-            await emitter.completed(
-                status=status,
-                total_words=total_words,
-                review_iterations=review_iterations,
-                sections_count=len([s for s in sections_results if s.status == "ok"]),
-                pdf_path=pdf_path,
-                paper_dir=str(paper_dir) if paper_dir else None,
-            )
             
-            return PaperGenerationResult(
+            result = PaperGenerationResult(
                 status=status,
                 paper_title=metadata.title,
                 sections=sections_results,
@@ -2245,7 +2402,16 @@ class MetaDataAgent(ReActAgent):
                 review_iterations=review_iterations,
                 errors=errors,
             )
-            
+            await emitter.completed(
+                status=status,
+                total_words=total_words,
+                review_iterations=review_iterations,
+                sections_count=len([s for s in sections_results if s.status == "ok"]),
+                pdf_path=pdf_path,
+                paper_dir=str(paper_dir) if paper_dir else None,
+            )
+            return result
+
         except Exception as e:
             print(f"[MetaDataAgent] Error: {e}")
             await emitter.error(message=str(e), phase="generate_paper")
@@ -2255,413 +2421,9 @@ class MetaDataAgent(ReActAgent):
                 sections=sections_results,
                 errors=[str(e)],
             )
-
-    async def resume_from_checkpoint(
-        self,
-        checkpoint_path: str,
-        user_feedback: Dict[str, Any],
-        progress_callback: Optional[ProgressCallback] = None,
-        artifacts_prefix: str = "",
-    ) -> PaperGenerationResult:
-        """
-        Resume generation from a checkpoint after user feedback.
-        - **Description**:
-            - Loads a ReviewCheckpoint from disk, injects user feedback as
-              additional RevisionTasks, then continues the review-revision loop.
-
-        - **Args**:
-            - `checkpoint_path` (str): Path to the checkpoint JSON file.
-            - `user_feedback` (dict): User feedback payload with action, global_feedback,
-              and optional section_annotations.
-            - `progress_callback` (ProgressCallback): Callback for streaming events.
-
-        - **Returns**:
-            - `PaperGenerationResult`: Final result after completing revisions.
-        """
-        from .models import ReviewCheckpoint
-        from ..reviewer_agent.models import (
-            ReviewResult as ReviewerReviewResult,
-            RevisionTask,
-            SectionFeedback,
-        )
-        from ..shared.session_memory import SessionMemory
-
-        ckpt_data = Path(checkpoint_path).read_text(encoding="utf-8")
-        ckpt = ReviewCheckpoint.model_validate_json(ckpt_data)
-
-        emitter = ProgressEmitter(progress_callback)
-
-        metadata = PaperMetaData.model_validate(ckpt.metadata)
-        generated_sections = dict(ckpt.generated_sections)
-        sections_results = list(ckpt.sections_results)
-        review_result = ReviewerReviewResult.model_validate(ckpt.review_result)
-        memory = SessionMemory.from_dict(ckpt.memory) if ckpt.memory else SessionMemory()
-        ref_pool = ReferencePool.from_dict(ckpt.ref_pool) if ckpt.ref_pool else ReferencePool([])
-
-        fb_action = user_feedback.get("action", "continue")
-        if fb_action == "stop":
-            print("[ResumeCheckpoint] User requested stop")
-            await emitter.review_feedback_received(
-                feedback_text=user_feedback.get("global_feedback", ""),
-                action=fb_action,
-            )
-            return PaperGenerationResult(
-                status="ok",
-                paper_title=metadata.title,
-                sections=sections_results,
-                total_word_count=sum(r.word_count for r in sections_results if r.word_count),
-                review_iterations=ckpt.review_iterations,
-                output_path=ckpt.paper_dir,
-            )
-        elif fb_action == "accept":
-            review_result.passed = True
-            print("[ResumeCheckpoint] User accepted current state — skipping review loop")
-        else:
-            global_fb = user_feedback.get("global_feedback", "")
-            section_annotations = user_feedback.get("section_annotations", [])
-
-            # Build a lookup for existing section feedbacks so we can merge
-            sf_by_section = {sf.section_type: sf for sf in review_result.section_feedbacks}
-
-            for ann in section_annotations:
-                sec_type = ann.get("section_type", "")
-                if not sec_type:
-                    continue
-                sec_fb = ann.get("feedback", "")
-                para_annotations = ann.get("paragraph_annotations", [])
-                combined_fb_parts = []
-                if sec_fb:
-                    combined_fb_parts.append(f"Section-level: {sec_fb}")
-                for pa in para_annotations:
-                    p_idx = pa.get("paragraph_index", 0)
-                    p_fb = pa.get("feedback", "")
-                    if p_fb:
-                        combined_fb_parts.append(f"Paragraph {p_idx}: {p_fb}")
-                if not combined_fb_parts:
-                    continue
-
-                user_instruction = "USER FEEDBACK (high priority):\n" + "\n".join(
-                    [f"- {part}" for part in combined_fb_parts]
-                )
-
-                # Merge into section_feedbacks so _apply_revisions picks it up
-                if sec_type in sf_by_section:
-                    sf = sf_by_section[sec_type]
-                    sf.revision_prompt = (
-                        user_instruction + "\n\n" + (sf.revision_prompt or "")
-                    ).strip()
-                    if sf.action == "ok":
-                        sf.action = "refine_paragraphs"
-                else:
-                    new_sf = SectionFeedback(
-                        section_type=sec_type,
-                        current_word_count=0,
-                        target_word_count=0,
-                        action="refine_paragraphs",
-                        delta_words=0,
-                        revision_prompt=user_instruction,
-                    )
-                    review_result.section_feedbacks.append(new_sf)
-                    sf_by_section[sec_type] = new_sf
-
-                # Also add as revision task for completeness
-                review_result.revision_tasks.append(
-                    RevisionTask(
-                        section_type=sec_type,
-                        target_id=sec_type,
-                        instruction=f"User feedback: {'; '.join(combined_fb_parts)}",
-                    )
-                )
-
-            if global_fb:
-                global_instruction = f"USER GLOBAL FEEDBACK (high priority): {global_fb}"
-                targets = list(review_result.requires_revision.keys())[:3] or list(sf_by_section.keys())[:3]
-                for sec_type in targets:
-                    if sec_type in sf_by_section:
-                        sf = sf_by_section[sec_type]
-                        sf.revision_prompt = (
-                            global_instruction + "\n\n" + (sf.revision_prompt or "")
-                        ).strip()
-                        if sf.action == "ok":
-                            sf.action = "refine_paragraphs"
-                    else:
-                        new_sf = SectionFeedback(
-                            section_type=sec_type,
-                            current_word_count=0,
-                            target_word_count=0,
-                            action="refine_paragraphs",
-                            delta_words=0,
-                            revision_prompt=global_instruction,
-                        )
-                        review_result.section_feedbacks.append(new_sf)
-                        sf_by_section[sec_type] = new_sf
-                    review_result.revision_tasks.append(
-                        RevisionTask(
-                            section_type=sec_type,
-                            target_id=sec_type,
-                            instruction=f"User global feedback: {global_fb}",
-                        )
-                    )
-
-        await emitter.review_feedback_received(
-            feedback_text=user_feedback.get("global_feedback", ""),
-            action=fb_action,
-        )
-
-        paper_plan = None
-        if ckpt.paper_plan:
-            try:
-                paper_plan = PaperPlan.model_validate(ckpt.paper_plan)
-            except Exception:
-                paper_plan = None
-
-        paper_dir = Path(ckpt.paper_dir) if ckpt.paper_dir else None
-
-        if fb_action == "accept":
-            # Skip review loop entirely — go straight to finalization
-            try:
-                pdf_path = ckpt.pdf_path
-                review_iterations = ckpt.review_iterations
-                target_word_count = ckpt.target_word_count
-                final_dir = None
-
-                if ckpt.compile_pdf and ckpt.template_path and paper_dir:
-                    await emitter.phase_start(Phase.PDF_COMPILE, "Final PDF compilation")
-                    await emitter.compile_start(iteration=review_iterations)
-                    final_dir = paper_dir / f"iteration_{review_iterations:02d}_accepted"
-                    final_dir.mkdir(parents=True, exist_ok=True)
-                    figure_base_path = os.getcwd()
-                    figure_paths = self._collect_figure_paths(metadata.figures, base_path=figure_base_path)
-                    final_pdf, _, final_errors, _ = await self._compile_pdf(
-                        generated_sections=generated_sections,
-                        template_path=ckpt.template_path,
-                        references=ref_pool.get_all_refs(),
-                        output_dir=final_dir,
-                        paper_title=metadata.title,
-                        figures_source_dir=ckpt.figures_source_dir,
-                        figure_paths=figure_paths,
-                        converted_tables=ckpt.converted_tables,
-                        paper_plan=paper_plan,
-                        figures=metadata.figures,
-                        metadata_tables=metadata.tables,
-                    )
-                    if final_pdf:
-                        pdf_path = str(final_pdf)
-                        await emitter.compile_complete(success=True, pdf_path=pdf_path)
-                    else:
-                        await emitter.compile_complete(success=False, pdf_path=None)
-
-                latex_content = self._assemble_paper(
-                    title=metadata.title,
-                    sections=generated_sections,
-                    references=ref_pool.get_all_refs(),
-                    valid_citation_keys=ref_pool.valid_citation_keys,
-                )
-                total_words = sum(r.word_count for r in sections_results if r.word_count)
-
-                _sa_accept = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
-
-                if paper_dir:
-                    tex_path = paper_dir / "main.tex"
-                    tex_path.write_text(latex_content, encoding="utf-8")
-                    await _sa_accept(paper_dir, "main.tex", latex_content, emitter, "root", "Main LaTeX")
-                    await _sa_accept(paper_dir, "references.bib",
-                                     ref_pool.to_bibtex(), emitter, "references", "References BibTeX")
-                    if pdf_path:
-                        await _sa_accept(paper_dir, "output.pdf",
-                                         Path(pdf_path).read_bytes(), emitter, "output", "Paper PDF")
-                    for sec_type, sec_content in generated_sections.items():
-                        sec_label = sec_type.replace(" ", "_")
-                        await _sa_accept(paper_dir, f"sections/{sec_label}.tex",
-                                         sec_content, emitter, "section", f"{sec_label}.tex")
-
-                if final_dir and final_dir.is_dir():
-                    await self._save_compilation_output(
-                        final_dir, paper_dir, emitter, artifacts_prefix,
-                    )
-
-                await emitter.completed(
-                    status="ok",
-                    total_words=total_words,
-                    sections_count=len(sections_results),
-                    pdf_path=pdf_path,
-                    review_iterations=review_iterations,
-                )
-
-                return PaperGenerationResult(
-                    status="ok",
-                    paper_title=metadata.title,
-                    sections=sections_results,
-                    latex_content=latex_content,
-                    output_path=str(paper_dir) if paper_dir else None,
-                    pdf_path=pdf_path,
-                    total_word_count=total_words,
-                    target_word_count=target_word_count,
-                    review_iterations=review_iterations,
-                )
-            except Exception as e:
-                print(f"[ResumeCheckpoint] Accept finalization error: {e}")
-                await emitter.error(message=str(e), phase="accept_finalization")
-                return PaperGenerationResult(
-                    status="error",
-                    paper_title=metadata.title,
-                    sections=sections_results,
-                    errors=[str(e)],
-                )
-
-        # fb_action == "continue": apply user-feedback revisions then re-enter review loop
-        if review_result.revision_tasks:
-            print(
-                f"[ResumeCheckpoint] Applying {len(review_result.revision_tasks)} "
-                f"revision task(s) from user feedback before re-review"
-            )
-            valid_keys = self._extract_valid_citation_keys(ref_pool.get_all_refs())
-            revised = await self._apply_revisions(
-                review_result=review_result,
-                generated_sections=generated_sections,
-                sections_results=sections_results,
-                valid_citation_keys=valid_keys,
-                metadata=metadata,
-                memory=memory,
-            )
-            if revised:
-                print(f"[ResumeCheckpoint] Revised sections: {sorted(revised)}")
-                for rev_sec in revised:
-                    await emitter.revision_applied(
-                        section_type=rev_sec,
-                        iteration=ckpt.review_iterations,
-                    )
-                    if paper_dir and rev_sec in generated_sections:
-                        _plan_titles = paper_plan.get_section_titles() if paper_plan else {}
-                        sec_label = _plan_titles.get(rev_sec, rev_sec.replace("_", " ").title())
-                        _sa_resume = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
-                        await _sa_resume(paper_dir, f"sections/{sec_label}.tex",
-                                         generated_sections[rev_sec], emitter, "section", f"{sec_label}.tex")
-            else:
-                print("[ResumeCheckpoint] No sections were revised")
-
-        remaining_iterations = max(1, ckpt.max_review_iterations - ckpt.review_iterations)
-        print(
-            f"[ResumeCheckpoint] Resuming review loop: "
-            f"{ckpt.review_iterations} done, {remaining_iterations} remaining"
-        )
-        try:
-            (
-                generated_sections,
-                sections_results,
-                review_iterations,
-                target_word_count,
-                pdf_path,
-                orchestration_errors,
-            ) = await self._run_review_orchestration(
-                generated_sections=generated_sections,
-                sections_results=sections_results,
-                metadata=metadata,
-                parsed_refs=ref_pool.get_all_refs(),
-                paper_plan=paper_plan,
-                template_path=ckpt.template_path,
-                figures_source_dir=ckpt.figures_source_dir,
-                converted_tables=ckpt.converted_tables,
-                max_review_iterations=remaining_iterations,
-                enable_review=ckpt.enable_review,
-                compile_pdf=ckpt.compile_pdf,
-                enable_vlm_review=ckpt.enable_vlm_review,
-                target_pages=ckpt.target_pages,
-                paper_dir=paper_dir,
-                memory=memory,
-                emitter=emitter,
-                progress_callback=progress_callback,
-                enable_user_feedback=True,
-                ref_pool=ref_pool,
-                artifacts_prefix=artifacts_prefix,
-            )
-            review_iterations += ckpt.review_iterations
-
-            errors: List[str] = []
-            if orchestration_errors:
-                is_paused = any(
-                    e.startswith("__paused_for_feedback__:") for e in orchestration_errors
-                )
-                if is_paused:
-                    ckpt_new = next(
-                        (e.split(":", 1)[1] for e in orchestration_errors
-                         if e.startswith("__paused_for_feedback__:")),
-                        "",
-                    )
-                    return PaperGenerationResult(
-                        status="paused_for_feedback",
-                        paper_title=metadata.title,
-                        sections=sections_results,
-                        total_word_count=sum(r.word_count for r in sections_results if r.word_count),
-                        target_word_count=target_word_count,
-                        review_iterations=review_iterations,
-                        output_path=str(paper_dir) if paper_dir else None,
-                        errors=[f"checkpoint:{ckpt_new}"],
-                    )
-                errors.extend(orchestration_errors)
-
-            latex_content = self._assemble_paper(
-                title=metadata.title,
-                sections=generated_sections,
-                references=ref_pool.get_all_refs(),
-                valid_citation_keys=ref_pool.valid_citation_keys,
-            )
-            total_words = sum(r.word_count for r in sections_results if r.word_count)
-
-            _sa_cont = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
-
-            if paper_dir:
-                tex_path = paper_dir / "main.tex"
-                tex_path.write_text(latex_content, encoding="utf-8")
-                await _sa_cont(paper_dir, "main.tex", latex_content, emitter, "root", "Main LaTeX")
-                await _sa_cont(paper_dir, "references.bib",
-                               ref_pool.to_bibtex(), emitter, "references", "References BibTeX")
-                if pdf_path:
-                    await _sa_cont(paper_dir, "output.pdf",
-                                   Path(pdf_path).read_bytes(), emitter, "output", "Paper PDF")
-                for sec_type, sec_content in generated_sections.items():
-                    sec_label = sec_type.replace(" ", "_")
-                    await _sa_cont(paper_dir, f"sections/{sec_label}.tex",
-                                   sec_content, emitter, "section", f"{sec_label}.tex")
-
-                if pdf_path:
-                    compile_dir = Path(pdf_path).parent
-                    if compile_dir.is_dir() and compile_dir != paper_dir:
-                        await self._save_compilation_output(
-                            compile_dir, paper_dir, emitter, artifacts_prefix,
-                        )
-
-            status = "ok" if not errors else "partial"
-            await emitter.completed(
-                status=status,
-                total_words=total_words,
-                sections_count=len(sections_results),
-                pdf_path=pdf_path,
-                review_iterations=review_iterations,
-            )
-
-            return PaperGenerationResult(
-                status=status,
-                paper_title=metadata.title,
-                sections=sections_results,
-                latex_content=latex_content,
-                output_path=str(paper_dir) if paper_dir else None,
-                pdf_path=pdf_path,
-                total_word_count=total_words,
-                target_word_count=target_word_count,
-                review_iterations=review_iterations,
-                errors=errors,
-            )
-        except Exception as e:
-            print(f"[ResumeCheckpoint] Error: {e}")
-            await emitter.error(message=str(e), phase="resume_from_checkpoint")
-            return PaperGenerationResult(
-                status="error",
-                paper_title=metadata.title,
-                sections=sections_results,
-                errors=[str(e)],
-            )
-
+        finally:
+            clear_llm_progress_context()
+    
     async def generate_single_section(
         self,
         request: SectionGenerationRequest,
@@ -2709,6 +2471,7 @@ class MetaDataAgent(ReActAgent):
         research_context: Optional[Dict[str, Any]] = None,
         prompt_traces: Optional[List[Dict[str, Any]]] = None,
         memory: Optional[SessionMemory] = None,
+        evidence_dag: Optional[EvidenceDAG] = None,
     ) -> SectionResult:
         """
         Generate Introduction section — delegates to WriterAgent.
@@ -2750,6 +2513,7 @@ class MetaDataAgent(ReActAgent):
             intro_research_context = self._format_research_context_for_prompt(
                 research_context=research_context,
                 section_type="introduction",
+                evidence_dag=evidence_dag,
             )
             prompt = compile_introduction_prompt(
                 paper_title=metadata.title,
@@ -2846,6 +2610,7 @@ class MetaDataAgent(ReActAgent):
         research_context: Optional[Dict[str, Any]] = None,
         prompt_traces: Optional[List[Dict[str, Any]]] = None,
         memory: Optional[SessionMemory] = None,
+        evidence_dag: Optional[EvidenceDAG] = None,
     ) -> SectionResult:
         """
         Generate a body section using two-phase pattern.
@@ -2917,6 +2682,7 @@ class MetaDataAgent(ReActAgent):
             section_research_context = self._format_research_context_for_prompt(
                 research_context=research_context,
                 section_type=section_type,
+                evidence_dag=evidence_dag,
             )
 
             # Build prompt AFTER search so it includes any new refs
@@ -2963,16 +2729,36 @@ class MetaDataAgent(ReActAgent):
                 else []
             )
             writer_valid_keys = list(dict.fromkeys(list(section_keys) + list(reserve_keys)))
-            result = await self._writer.run(
-                system_prompt=GENERATION_SYSTEM_PROMPT,
-                user_prompt=prompt,
-                section_type=section_type,
-                valid_citation_keys=writer_valid_keys,
-                key_points=key_points or None,
-                memory=memory,
-                peers={"planner": self._planner, "reviewer": self._reviewer},
+
+            # ---------------------------------------------------------------
+            # Decomposed generation: paragraph-by-paragraph when DAG bindings
+            # are available.  Falls back to section-level generation otherwise.
+            # ---------------------------------------------------------------
+            has_claim_bindings = (
+                evidence_dag is not None
+                and section_plan is not None
+                and any(p.claim_id for p in section_plan.paragraphs)
             )
-            content = result.get("generated_content", "")
+            if has_claim_bindings:
+                content = await self._generate_section_decomposed(
+                    section_type=section_type,
+                    section_plan=section_plan,
+                    evidence_dag=evidence_dag,
+                    writer_valid_keys=writer_valid_keys,
+                    section_title_str=section_title_str,
+                    memory=memory,
+                )
+            else:
+                result = await self._writer.run(
+                    system_prompt=GENERATION_SYSTEM_PROMPT,
+                    user_prompt=prompt,
+                    section_type=section_type,
+                    valid_citation_keys=writer_valid_keys,
+                    key_points=key_points or None,
+                    memory=memory,
+                    peers={"planner": self._planner, "reviewer": self._reviewer},
+                )
+                content = result.get("generated_content", "")
             word_count = len(content.split())
 
             # Use plan's title if available
@@ -3002,6 +2788,170 @@ class MetaDataAgent(ReActAgent):
                 error=str(e),
             )
     
+    # =========================================================================
+    # Decomposed (claim-level) generation helper
+    # =========================================================================
+
+    async def _generate_section_decomposed(
+        self,
+        section_type: str,
+        section_plan: SectionPlan,
+        evidence_dag: EvidenceDAG,
+        writer_valid_keys: List[str],
+        section_title_str: str = "",
+        memory: Optional[SessionMemory] = None,
+    ) -> str:
+        """
+        Generate a section paragraph-by-paragraph with verify-retry-degrade.
+        - **Description**:
+            - Iterates over ``section_plan.paragraphs``.
+            - For each paragraph with a ``claim_id``, compiles a focused prompt
+              and calls ``writer.generate_paragraph()``.
+            - Immediately verifies the output using ``ClaimVerifier``.
+            - On failure, retries up to ``MAX_CLAIM_RETRIES`` with feedback.
+            - After exhausting retries, degrades to template-slot filling
+              if ``TEMPLATE_FALLBACK_ENABLED`` and a template is available.
+            - Accumulates ``section_context`` for coherence.
+
+        - **Args**:
+            - ``section_type`` (str): Section identifier.
+            - ``section_plan`` (SectionPlan): Plan with paragraph-level structure.
+            - ``evidence_dag`` (EvidenceDAG): The evidence graph.
+            - ``writer_valid_keys`` (List[str]): Superset of allowed citation keys.
+            - ``section_title_str`` (str): Display title for prompt context.
+            - ``memory`` (SessionMemory, optional): Shared memory.
+
+        - **Returns**:
+            - ``str``: Assembled LaTeX content for the entire section.
+        """
+        from ...generation.claim_verifier import (
+            ClaimVerifier,
+            MAX_CLAIM_RETRIES,
+            TEMPLATE_FALLBACK_ENABLED,
+        )
+        from ...generation.template_slots import ParagraphTemplate
+
+        verifier = ClaimVerifier()
+        paragraph_outputs: List[str] = []
+        section_context = ""
+        total_paras = len(section_plan.paragraphs)
+        verify_stats = {"passed": 0, "retried": 0, "degraded": 0, "skipped": 0}
+
+        for pidx, para in enumerate(section_plan.paragraphs):
+            if not para.claim_id:
+                paragraph_outputs.append("")
+                verify_stats["skipped"] += 1
+                continue
+
+            # Gather evidence for this paragraph's claim
+            evidence_nodes = evidence_dag.get_evidence_for_claim(para.claim_id)
+            evidence_snippets: List[str] = []
+            evidence_snippet_map: Dict[str, str] = {}
+            para_valid_refs: List[str] = list(writer_valid_keys)
+            for enode in evidence_nodes:
+                snippet = enode.content or enode.source_path or enode.node_id
+                evidence_snippets.append(snippet)
+                evidence_snippet_map[enode.node_id] = snippet
+                if enode.source_path and enode.source_path not in para_valid_refs:
+                    para_valid_refs.append(enode.source_path)
+
+            for r in para.references_to_cite:
+                if r not in para_valid_refs:
+                    para_valid_refs.append(r)
+
+            valid_keys_set = set(para_valid_refs)
+            latex = ""
+            verification_feedback = ""
+
+            for attempt in range(MAX_CLAIM_RETRIES):
+                extra_constraints = verification_feedback if attempt > 0 else ""
+
+                para_prompt = compile_paragraph_prompt(
+                    paragraph_plan=para,
+                    section_type=section_type,
+                    section_context=section_context,
+                    evidence_snippets=evidence_snippets,
+                    valid_refs=para_valid_refs,
+                    constraints=extra_constraints or None,
+                    section_title=section_title_str,
+                    paragraph_index=pidx,
+                    total_paragraphs=total_paras,
+                )
+
+                para_result = await self._writer.generate_paragraph(
+                    paragraph_prompt=para_prompt,
+                    section_type=section_type,
+                    valid_citation_keys=para_valid_refs,
+                    memory=memory,
+                    peers={"planner": self._planner, "reviewer": self._reviewer},
+                    paragraph_index=pidx,
+                    claim_id=para.claim_id,
+                )
+
+                latex = para_result.get("latex_content", "")
+
+                vr = await verifier.verify(
+                    generated_text=latex,
+                    paragraph_plan=para,
+                    evidence_dag=evidence_dag,
+                    valid_citation_keys=valid_keys_set,
+                )
+
+                if vr.passed:
+                    verify_stats["passed"] += 1
+                    break
+
+                verification_feedback = vr.feedback_for_retry
+                verify_stats["retried"] += 1
+                print(
+                    f"[MetaDataAgent] Paragraph {pidx} attempt {attempt + 1} "
+                    f"failed verification: {len(vr.citation_issues)} citation issues, "
+                    f"{len(vr.missing_evidence_refs)} missing refs, "
+                    f"{len(vr.coverage_gaps)} coverage gaps"
+                )
+            else:
+                # Exhausted retries — try template-slot filling as fallback
+                if TEMPLATE_FALLBACK_ENABLED and para.paragraph_template:
+                    try:
+                        tmpl_data = para.paragraph_template
+                        if isinstance(tmpl_data, dict):
+                            tmpl = ParagraphTemplate(**tmpl_data)
+                        else:
+                            tmpl = tmpl_data
+
+                        tmpl_result = await self._writer.generate_from_template(
+                            template=tmpl,
+                            section_type=section_type,
+                            evidence_snippets=evidence_snippet_map,
+                            valid_citation_keys=para_valid_refs,
+                            memory=memory,
+                            peers={"planner": self._planner, "reviewer": self._reviewer},
+                            paragraph_index=pidx,
+                            claim_id=para.claim_id,
+                        )
+                        latex = tmpl_result.get("latex_content", latex)
+                        verify_stats["degraded"] += 1
+                        print(
+                            f"[MetaDataAgent] Paragraph {pidx} degraded to template-slot filling"
+                        )
+                    except Exception as tmpl_err:
+                        print(
+                            f"[MetaDataAgent] Template fallback failed for paragraph {pidx}: {tmpl_err}"
+                        )
+
+            paragraph_outputs.append(latex)
+            if latex:
+                section_context += "\n\n" + latex
+
+        content = "\n\n".join(p for p in paragraph_outputs if p)
+        print(
+            f"[MetaDataAgent] Decomposed generation for '{section_type}': "
+            f"{verify_stats['passed']} passed, {verify_stats['retried']} retried, "
+            f"{verify_stats['degraded']} degraded, {verify_stats['skipped']} skipped "
+            f"(total {total_paras} paragraphs)"
+        )
+        return content
+
     # =========================================================================
     # Phase 3: Synthesis Section Generation
     # =========================================================================
@@ -3165,82 +3115,16 @@ class MetaDataAgent(ReActAgent):
         memory: Optional[SessionMemory] = None,
         max_sections_to_revise: int = 2,
     ) -> Set[str]:
-        """
-        Reference coverage fix pass.
-        - **Description**:
-            - Finds uncited pooled references.
-            - Routes each missing key to one section that has it in assigned_refs.
-            - Applies targeted revision prompts to integrate those citations.
-        """
-        if not paper_plan:
-            return set()
-
-        all_content = "\n".join(generated_sections.values())
-        cited_keys = ReferencePool.extract_cite_keys(all_content)
-        uncited_keys = set(valid_ref_keys) - set(cited_keys)
-        if not uncited_keys:
-            return set()
-
-        # Map section -> missing keys it can cite.
-        missing_by_section: Dict[str, List[str]] = {}
-        for sp in paper_plan.sections:
-            st = sp.section_type
-            if st in ("abstract", "conclusion"):
-                continue
-            if st not in generated_sections:
-                continue
-            assigned = set(getattr(sp, "assigned_refs", []) or [])
-            missing = sorted(list(assigned & uncited_keys))
-            if missing:
-                missing_by_section[st] = missing
-
-        if not missing_by_section:
-            return set()
-
-        revised_sections: Set[str] = set()
-        # Prioritize sections that can absorb the most missing refs.
-        targets = sorted(
-            missing_by_section.items(),
-            key=lambda kv: len(kv[1]),
-            reverse=True,
-        )[:max_sections_to_revise]
-
-        for section_type, missing_keys in targets:
-            prompt = (
-                f"Reference coverage fix for section '{section_type}'.\n"
-                f"Integrate the following citation keys naturally into relevant claims: "
-                f"{', '.join(missing_keys[:6])}.\n"
-                "Rules:\n"
-                "- Preserve technical meaning and paragraph structure.\n"
-                "- Use ONLY these keys via \\cite{key}.\n"
-                "- Do not add citations in abstract or conclusion.\n"
-                "- Do not fabricate facts; attach citations to existing statements where appropriate."
-            )
-            revised = await self._revise_section(
-                section_type=section_type,
-                current_content=generated_sections[section_type],
-                revision_prompt=prompt,
-                metadata=metadata,
-                memory=memory,
-            )
-            if revised and revised.strip():
-                generated_sections[section_type] = revised
-                # Sync word_count in section results
-                for sr in sections_results:
-                    if sr.section_type == section_type and sr.status == "ok":
-                        sr.latex_content = revised
-                        sr.word_count = len(revised.split())
-                        break
-                revised_sections.add(section_type)
-
-        if revised_sections:
-            post_cited = ReferencePool.extract_cite_keys("\n".join(generated_sections.values()))
-            post_coverage = (len(set(valid_ref_keys) & set(post_cited)) / len(valid_ref_keys)) if valid_ref_keys else 1.0
-            print(
-                "[MetaDataAgent] Ref coverage pass revised="
-                f"{sorted(revised_sections)} coverage={post_coverage:.0%}"
-            )
-        return revised_sections
+        """Delegation stub — see orchestrator.py."""
+        return await self._orchestrator._enforce_reference_coverage(
+            generated_sections=generated_sections,
+            sections_results=sections_results,
+            paper_plan=paper_plan,
+            metadata=metadata,
+            valid_ref_keys=valid_ref_keys,
+            memory=memory,
+            max_sections_to_revise=max_sections_to_revise,
+        )
 
     def _validate_file_paths(self, metadata: PaperMetaData) -> List[str]:
         """
@@ -4001,173 +3885,25 @@ class MetaDataAgent(ReActAgent):
         key_points: List[str],
         ref_pool: ReferencePool,
     ) -> Dict[str, Any]:
-        """
-        Ask the LLM whether additional references are needed for a section.
-
-        - **Description**:
-            - Phase A of the two-phase generation pattern.
-            - Sends a lightweight prompt asking the LLM to analyse the gap
-              between the section's requirements and the existing references.
-            - The LLM returns a structured JSON response with need_search,
-              reason, and queries fields.
-            - Does NOT use Function Calling — the LLM directly outputs JSON.
-
-        - **Args**:
-            - `section_type` (str): E.g. "introduction", "method".
-            - `section_title` (str): Human-readable section title.
-            - `paper_title` (str): Title of the paper being generated.
-            - `key_points` (List[str]): Key points to cover in this section.
-            - `ref_pool` (ReferencePool): Current reference pool.
-
-        - **Returns**:
-            - `dict`: {"need_search": bool, "reason": str, "queries": [str]}
-              On any error, returns {"need_search": False, ...}.
-        """
-        # Build reference summaries for the prompt
-        ref_summaries_parts = []
-        for ref in ref_pool.get_all_refs():
-            ref_id = ref.get("ref_id", "unknown")
-            title = ref.get("title", "Untitled")
-            year = ref.get("year", "?")
-            ref_summaries_parts.append(f"  - [{ref_id}] {title} ({year})")
-        ref_summaries = "\n".join(ref_summaries_parts) if ref_summaries_parts else "  (none)"
-
-        key_points_str = "\n".join(f"  - {kp}" for kp in key_points) if key_points else "  (not specified)"
-
-        prompt = SEARCH_JUDGMENT_PROMPT.format(
+        """Delegation stub — see orchestrator.py."""
+        return await self._orchestrator._judge_search_need(
             section_type=section_type,
             section_title=section_title,
             paper_title=paper_title,
-            key_points=key_points_str,
-            n_refs=len(ref_pool.get_all_refs()),
-            ref_summaries=ref_summaries,
+            key_points=key_points,
+            ref_pool=ref_pool,
         )
-
-        print(f"[SearchJudge] Judging search need for {section_type} ({section_title})...")
-
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {"role": "system", "content": "You are an academic research assistant. Respond with JSON only."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.3,
-                max_tokens=500,
-            )
-            raw = response.choices[0].message.content or ""
-            # Strip markdown code fences if present
-            raw = raw.strip()
-            if raw.startswith("```"):
-                # Remove opening fence (e.g. ```json)
-                raw = raw.split("\n", 1)[-1] if "\n" in raw else raw[3:]
-            if raw.endswith("```"):
-                raw = raw[:-3]
-            raw = raw.strip()
-
-            result = json.loads(raw)
-
-            need = result.get("need_search", False)
-            reason = result.get("reason", "")
-            queries = result.get("queries", [])
-
-            # Sanitize
-            if not isinstance(queries, list):
-                queries = []
-            queries = [q for q in queries if isinstance(q, str) and len(q.strip()) > 0]
-
-            print(f"[SearchJudge] need_search={need}, reason={reason}")
-            if queries:
-                print(f"[SearchJudge] Suggested queries: {queries}")
-
-            return {"need_search": bool(need), "reason": reason, "queries": queries}
-
-        except (json.JSONDecodeError, KeyError) as e:
-            print(f"[SearchJudge] Failed to parse LLM response: {e}")
-            print(f"[SearchJudge] Raw response: {raw[:300]}")
-            return {"need_search": False, "reason": f"parse error: {e}", "queries": []}
-        except Exception as e:
-            print(f"[SearchJudge] LLM call failed: {e}")
-            return {"need_search": False, "reason": f"error: {e}", "queries": []}
 
     async def _execute_pre_searches(
         self,
         queries: List[str],
         ref_pool: ReferencePool,
     ) -> int:
-        """
-        Execute paper searches and merge valid results into the reference pool.
-
-        - **Description**:
-            - Phase A continuation: after the LLM provides search queries,
-              this method directly calls PaperSearchTool.execute() for each
-              query (without going through the ReAct loop).
-            - Found papers are validated and added to the ref_pool.
-            - Returns the count of newly added references.
-
-        - **Args**:
-            - `queries` (List[str]): Search queries from the judgment step.
-            - `ref_pool` (ReferencePool): Persistent reference pool to update.
-
-        - **Returns**:
-            - `int`: Number of new references added to the pool.
-        """
-        from ..shared.tools.paper_search import PaperSearchTool
-
-        paper_search_cfg = self.tools_config.paper_search if self.tools_config else None
-        tool = PaperSearchTool(
-            serpapi_api_key=(
-                paper_search_cfg.serpapi_api_key if paper_search_cfg else None
-            ),
-            semantic_scholar_api_key=(
-                paper_search_cfg.semantic_scholar_api_key if paper_search_cfg else None
-            ),
-            timeout=paper_search_cfg.timeout if paper_search_cfg else 10,
-            semantic_scholar_min_results_before_fallback=(
-                paper_search_cfg.semantic_scholar_min_results_before_fallback
-                if paper_search_cfg else 3
-            ),
-            enable_query_cache=paper_search_cfg.enable_query_cache if paper_search_cfg else True,
-            cache_ttl_hours=paper_search_cfg.cache_ttl_hours if paper_search_cfg else 24,
+        """Delegation stub — see orchestrator.py."""
+        return await self._orchestrator._execute_pre_searches(
+            queries=queries,
+            ref_pool=ref_pool,
         )
-
-        added_count = 0
-        for i, query in enumerate(queries):
-            # Add delay between queries to avoid rate limiting
-            if i > 0:
-                print("[PreSearch] Waiting 1.5s between queries to avoid rate limits...")
-                await asyncio.sleep(1.5)
-
-            print(f"[PreSearch] Executing search ({i+1}/{len(queries)}): '{query}'")
-            try:
-                per_round = paper_search_cfg.search_results_per_round if paper_search_cfg else 5
-                result = await tool.execute(query=query, max_results=per_round)
-                if not result.success:
-                    print(f"[PreSearch] Search failed: {result.message}")
-                    continue
-
-                papers = result.data.get("papers", []) if result.data else []
-                print(f"[PreSearch] Found {len(papers)} papers for '{query}'")
-
-                for paper in papers:
-                    bibtex = paper.get("bibtex", "")
-                    cite_key = paper.get("bibtex_key", "") or paper.get("ref_id", "")
-                    if not bibtex or not cite_key:
-                        continue
-                    if ref_pool.has_key(cite_key):
-                        continue
-                    added = ref_pool.add_discovered(cite_key, bibtex, source="pre_search")
-                    if added:
-                        added_count += 1
-                        title = paper.get("title", "?")
-                        print(f"[PreSearch] Added to ref_pool: [{cite_key}] {title}")
-
-            except Exception as e:
-                print(f"[PreSearch] Error searching '{query}': {e}")
-
-        print(f"[PreSearch] Total new references added: {added_count} "
-              f"(pool: {ref_pool.summary()})")
-        return added_count
 
     def _validate_and_merge_new_references(
         self,
@@ -4578,75 +4314,14 @@ class MetaDataAgent(ReActAgent):
         research_context: Optional[Dict[str, Any]] = None,
         code_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[PaperPlan]:
-        """
-        Create a paper plan by calling the Planner Agent
-        
-        Args:
-            metadata: Paper metadata
-            target_pages: Target page count
-            style_guide: Writing style guide (e.g., "ICML")
-            
-        Returns:
-            PaperPlan or None if planning fails
-        """
-        try:
-            # Prepare figure info for planner
-            figures_info = []
-            for fig in metadata.figures:
-                figures_info.append({
-                    "id": fig.id,
-                    "caption": fig.caption,
-                    "description": fig.description,
-                    "section": fig.section,
-                    "wide": fig.wide,
-                    "file_path": getattr(fig, "file_path", None) or "",
-                })
-            
-            # Prepare table info for planner
-            tables_info = []
-            for tbl in metadata.tables:
-                tables_info.append({
-                    "id": tbl.id,
-                    "caption": tbl.caption,
-                    "description": tbl.description,
-                    "section": tbl.section,
-                    "wide": tbl.wide,
-                    "file_path": getattr(tbl, "file_path", None) or "",
-                })
-            
-            from ..planner_agent.models import PlanRequest, FigureInfo, TableInfo
-            planner_code_brief = format_code_context_for_planner(
-                context=code_context,
-                style_guide=style_guide,
-            ) if code_context else ""
-
-            plan_request = PlanRequest(
-                title=metadata.title,
-                idea_hypothesis=metadata.idea_hypothesis,
-                method=metadata.method,
-                data=metadata.data,
-                experiments=metadata.experiments,
-                references=metadata.references,
-                research_context=research_context,
-                code_context=code_context,
-                code_writing_assets={
-                    **((code_context or {}).get("writing_assets", {}) or {}),
-                    "planner_brief": planner_code_brief,
-                } if code_context else None,
-                figures=[FigureInfo(**fi) for fi in figures_info],
-                tables=[TableInfo(**ti) for ti in tables_info],
-                target_pages=target_pages,
-                style_guide=style_guide,
-            )
-
-            paper_plan = await self._planner.create_plan(plan_request)
-            return paper_plan
-
-        except Exception as e:
-            import traceback
-            print(f"[MetaDataAgent] Planning error: {e}")
-            traceback.print_exc()
-            return None
+        """Delegation stub — see orchestrator.py."""
+        return await self._orchestrator._create_paper_plan(
+            metadata=metadata,
+            target_pages=target_pages,
+            style_guide=style_guide,
+            research_context=research_context,
+            code_context=code_context,
+        )
     
     # =========================================================================
     # Phase 3.5: Review Loop Methods
@@ -4658,196 +4333,37 @@ class MetaDataAgent(ReActAgent):
         enable_review: bool,
         enable_vlm_review: bool,
     ) -> Dict[str, Any]:
-        """
-        Build a module-level baseline gap audit snapshot.
-        - **Description**:
-            - Captures current capabilities against the LLM-upgrade goals
-            - Stored into review export for explainability/audit trails
-        """
-        has_paragraph_content = any("\n\n" in (c or "") for c in generated_sections.values())
-        return {
-            "reviewer": {
-                "has_hierarchical_feedback": True,
-                "has_llm_orchestrator": True,
-                "gap": "needs stronger cross-agent conflict arbitration",
-            },
-            "writer": {
-                "writes_at_section_level": True,
-                "has_paragraph_units": has_paragraph_content,
-                "gap": "needs explicit revision plan execution constraints",
-            },
-            "metadata": {
-                "has_unified_review_loop": bool(enable_review),
-                "has_conflict_guardrails": True,
-                "gap": "needs explainable LLM arbitration traces",
-            },
-            "vlm": {
-                "enabled": bool(enable_vlm_review),
-                "has_structural_strategy": True,
-                "gap": "needs text-structure co-planning translation",
-            },
-            "export": {
-                "iteration_centric": True,
-                "has_agent_hierarchy": True,
-                "gap": "decision/reason traces should be first-class fields",
-            },
-        }
+        """Delegation stub — see orchestrator.py."""
+        return self._orchestrator._perform_baseline_gap_audit(
+            generated_sections=generated_sections,
+            enable_review=enable_review,
+            enable_vlm_review=enable_vlm_review,
+        )
 
     async def _llm_plan_revision_tasks(
         self,
         review_result: ReviewResult,
     ) -> List[Dict[str, Any]]:
-        """
-        Generate paragraph-level executable revision plans from tasks.
-        """
-        task_payload = [
-            t.model_dump() if hasattr(t, "model_dump") else t
-            for t in (review_result.revision_tasks or [])
-        ]
-        if not task_payload:
-            return []
-
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a paragraph revision planner. Convert tasks into JSON-only "
-                            "revision_plan entries with keys: task_id, section_type, target_paragraphs, "
-                            "paragraph_instructions, preserve_claims, do_not_change, expected_change, priority, "
-                            "issue_type, acceptance_criteria."
-                        ),
-                    },
-                    {"role": "user", "content": json.dumps({"tasks": task_payload}, ensure_ascii=False)},
-                ],
-                temperature=0.2,
-                max_tokens=1800,
-            )
-            raw = response.choices[0].message.content or ""
-            cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip())
-            cleaned = re.sub(r"\n?```\s*$", "", cleaned)
-            parsed = json.loads(cleaned) if cleaned else {}
-            plan = parsed.get("revision_plan", [])
-            if isinstance(plan, list):
-                return plan
-        except Exception as e:
-            print(f"[ReviewPlanner] LLM planner fallback: {e}")
-
-        # Deterministic fallback
-        fallback: List[Dict[str, Any]] = []
-        for idx, task in enumerate(task_payload):
-            section_type = str(task.get("section_type", ""))
-            if not section_type:
-                continue
-            tps = [int(x) for x in task.get("paragraph_indices", []) if isinstance(x, int) or str(x).isdigit()]
-            instruction = str(task.get("instruction", "")) or str(task.get("rationale", "Revise this section."))
-            paragraph_instructions = {p: instruction for p in tps}
-            fallback.append({
-                "task_id": task.get("task_id", f"fallback_{idx}"),
-                "section_type": section_type,
-                "target_paragraphs": tps,
-                "paragraph_instructions": paragraph_instructions,
-                "preserve_claims": task.get("preserve_claims", []),
-                "do_not_change": task.get("do_not_change", []),
-                "expected_change": task.get("expected_change", ""),
-                "priority": int(task.get("priority", 5)),
-                "issue_type": str(task.get("issue_type", "other")),
-                "acceptance_criteria": [str(x) for x in task.get("acceptance_criteria", [])],
-            })
-        return fallback
+        """Delegation stub — see orchestrator.py."""
+        return await self._orchestrator._llm_plan_revision_tasks(
+            review_result=review_result,
+        )
 
     def _apply_revision_plan_to_feedbacks(
         self,
         review_result: ReviewResult,
         revision_plan: List[Dict[str, Any]],
     ) -> None:
-        """
-        Merge revision-plan paragraph instructions into section feedbacks.
-        """
-        if not revision_plan:
-            return
-        by_section = {sf.section_type: sf for sf in review_result.section_feedbacks}
-        for plan_item in revision_plan:
-            section_type = str(plan_item.get("section_type", ""))
-            if not section_type:
-                continue
-            sf = by_section.get(section_type)
-            if sf is None:
-                sf = SectionFeedback(
-                    section_type=section_type,
-                    current_word_count=0,
-                    target_word_count=0,
-                    action="refine_paragraphs",
-                    delta_words=0,
-                    revision_prompt=str(plan_item.get("expected_change", "")),
-                    target_paragraphs=[],
-                    paragraph_instructions={},
-                )
-                review_result.section_feedbacks.append(sf)
-                by_section[section_type] = sf
-            targets = self._normalize_target_paragraphs(plan_item.get("target_paragraphs", []))
-            sf.target_paragraphs = sorted(list(set((sf.target_paragraphs or []) + targets)))
-            normalized_instructions = self._normalize_paragraph_instructions(
-                plan_item.get("paragraph_instructions", {}),
-                target_paragraphs=sf.target_paragraphs,
-                fallback_instruction=str(plan_item.get("expected_change", "")).strip(),
-            )
-            for k, v in normalized_instructions.items():
-                try:
-                    sf.paragraph_instructions[int(k)] = str(v)
-                except Exception:
-                    continue
-            if sf.target_paragraphs and sf.action == "revise":
-                sf.action = "refine_paragraphs"
-            if plan_item.get("issue_type"):
-                try:
-                    sf.issue_type = plan_item.get("issue_type")
-                except Exception:
-                    pass
-            criteria = plan_item.get("acceptance_criteria", []) or []
-            if criteria:
-                sf.acceptance_criteria = [str(x) for x in criteria]
-            preserve_claims = plan_item.get("preserve_claims", [])
-            do_not_change = plan_item.get("do_not_change", [])
-            expected_change = plan_item.get("expected_change", "")
-            extra = []
-            if preserve_claims:
-                extra.append(f"Preserve claims: {', '.join([str(x) for x in preserve_claims])}.")
-            if do_not_change:
-                extra.append(f"Do not change: {', '.join([str(x) for x in do_not_change])}.")
-            if expected_change:
-                extra.append(f"Expected change: {expected_change}.")
-            if extra:
-                sf.revision_prompt = (sf.revision_prompt + "\n\n" + " ".join(extra)).strip()
+        """Delegation stub — see orchestrator.py."""
+        return self._orchestrator._apply_revision_plan_to_feedbacks(
+            review_result=review_result,
+            revision_plan=revision_plan,
+        )
 
     @staticmethod
     def _normalize_target_paragraphs(raw_targets: Any) -> List[int]:
-        """
-        Normalizes paragraph targets from heterogeneous payloads.
-        - **Description**:
-         - Normalizes paragraph targets from heterogeneous payload types (int/str/list) into a deduplicated integer list.
-
-        - **Args**:
-         - `raw_targets` (Any): Raw paragraph target payload from planner/reviewer output.
-
-        - **Returns**:
-         - `targets` (List[int]): Deduplicated paragraph indices in ascending order.
-        """
-        if raw_targets is None:
-            return []
-        if isinstance(raw_targets, (int, str)):
-            raw_targets = [raw_targets]
-        if not isinstance(raw_targets, list):
-            return []
-        targets: List[int] = []
-        for item in raw_targets:
-            if isinstance(item, int):
-                targets.append(item)
-            elif isinstance(item, str) and item.strip().isdigit():
-                targets.append(int(item.strip()))
-        return sorted(list(set(targets)))
+        """Delegation stub — see conflict_resolver.py."""
+        return ConflictResolver._normalize_target_paragraphs(raw_targets)
 
     @staticmethod
     def _normalize_paragraph_instructions(
@@ -4855,96 +4371,15 @@ class MetaDataAgent(ReActAgent):
         target_paragraphs: Optional[List[int]] = None,
         fallback_instruction: str = "",
     ) -> Dict[int, str]:
-        """
-        Normalizes paragraph instructions into a stable mapping.
-        - **Description**:
-         - Converts reviewer/planner outputs from `dict`, `list`, or `str` into `{paragraph_index: instruction}`.
-         - Supports JSON-like string payloads and generic text instructions with paragraph-target fallback.
-
-        - **Args**:
-         - `raw_instructions` (Any): Raw paragraph instruction payload from planner/reviewer output.
-         - `target_paragraphs` (Optional[List[int]]): Candidate paragraph indices used for fallback fan-out.
-         - `fallback_instruction` (str): Backup instruction applied when parsing fails but targets exist.
-
-        - **Returns**:
-         - `normalized` (Dict[int, str]): Normalized paragraph instruction mapping.
-        """
-        normalized: Dict[int, str] = {}
-        targets = target_paragraphs or []
-
-        # dict form
-        if isinstance(raw_instructions, dict):
-            for k, v in raw_instructions.items():
-                if str(k).isdigit():
-                    normalized[int(k)] = str(v).strip()
-            return normalized
-
-        # list form
-        if isinstance(raw_instructions, list):
-            for item in raw_instructions:
-                if isinstance(item, dict):
-                    pidx = item.get("paragraph_index")
-                    ins = item.get("instruction") or item.get("suggestion") or item.get("text")
-                    if (isinstance(pidx, int) or str(pidx).isdigit()) and ins:
-                        normalized[int(pidx)] = str(ins).strip()
-                elif isinstance(item, str) and targets:
-                    for t in targets:
-                        normalized[t] = item.strip()
-            return normalized
-
-        # string form (generic or JSON-like)
-        if isinstance(raw_instructions, str):
-            text = raw_instructions.strip()
-            if not text:
-                return normalized
-
-            # Try JSON object first
-            if text.startswith("{") and text.endswith("}"):
-                try:
-                    parsed = json.loads(text)
-                    if isinstance(parsed, dict):
-                        for k, v in parsed.items():
-                            if str(k).isdigit():
-                                normalized[int(k)] = str(v).strip()
-                        if normalized:
-                            return normalized
-                except Exception:
-                    pass
-
-            # Parse "3: xxx; 4: yyy" pattern
-            pairs = re.findall(r"(\d+)\s*[:=-]\s*([^;]+)", text)
-            for pidx, ins in pairs:
-                normalized[int(pidx)] = ins.strip()
-            if normalized:
-                return normalized
-
-            # Generic sentence => apply to all targets when available
-            if targets:
-                for t in targets:
-                    normalized[t] = text
-                return normalized
-
-        # Fallback: if we have targets, use fallback instruction
-        if targets and fallback_instruction:
-            for t in targets:
-                normalized[t] = fallback_instruction
-        return normalized
+        """Delegation stub — see conflict_resolver.py."""
+        return ConflictResolver._normalize_paragraph_instructions(
+            raw_instructions, target_paragraphs, fallback_instruction,
+        )
 
     @staticmethod
     def _default_acceptance_criteria(issue_type: str) -> List[str]:
-        """
-        Build default acceptance gates for generalized issue handling.
-        - **Description**:
-         - Uses issue taxonomy to derive validation gates
-         - Keeps contracts stable when reviewer does not supply criteria
-        """
-        base = ["execution_changed", "semantic_preserved"]
-        normalized = str(issue_type or "other").strip().lower()
-        if normalized == "logical_contradiction":
-            return base + ["contradiction_resolved"]
-        if normalized in ("claim_evidence_gap", "unsupported_generalization"):
-            return base + ["evidence_sufficient"]
-        return base
+        """Delegation stub — see revision_executor.py."""
+        return RevisionExecutor._default_acceptance_criteria(issue_type)
 
     async def _run_semantic_consistency_guard(
         self,
@@ -4953,387 +4388,46 @@ class MetaDataAgent(ReActAgent):
         after_text: str,
         revision_prompt: str,
     ) -> SemanticCheckRecord:
-        """
-        Check semantic consistency of before/after revisions.
-        """
-        if before_text.strip() == after_text.strip():
-            return SemanticCheckRecord(
-                section_type=section_type,
-                passed=True,
-                summary="No semantic delta detected.",
-                risks=[],
-                action_taken="accepted",
-            )
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a semantic consistency guard for academic revisions. "
-                            "Return JSON only with keys: passed (bool), summary (str), risks (list[str]). "
-                            "Fail if key claims are dropped or contradictions are introduced."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "section_type": section_type,
-                                "revision_prompt": revision_prompt[:1200],
-                                "before": before_text[:7000],
-                                "after": after_text[:7000],
-                            },
-                            ensure_ascii=False,
-                        ),
-                    },
-                ],
-                temperature=0.1,
-                max_tokens=600,
-            )
-            raw = response.choices[0].message.content or ""
-            cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip())
-            cleaned = re.sub(r"\n?```\s*$", "", cleaned)
-            parsed = json.loads(cleaned) if cleaned else {}
-            passed = bool(parsed.get("passed", True))
-            summary = str(parsed.get("summary", "Semantic check completed."))
-            risks = [str(x) for x in parsed.get("risks", [])]
-            return SemanticCheckRecord(
-                section_type=section_type,
-                passed=passed,
-                summary=summary,
-                risks=risks,
-                action_taken="accepted" if passed else "rollback",
-            )
-        except Exception as e:
-            return SemanticCheckRecord(
-                section_type=section_type,
-                passed=False,
-                summary=f"Semantic guard failed due to error: {e}",
-                risks=["semantic_guard_unavailable"],
-                action_taken="rollback",
-            )
+        """Delegation stub — see revision_executor.py."""
+        return await self._executor._run_semantic_consistency_guard(
+            section_type=section_type,
+            before_text=before_text,
+            after_text=after_text,
+            revision_prompt=revision_prompt,
+        )
 
     async def _translate_vlm_to_revision_plan(
         self,
         vlm_result: Dict[str, Any],
         generated_sections: Dict[str, str],
     ) -> List[Dict[str, Any]]:
-        """
-        Translate VLM section advice into joint text/structure revision tasks.
-        """
-        if not vlm_result:
-            return []
-        payload = {
-            "summary": vlm_result.get("summary", ""),
-            "needs_trim": bool(vlm_result.get("needs_trim", False)),
-            "needs_expand": bool(vlm_result.get("needs_expand", False)),
-            "section_recommendations": {
-                sec: (advice.model_dump() if hasattr(advice, "model_dump") else advice)
-                for sec, advice in (vlm_result.get("section_recommendations", {}) or {}).items()
-            },
-            "sections": {k: v[:1800] for k, v in generated_sections.items()},
-        }
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model_name,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You translate VLM layout feedback into executable JSON revision tasks. "
-                            "Return JSON only with key vlm_revision_plan as list of objects: "
-                            "section_type, action, delta_words, paragraph_instructions, rationale."
-                        ),
-                    },
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ],
-                temperature=0.2,
-                max_tokens=1200,
-            )
-            raw = response.choices[0].message.content or ""
-            cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip())
-            cleaned = re.sub(r"\n?```\s*$", "", cleaned)
-            parsed = json.loads(cleaned) if cleaned else {}
-            plan = parsed.get("vlm_revision_plan", [])
-            if isinstance(plan, list):
-                return plan
-        except Exception as e:
-            print(f"[VLMTranslate] LLM translator fallback: {e}")
-
-        fallback = []
-        for section_type, advice in (vlm_result.get("section_recommendations", {}) or {}).items():
-            action = getattr(advice, "recommended_action", None) or advice.get("recommended_action")
-            target_change = getattr(advice, "target_change", None) or advice.get("target_change") or 0
-            fallback.append({
-                "section_type": section_type,
-                "action": "reduce" if action == "trim" else ("expand" if action == "expand" else "ok"),
-                "delta_words": int(target_change or 0),
-                "paragraph_instructions": {},
-                "rationale": "VLM fallback translation",
-            })
-        return fallback
+        """Delegation stub — see orchestrator.py."""
+        return await self._orchestrator._translate_vlm_to_revision_plan(
+            vlm_result=vlm_result,
+            generated_sections=generated_sections,
+        )
 
     async def _resolve_conflicts_with_llm(
         self,
         reviewer_feedbacks: List[SectionFeedback],
         external_feedbacks: List[SectionFeedback],
     ) -> Tuple[List[SectionFeedback], List[ConflictResolutionRecord]]:
-        """
-        Resolve conflicts between reviewer and external (typesetter/VLM) feedback.
-        """
-        guardrail_priority = {
-            "fix_latex": 100,
-            "reduce": 80,
-            "expand": 20,
-            "revise": 30,
-            "refine_paragraphs": 40,
-            "ok": 0,
-        }
-        merged = {sf.section_type: sf for sf in reviewer_feedbacks}
-        conflict_records: List[ConflictResolutionRecord] = []
-        for ext in external_feedbacks:
-            existing = merged.get(ext.section_type)
-            if existing is None:
-                merged[ext.section_type] = ext
-                continue
-            if existing.action == ext.action:
-                merged[ext.section_type] = self._merge_section_feedbacks(
-                    [existing],
-                    [ext],
-                    prefer_vlm=False,
-                )[0]
-                continue
-            # Hard guardrails first.
-            if guardrail_priority.get(ext.action, 0) > guardrail_priority.get(existing.action, 0):
-                chosen, rejected = ext, existing
-                guardrail = "rule_guardrail_priority"
-            elif guardrail_priority.get(ext.action, 0) < guardrail_priority.get(existing.action, 0):
-                chosen, rejected = existing, ext
-                guardrail = "rule_guardrail_priority"
-            else:
-                # LLM arbitration for same-priority soft conflicts.
-                chosen = existing
-                rejected = ext
-                guardrail = None
-                try:
-                    response = await self.client.chat.completions.create(
-                        model=self.model_name,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
-                                    "You arbitrate conflicting section revision actions. "
-                                    "Prefer preserving compilation validity and page limits. "
-                                    "Return JSON only: {selected: 'a'|'b', reason: '...'}."
-                                ),
-                            },
-                            {
-                                "role": "user",
-                                "content": json.dumps(
-                                    {
-                                        "section": ext.section_type,
-                                        "candidate_a": existing.model_dump(),
-                                        "candidate_b": ext.model_dump(),
-                                    },
-                                    ensure_ascii=False,
-                                ),
-                            },
-                        ],
-                        temperature=0.1,
-                        max_tokens=300,
-                    )
-                    raw = response.choices[0].message.content or ""
-                    cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip())
-                    cleaned = re.sub(r"\n?```\s*$", "", cleaned)
-                    arb = json.loads(cleaned) if cleaned else {}
-                    if str(arb.get("selected", "a")).lower() == "b":
-                        chosen, rejected = ext, existing
-                    reason = str(arb.get("reason", "LLM arbitration selected safer action."))
-                except Exception:
-                    reason = "Fallback arbitration kept existing action."
-                conflict_records.append(ConflictResolutionRecord(
-                    section_type=ext.section_type,
-                    target_id=ext.target_id or existing.target_id or ext.section_type,
-                    candidates=[existing.model_dump(), ext.model_dump()],
-                    selected_action=chosen.action,
-                    selected_source="llm_arbiter",
-                    reason=reason,
-                    applied_guardrail=guardrail,
-                ))
-                merged[ext.section_type] = chosen
-                continue
-
-            merged[ext.section_type] = chosen
-            conflict_records.append(ConflictResolutionRecord(
-                section_type=ext.section_type,
-                target_id=ext.target_id or existing.target_id or ext.section_type,
-                candidates=[existing.model_dump(), ext.model_dump()],
-                selected_action=chosen.action,
-                selected_source="rule_guardrail",
-                reason=f"Selected '{chosen.action}' over '{rejected.action}' by guardrail priority.",
-                applied_guardrail=guardrail,
-            ))
-        return list(merged.values()), conflict_records
+        """Delegation stub — see conflict_resolver.py."""
+        return await self._resolver._resolve_conflicts_with_llm(
+            reviewer_feedbacks=reviewer_feedbacks,
+            external_feedbacks=external_feedbacks,
+        )
     
     def _build_vlm_feedback(
         self,
         vlm_result: Dict[str, Any],
         structural_actions: Optional[List[StructuralAction]] = None,
     ) -> Tuple[List[FeedbackResult], List[SectionFeedback]]:
-        """
-        Build feedback and section revisions from VLM result.
-        - **Description**:
-            - Converts VLM review output into Reviewer-compatible feedback
-            - Maps overflow/underfill to FeedbackResult and section advice to SectionFeedback
-            - When structural_actions are provided, enriches revision prompts with
-              global strategy context (e.g. what was moved to appendix, resized)
-
-        - **Args**:
-            - `vlm_result` (Dict[str, Any]): Raw VLM review result dict
-            - `structural_actions` (Optional[List[StructuralAction]]): Planned/executed actions
-
-        - **Returns**:
-            - `feedbacks` (List[FeedbackResult]): Aggregated feedback results
-            - `section_feedbacks` (List[SectionFeedback]): Per-section revision guidance
-        """
-        feedbacks: List[FeedbackResult] = []
-        section_feedbacks: List[SectionFeedback] = []
-        
-        if not vlm_result:
-            return feedbacks, section_feedbacks
-
-        # try:
-        #     print("[VLMReview] RawResult:\n" + json.dumps(vlm_result, ensure_ascii=False, indent=2))
-        # except Exception as e:
-        #     print(f"[VLMReview] RawResult log failed: {e}")
-        
-        overflow_pages = vlm_result.get("overflow_pages", 0)
-        needs_trim = vlm_result.get("needs_trim", False)
-        needs_expand = vlm_result.get("needs_expand", False)
-        
-        if overflow_pages > 0 or needs_trim:
-            feedbacks.append(FeedbackResult(
-                checker_name="vlm_review",
-                passed=False,
-                severity=Severity.ERROR,
-                message=vlm_result.get("summary", "Page overflow detected"),
-                details={
-                    "overflow_pages": overflow_pages,
-                    "needs_trim": True,
-                    "source": "vlm_review",
-                },
-            ))
-        elif needs_expand:
-            feedbacks.append(FeedbackResult(
-                checker_name="vlm_review",
-                passed=False,
-                severity=Severity.WARNING,
-                message=vlm_result.get("summary", "Underfill detected"),
-                details={
-                    "needs_expand": True,
-                    "source": "vlm_review",
-                },
-            ))
-        else:
-            feedbacks.append(FeedbackResult(
-                checker_name="vlm_review",
-                passed=True,
-                severity=Severity.INFO,
-                message=vlm_result.get("summary", "VLM review passed"),
-                details={"source": "vlm_review"},
-            ))
-        
-        print(
-            "[VLMReview] Summary: "
-            f"{vlm_result.get('summary', 'No summary')} | "
-            f"overflow_pages={overflow_pages} needs_trim={needs_trim} needs_expand={needs_expand}"
+        """Delegation stub — see conflict_resolver.py."""
+        return self._resolver._build_vlm_feedback(
+            vlm_result=vlm_result,
+            structural_actions=structural_actions,
         )
-        
-        # Build structural context string for enriched revision prompts
-        structural_context = None
-        if structural_actions:
-            ctx_parts = [
-                f"This paper exceeds the page limit by {overflow_pages:.1f} pages. "
-                "The following structural adjustments have been applied:"
-            ]
-            moved_count = sum(1 for a in structural_actions if a.action_type in ("move_figure", "move_table"))
-            resized_count = sum(1 for a in structural_actions if a.action_type == "resize_figure")
-            downgraded_count = sum(1 for a in structural_actions if a.action_type == "downgrade_wide")
-            appendix_created = any(a.action_type == "create_appendix" for a in structural_actions)
-
-            if appendix_created:
-                ctx_parts.append("- An Appendix section has been created.")
-            if moved_count > 0:
-                moved_ids = [a.target_id for a in structural_actions if a.action_type in ("move_figure", "move_table")]
-                ctx_parts.append(f"- {moved_count} figure(s)/table(s) moved to Appendix: {', '.join(moved_ids)}.")
-            if downgraded_count > 0:
-                ctx_parts.append(f"- {downgraded_count} wide figure(s) converted to single-column.")
-            if resized_count > 0:
-                ctx_parts.append(f"- {resized_count} figure(s) resized to smaller width.")
-
-            total_saved = sum(a.estimated_savings for a in structural_actions)
-            remaining_trim = max(0, overflow_pages - total_saved)
-            if remaining_trim > 0:
-                ctx_parts.append(
-                    f"After these adjustments, an estimated {remaining_trim:.1f} pages of word-level "
-                    "trimming is still needed across sections."
-                )
-            structural_context = " ".join(ctx_parts)
-
-        section_recommendations = vlm_result.get("section_recommendations", {}) or {}
-        for section_type, advice in section_recommendations.items():
-            if section_type == "appendix":
-                continue
-            recommended_action = getattr(advice, "recommended_action", None) or advice.get("recommended_action")
-            target_change = getattr(advice, "target_change", None) or advice.get("target_change")
-            guidance = getattr(advice, "specific_guidance", None) or advice.get("specific_guidance")
-            
-            if recommended_action == "trim":
-                action = "reduce"
-                delta_words = -abs(target_change) if target_change else 0
-            elif recommended_action == "expand":
-                action = "expand"
-                delta_words = abs(target_change) if target_change else 0
-            else:
-                action = "ok"
-                delta_words = 0
-            
-            # Build per-section structural action descriptors
-            section_struct_actions = []
-            if structural_actions:
-                section_struct_actions = [
-                    f"{a.action_type}:{a.target_id}"
-                    for a in structural_actions
-                    if a.section == section_type
-                ]
-            
-            revision_prompt = self._build_vlm_revision_prompt(
-                section_type=section_type,
-                action=action,
-                delta_words=delta_words,
-                guidance=guidance,
-                structural_context=structural_context if action == "reduce" else None,
-            )
-            
-            section_feedbacks.append(SectionFeedback(
-                section_type=section_type,
-                current_word_count=0,
-                target_word_count=0,
-                action=action,
-                delta_words=delta_words,
-                revision_prompt=revision_prompt,
-                structural_actions=section_struct_actions,
-            ))
-            print(
-                "[VLMReview] Advice: "
-                f"section={section_type} action={action} delta_words={delta_words} "
-                f"guidance={guidance or 'n/a'}"
-                + (f" structural_actions={section_struct_actions}" if section_struct_actions else "")
-            )
-        
-        return feedbacks, section_feedbacks
     
     def _build_vlm_revision_prompt(
         self,
@@ -5343,53 +4437,14 @@ class MetaDataAgent(ReActAgent):
         guidance: Optional[str] = None,
         structural_context: Optional[str] = None,
     ) -> str:
-        """
-        Build revision prompt from VLM guidance with optional structural context.
-        - **Description**:
-            - Produces a detailed revision instruction for the writer agent
-            - When structural_context is provided, includes information about
-              overall page-reduction strategy so the writer knows what has changed
-
-        - **Args**:
-            - `section_type` (str): Section name to revise
-            - `action` (str): "reduce" or "expand"
-            - `delta_words` (int): Target word change (+/-)
-            - `guidance` (Optional[str]): Extra VLM guidance
-            - `structural_context` (Optional[str]): Global strategy summary
-
-        - **Returns**:
-            - `prompt` (str): Revision instruction prompt
-        """
-        action_text = "reduce" if action == "reduce" else "expand"
-        delta = abs(delta_words) if delta_words else 0
-
-        parts = []
-
-        # Global strategy context (if structural actions were planned)
-        if structural_context:
-            parts.append(structural_context)
-
-        parts.append(
-            f"Revise the {section_type} section to {action_text} by approximately {delta} words."
+        """Delegation stub — see conflict_resolver.py."""
+        return self._resolver._build_vlm_revision_prompt(
+            section_type=section_type,
+            action=action,
+            delta_words=delta_words,
+            guidance=guidance,
+            structural_context=structural_context,
         )
-
-        if action == "reduce":
-            parts.append(
-                "Prioritize: (1) removing redundant explanations of figures/tables that may "
-                "have been moved to the Appendix, (2) condensing verbose passages, "
-                "(3) merging overlapping sentences. Preserve factual consistency, "
-                "citations, equations, and LaTeX formatting."
-            )
-        else:
-            parts.append(
-                "Prioritize expanding with additional evidence, details, or analysis. "
-                "Preserve factual consistency, citations, and LaTeX formatting."
-            )
-
-        if guidance:
-            parts.append(f"Additional guidance: {guidance}")
-
-        return " ".join(parts)
     
     # =====================================================================
     # Smart page-limit control: structural overflow strategy
@@ -5869,42 +4924,8 @@ class MetaDataAgent(ReActAgent):
 
         print("[Structural] All structural actions executed")
 
-    # LaTeX error patterns mapped to fix instructions
-    LATEX_ERROR_FIXES: Dict[str, str] = {
-        "ended by": (
-            "Fix unclosed LaTeX environment. Ensure every \\begin{{...}} has a matching \\end{{...}}. "
-            "Check figure, table, and equation environments."
-        ),
-        "misplaced alignment tab character &": (
-            "Escape all literal '&' characters as '\\&' in regular text. "
-            "Only use bare '&' inside tabular/align environments."
-        ),
-        "unicode character": (
-            "Replace Unicode characters with LaTeX equivalents. "
-            "For example: use \\textendash for –, $-$ or $\\minus$ for −, "
-            "\\% for %, \\& for &."
-        ),
-        "missing $ inserted": (
-            "Fix math mode errors. Wrap mathematical symbols like _, ^, "
-            "\\alpha, \\beta in $...$ when used outside math environments."
-        ),
-        "undefined control sequence": (
-            "Remove or replace undefined LaTeX commands. "
-            "Check for typos in command names or missing package imports."
-        ),
-        "not in outer par mode": (
-            "Move float environments (figure, table) out of restricted contexts. "
-            "Floats cannot appear inside minipage, parbox, or other floats."
-        ),
-        "file not found": (
-            "Remove or comment out \\includegraphics for missing figure files. "
-            "Replace with a placeholder comment if needed."
-        ),
-        "no output pdf file produced": (
-            "Fix critical LaTeX errors that prevent PDF generation. "
-            "Check for unclosed environments, invalid commands, and encoding issues."
-        ),
-    }
+    # Moved to conflict_resolver.py; kept here for backward compat
+    LATEX_ERROR_FIXES = _CR_LATEX_ERROR_FIXES
     
     def _build_typesetter_feedback(
         self,
@@ -5912,185 +4933,12 @@ class MetaDataAgent(ReActAgent):
         generated_sections: Dict[str, str],
         section_errors: Optional[Dict[str, List[str]]] = None,
     ) -> Tuple[List[FeedbackResult], List[SectionFeedback]]:
-        """
-        Build feedback from LaTeX compilation errors.
-        - **Description**:
-            - Converts compilation errors into reviewer-compatible feedback
-            - When section_errors is provided (multi-file mode), uses precise
-              error-to-section mapping from the LaTeX log file tracking
-            - Falls back to heuristic content matching when section_errors is not available
-
-        - **Args**:
-            - `compile_errors` (List[str]): Error messages from LaTeX compiler
-            - `generated_sections` (Dict[str, str]): Current section contents
-            - `section_errors` (Dict[str, List[str]], optional): Pre-mapped section -> errors
-
-        - **Returns**:
-            - `feedbacks` (List[FeedbackResult]): Aggregated feedback results
-            - `section_feedbacks` (List[SectionFeedback]): Per-section revision guidance
-        """
-        feedbacks: List[FeedbackResult] = []
-        section_feedbacks: List[SectionFeedback] = []
-        
-        if not compile_errors and not section_errors:
-            return feedbacks, section_feedbacks
-        
-        total_errors = len(compile_errors) if compile_errors else sum(
-            len(v) for v in (section_errors or {}).values()
+        """Delegation stub — see conflict_resolver.py."""
+        return self._resolver._build_typesetter_feedback(
+            compile_errors=compile_errors,
+            generated_sections=generated_sections,
+            section_errors=section_errors,
         )
-        print(f"[Typesetter] Building feedback from {total_errors} compile errors")
-        
-        # Build a combined feedback result
-        feedbacks.append(FeedbackResult(
-            checker_name="typesetter",
-            passed=False,
-            severity=Severity.ERROR,
-            message=f"LaTeX compilation failed with {total_errors} error(s): {'; '.join(compile_errors[:3]) if compile_errors else 'see section_errors'}",
-            details={
-                "source": "typesetter",
-                "compile_errors": compile_errors or [],
-                "section_errors": section_errors or {},
-            },
-        ))
-        
-        # =====================================================================
-        # Multi-file mode: precise section_errors mapping available
-        # =====================================================================
-        if section_errors:
-            for sec_type, sec_errs in section_errors.items():
-                if sec_type not in generated_sections:
-                    continue
-                if not sec_errs:
-                    continue
-                
-                revision_parts = [
-                    "Fix the following LaTeX compilation errors in this section:\n"
-                ]
-                for err in sec_errs:
-                    err_lower = err.lower()
-                    matched_fix = False
-                    for pattern, fix in self.LATEX_ERROR_FIXES.items():
-                        if pattern in err_lower:
-                            revision_parts.append(f"- {err}: {fix}")
-                            matched_fix = True
-                            break
-                    if not matched_fix:
-                        revision_parts.append(f"- {err}: Review and correct this LaTeX error.")
-                revision_parts.append(
-                    "\nOutput ONLY valid LaTeX. Do NOT use unescaped special characters "
-                    "(&, %, $, #, _, {, }) in regular text."
-                )
-                
-                section_feedbacks.append(SectionFeedback(
-                    section_type=sec_type,
-                    current_word_count=len(generated_sections.get(sec_type, "").split()),
-                    target_word_count=0,
-                    action="fix_latex",
-                    delta_words=0,
-                    revision_prompt="\n".join(revision_parts),
-                ))
-                print(f"[Typesetter] Targeted fix (multi-file): section={sec_type} errors={sec_errs[:3]}")
-            
-            # Handle any errors not attributed to a specific section
-            attributed_errors = set()
-            for errs in section_errors.values():
-                attributed_errors.update(errs)
-            unattributed = [e for e in (compile_errors or []) if e not in attributed_errors]
-            if unattributed and not section_feedbacks:
-                # If no section feedbacks were created from section_errors,
-                # fall through to the heuristic/broadcast path below
-                compile_errors = unattributed
-            elif section_feedbacks:
-                return feedbacks, section_feedbacks
-        
-        # =====================================================================
-        # Fallback: heuristic matching or broadcast
-        # =====================================================================
-        if not compile_errors:
-            return feedbacks, section_feedbacks
-        
-        # Collect fix instructions for all errors
-        fix_instructions: List[str] = []
-        for error in compile_errors:
-            error_lower = error.lower()
-            for pattern, fix in self.LATEX_ERROR_FIXES.items():
-                if pattern in error_lower:
-                    fix_instructions.append(f"Error: {error}\nFix: {fix}")
-                    break
-            else:
-                fix_instructions.append(f"Error: {error}\nFix: Review and correct this LaTeX error.")
-        
-        # Try to locate errors to specific sections by scanning content
-        section_error_map: Dict[str, List[str]] = {}
-        for error in compile_errors:
-            error_lower = error.lower()
-            matched_section = None
-            
-            if "figure" in error_lower or "includegraphics" in error_lower:
-                for section_type, content in generated_sections.items():
-                    if "\\begin{figure" in content or "\\includegraphics" in content:
-                        matched_section = section_type
-                        break
-            elif "tabular" in error_lower or "alignment tab" in error_lower:
-                for section_type, content in generated_sections.items():
-                    if "\\begin{tabular" in content or "\\begin{table" in content or "&" in content:
-                        matched_section = section_type
-                        break
-            
-            if matched_section:
-                if matched_section not in section_error_map:
-                    section_error_map[matched_section] = []
-                section_error_map[matched_section].append(error)
-        
-        if section_error_map:
-            for section_type, sec_errs in section_error_map.items():
-                revision_parts = [
-                    "Fix the following LaTeX compilation errors in this section:\n"
-                ]
-                for err in sec_errs:
-                    err_lower = err.lower()
-                    for pattern, fix in self.LATEX_ERROR_FIXES.items():
-                        if pattern in err_lower:
-                            revision_parts.append(f"- {err}: {fix}")
-                            break
-                    else:
-                        revision_parts.append(f"- {err}: Review and correct.")
-                revision_parts.append(
-                    "\nOutput ONLY valid LaTeX. Do NOT use unescaped special characters "
-                    "(&, %, $, #, _, {, }) in regular text."
-                )
-                
-                section_feedbacks.append(SectionFeedback(
-                    section_type=section_type,
-                    current_word_count=len(generated_sections.get(section_type, "").split()),
-                    target_word_count=0,
-                    action="fix_latex",
-                    delta_words=0,
-                    revision_prompt="\n".join(revision_parts),
-                ))
-                print(f"[Typesetter] Targeted fix (heuristic): section={section_type} errors={sec_errs}")
-        else:
-            # Cannot locate to specific section - broadcast to all sections
-            all_fix_prompt = (
-                "Fix the following LaTeX compilation errors in this section:\n"
-                + "\n".join(f"- {inst}" for inst in fix_instructions)
-                + "\n\nOutput ONLY valid LaTeX. Ensure all environments are properly closed. "
-                "Escape special characters (&, %, $, #, _, {, }) in regular text."
-            )
-            for section_type in generated_sections:
-                if section_type == "appendix":
-                    continue
-                section_feedbacks.append(SectionFeedback(
-                    section_type=section_type,
-                    current_word_count=len(generated_sections.get(section_type, "").split()),
-                    target_word_count=0,
-                    action="fix_latex",
-                    delta_words=0,
-                    revision_prompt=all_fix_prompt,
-                ))
-            print(f"[Typesetter] Broadcast fix to all {len(generated_sections)} sections (excl. appendix)")
-        
-        return feedbacks, section_feedbacks
     
     def _merge_section_feedbacks(
         self,
@@ -6098,56 +4946,12 @@ class MetaDataAgent(ReActAgent):
         vlm_feedbacks: List[SectionFeedback],
         prefer_vlm: bool,
     ) -> List[SectionFeedback]:
-        """
-        Merge section feedbacks with conflict resolution.
-        - **Description**:
-            - Merges reviewer and VLM section feedback
-            - Resolves conflicts based on prefer_vlm flag
-        
-        - **Args**:
-            - `base_feedbacks` (List[SectionFeedback]): Reviewer-driven feedback
-            - `vlm_feedbacks` (List[SectionFeedback]): VLM-driven feedback
-            - `prefer_vlm` (bool): Whether to override conflicts with VLM advice
-        
-        - **Returns**:
-            - `merged` (List[SectionFeedback]): Merged section feedback list
-        """
-        merged: Dict[str, SectionFeedback] = {fb.section_type: fb for fb in base_feedbacks}
-        
-        for fb in vlm_feedbacks:
-            existing = merged.get(fb.section_type)
-            if not existing:
-                merged[fb.section_type] = fb
-                continue
-            
-            # fix_latex always takes priority — compilation must succeed first
-            if fb.action == "fix_latex" and existing.action != "fix_latex":
-                merged[fb.section_type] = fb
-            elif existing.action == "fix_latex":
-                # Keep existing fix_latex; append new prompt if also fix_latex
-                if fb.action == "fix_latex":
-                    existing.revision_prompt += "\n\n" + fb.revision_prompt
-            elif existing.action != fb.action and prefer_vlm:
-                merged[fb.section_type] = fb
-            elif existing.action == fb.action and abs(fb.delta_words) > abs(existing.delta_words):
-                merged[fb.section_type] = fb
-            else:
-                # Preserve paragraph-level targets/instructions from both sources.
-                merged_targets = sorted(
-                    list(set((existing.target_paragraphs or []) + (fb.target_paragraphs or [])))
-                )
-                existing.target_paragraphs = merged_targets
-                if fb.paragraph_instructions:
-                    existing.paragraph_instructions.update(fb.paragraph_instructions)
-                if fb.paragraph_feedbacks:
-                    existing.paragraph_feedbacks.extend(fb.paragraph_feedbacks)
-                if fb.revision_prompt and fb.revision_prompt not in (existing.revision_prompt or ""):
-                    if existing.revision_prompt:
-                        existing.revision_prompt += "\n\n" + fb.revision_prompt
-                    else:
-                        existing.revision_prompt = fb.revision_prompt
-        
-        return list(merged.values())
+        """Delegation stub — see conflict_resolver.py."""
+        return self._resolver._merge_section_feedbacks(
+            base_feedbacks=base_feedbacks,
+            vlm_feedbacks=vlm_feedbacks,
+            prefer_vlm=prefer_vlm,
+        )
     
     def _resolve_section_feedbacks(
         self,
@@ -6155,32 +4959,12 @@ class MetaDataAgent(ReActAgent):
         revised_sections: set,
         review_result: ReviewResult,
     ) -> None:
-        """
-        Mark section feedbacks as resolved after revision.
-        - **Description**:
-            - Clears revision prompts for sections already revised
-            - Updates review_result.requires_revision accordingly
-        
-        - **Args**:
-            - `section_feedbacks` (List[SectionFeedback]): Feedback list to update
-            - `revised_sections` (set): Sections that were revised
-            - `review_result` (ReviewResult): Review result to update
-        
-        - **Returns**:
-            - `None`
-        """
-        if not revised_sections:
-            return
-        
-        for sf in section_feedbacks:
-            if sf.section_type in revised_sections:
-                sf.action = "ok"
-                sf.delta_words = 0
-                sf.revision_prompt = ""
-        
-        for section_type in list(review_result.requires_revision.keys()):
-            if section_type in revised_sections:
-                review_result.requires_revision.pop(section_type, None)
+        """Delegation stub — see conflict_resolver.py."""
+        return self._resolver._resolve_section_feedbacks(
+            section_feedbacks=section_feedbacks,
+            revised_sections=revised_sections,
+            review_result=review_result,
+        )
     
     async def _apply_revisions(
         self,
@@ -6196,284 +4980,30 @@ class MetaDataAgent(ReActAgent):
         writer_response_paragraph: Optional[List[Dict[str, Any]]] = None,
         reviewer_verification: Optional[List[Dict[str, Any]]] = None,
     ) -> set:
-        """
-        Apply revisions based on a unified review result.
-        - **Description**:
-            - Uses review_result.section_feedbacks to revise sections
-            - Updates generated_sections and sections_results in place
-            - Injects revision history from memory to prevent regression
-        
-        - **Args**:
-            - `review_result` (ReviewResult): Unified review result
-            - `generated_sections` (Dict[str, str]): Section contents
-            - `sections_results` (List[SectionResult]): Section results to update
-            - `valid_citation_keys` (set): Valid citation keys
-            - `metadata` (PaperMetaData): Original metadata for context
-            - `memory` (SessionMemory, optional): Session memory for revision context
-        
-        - **Returns**:
-            - `revised_sections` (set): Section types that were revised
-        """
-        revised_sections: set = set()
-        if not review_result or not review_result.section_feedbacks:
-            return revised_sections
-        
-        for sf in review_result.section_feedbacks:
-            if sf.action == "ok":
-                continue
-            if sf.section_type not in generated_sections:
-                continue
-            
-            revision_prompt = sf.revision_prompt
-            if not revision_prompt:
-                continue
-            task_contract = {
-                "target": sf.target_id or sf.section_type,
-                "target_level": "paragraph" if sf.target_paragraphs else "section",
-                "instruction": revision_prompt,
-                "issue_type": str(getattr(sf, "issue_type", "other") or "other"),
-                "constraints": {
-                    "preserve_claims": ["Preserve factual claims and citations."],
-                    "do_not_change": [],
-                },
-                "acceptance_criteria": self._default_acceptance_criteria(
-                    str(getattr(sf, "issue_type", "other") or "other")
-                ),
-                "target_paragraphs": sf.target_paragraphs or [],
-                "paragraph_instructions": sf.paragraph_instructions or {},
-            }
-            if getattr(sf, "acceptance_criteria", None):
-                task_contract["acceptance_criteria"] = [str(x) for x in (sf.acceptance_criteria or [])]
-            if memory is not None:
-                issue_ctx = memory.get_issue_context(limit=60)
-                unresolved = issue_ctx.get("unresolved_issues", [])
-                hard_rules = []
-                soft_hints = []
-                for issue in unresolved:
-                    sec = str(issue.get("section_type", ""))
-                    target_id = str(issue.get("target_id", ""))
-                    if sec not in ("", sf.section_type) and not target_id.startswith(f"{sf.section_type}."):
-                        continue
-                    msg = str(issue.get("message", ""))[:220]
-                    if str(issue.get("locked_mode", "soft")) == "hard":
-                        hard_rules.append(msg)
-                    else:
-                        soft_hints.append(msg)
-                if hard_rules:
-                    revision_prompt = (
-                        "HARD LOCK ISSUES (must remain resolved; do not reintroduce):\n"
-                        + "\n".join([f"- {x}" for x in hard_rules[:8]])
-                        + "\n\n"
-                        + revision_prompt
-                    )
-                if soft_hints:
-                    revision_prompt = (
-                        revision_prompt
-                        + "\n\nSOFT LOCK GUIDANCE (avoid regression if possible):\n"
-                        + "\n".join([f"- {x}" for x in soft_hints[:6]])
-                    )
-            
-            print(
-                "[ReviewLoop] Applying revision: "
-                f"section={sf.section_type} action={sf.action} delta_words={sf.delta_words}"
-            )
-            
-            current_content = generated_sections[sf.section_type]
-            before_content = current_content
-
-            # Paragraph-first revision path (higher precision than whole-section rewrite).
-            if sf.target_paragraphs:
-                revised_content = await self._revise_section_paragraphs(
-                    section_type=sf.section_type,
-                    current_content=current_content,
-                    target_paragraphs=sf.target_paragraphs,
-                    paragraph_instructions=sf.paragraph_instructions or {},
-                    fallback_prompt=revision_prompt,
-                    metadata=metadata,
-                    memory=memory,
-                    task_contract_base=task_contract,
-                    valid_citation_keys=valid_citation_keys,
-                )
-            else:
-                revised_content = await self._revise_section(
-                    section_type=sf.section_type,
-                    current_content=current_content,
-                    revision_prompt=revision_prompt,
-                    metadata=metadata,
-                    memory=memory,
-                    task_contract=task_contract,
-                    valid_citation_keys=valid_citation_keys,
-                )
-            
-            if revised_content:
-                revised_content = self._fix_latex_references(revised_content)
-                revised_content, invalid_citations, _ = self._validate_and_fix_citations(
-                    revised_content, valid_citation_keys, remove_invalid=True
-                )
-                if invalid_citations:
-                    print(f"[ReviewLoop] Removed {len(invalid_citations)} invalid citations from {sf.section_type}: {invalid_citations[:3]}{'...' if len(invalid_citations) > 3 else ''}")
-                    if decision_trace is not None:
-                        decision_trace.append(
-                            {
-                                "section_type": sf.section_type,
-                                "decision": "removed_invalid_citations",
-                                "count": len(invalid_citations),
-                                "keys": list(invalid_citations),
-                            }
-                        )
-                semantic_record = await self._run_semantic_consistency_guard(
-                    section_type=sf.section_type,
-                    before_text=before_content,
-                    after_text=revised_content,
-                    revision_prompt=revision_prompt,
-                )
-                if semantic_checks is not None:
-                    semantic_checks.append(semantic_record)
-                if not semantic_record.passed:
-                    # Roll back unsafe revisions, then attempt one fallback section rewrite.
-                    if decision_trace is not None:
-                        decision_trace.append({
-                            "section_type": sf.section_type,
-                            "decision": "rollback_revision",
-                            "reason": semantic_record.summary,
-                            "risks": semantic_record.risks,
-                        })
-                    fallback_content = await self._revise_section(
-                        section_type=sf.section_type,
-                        current_content=before_content,
-                        revision_prompt=revision_prompt,
-                        metadata=metadata,
-                        memory=memory,
-                        task_contract=task_contract,
-                        valid_citation_keys=valid_citation_keys,
-                    )
-                    if fallback_content:
-                        fallback_content = self._fix_latex_references(fallback_content)
-                        fallback_content, _, _ = self._validate_and_fix_citations(
-                            fallback_content, valid_citation_keys, remove_invalid=True
-                        )
-                        fallback_semantic = await self._run_semantic_consistency_guard(
-                            section_type=sf.section_type,
-                            before_text=before_content,
-                            after_text=fallback_content,
-                            revision_prompt=revision_prompt,
-                        )
-                        if semantic_checks is not None:
-                            semantic_checks.append(fallback_semantic)
-                        if fallback_semantic.passed:
-                            revised_content = fallback_content
-                            if decision_trace is not None:
-                                decision_trace.append({
-                                    "section_type": sf.section_type,
-                                    "decision": "accept_fallback_section_rewrite",
-                                    "reason": fallback_semantic.summary,
-                                })
-                        else:
-                            if decision_trace is not None:
-                                decision_trace.append({
-                                    "section_type": sf.section_type,
-                                    "decision": "keep_original_after_failed_semantic_checks",
-                                    "reason": fallback_semantic.summary,
-                                    "risks": fallback_semantic.risks,
-                                })
-                            continue
-                    else:
-                        continue
-                
-                generated_sections[sf.section_type] = revised_content
-                new_word_count = len(revised_content.split())
-                if writer_response_section is not None:
-                    writer_response_section.append({
-                        "target_id": sf.target_id or sf.section_type,
-                        "section_type": sf.section_type,
-                        "target": task_contract["target"],
-                        "instruction": task_contract["instruction"],
-                        "constraints": task_contract["constraints"],
-                        "disposition": "executed",
-                        "source_agent": "writer",
-                        "evidence": {
-                            "before_words": len(before_content.split()),
-                            "after_words": new_word_count,
-                        },
-                    })
-                if writer_response_paragraph is not None:
-                    final_paragraphs = self._split_section_paragraphs(revised_content)
-                    final_para_count = len(final_paragraphs)
-                    for pidx in (sf.target_paragraphs or []):
-                        mapped_to: List[int] = []
-                        mapping_strategy = "identity"
-                        if 0 <= int(pidx) < final_para_count:
-                            mapped_to = [int(pidx)]
-                        elif final_para_count > 0:
-                            mapped_to = [min(max(int(pidx), 0), final_para_count - 1)]
-                            mapping_strategy = "clamped_nearest"
-                        else:
-                            mapping_strategy = "no_paragraphs"
-                        writer_response_paragraph.append({
-                            "target_id": f"{sf.section_type}.p{int(pidx)}",
-                            "section_type": sf.section_type,
-                            "paragraph_index": int(pidx),
-                            "target": f"{sf.section_type}.p{int(pidx)}",
-                            "disposition": "executed",
-                            "instruction": str((task_contract.get("paragraph_instructions", {}) or {}).get(int(pidx), "")),
-                            "constraints": task_contract["constraints"],
-                            "source_agent": "writer",
-                            "evidence": {
-                                "content_changed": True,
-                                "mapped_to_paragraph_indices": mapped_to,
-                                "mapping_strategy": mapping_strategy,
-                                "final_paragraph_count": final_para_count,
-                            },
-                        })
-                if reviewer_verification is not None:
-                    verify_result: Dict[str, Any] = {
-                        "section_type": sf.section_type,
-                        "target": task_contract["target"],
-                        "passed": semantic_record.passed,
-                        "summary": semantic_record.summary,
-                        "checker": "reviewer_verifier",
-                    }
-                    if hasattr(self._reviewer, "verify_execution"):
-                        try:
-                            verify_result = await self._reviewer.verify_execution(
-                                section_type=sf.section_type,
-                                task_contract=task_contract,
-                                before_text=before_content,
-                                after_text=revised_content,
-                                semantic_passed=semantic_record.passed,
-                                semantic_summary=semantic_record.summary,
-                            )
-                        except Exception:
-                            pass
-                    reviewer_verification.append(verify_result)
-                
-                for sr in sections_results:
-                    if sr.section_type == sf.section_type:
-                        sr.latex_content = revised_content
-                        sr.word_count = new_word_count
-                        break
-                
-                revised_sections.add(sf.section_type)
-                print(f"[MetaDataAgent] Revised {sf.section_type}: {new_word_count} words")
-        
-        return revised_sections
+        """Delegation stub — see revision_executor.py."""
+        return await self._executor._apply_revisions(
+            review_result=review_result,
+            generated_sections=generated_sections,
+            sections_results=sections_results,
+            valid_citation_keys=valid_citation_keys,
+            metadata=metadata,
+            memory=memory,
+            semantic_checks=semantic_checks,
+            decision_trace=decision_trace,
+            writer_response_section=writer_response_section,
+            writer_response_paragraph=writer_response_paragraph,
+            reviewer_verification=reviewer_verification,
+        )
 
     @staticmethod
     def _split_section_paragraphs(content: str) -> List[str]:
-        """
-        Split section content into paragraph units.
-        - **Description**:
-            - Uses blank lines as paragraph boundaries
-            - Preserves paragraph order for stable paragraph IDs
-        """
-        if not content:
-            return []
-        return [p.strip() for p in re.split(r"\n\s*\n", content) if p.strip()]
+        """Delegation stub — see revision_executor.py."""
+        return RevisionExecutor._split_section_paragraphs(content)
 
     @staticmethod
     def _join_section_paragraphs(paragraphs: List[str]) -> str:
-        """Join paragraph units back into section LaTeX text."""
-        return "\n\n".join([p for p in paragraphs if p is not None]).strip()
+        """Delegation stub — see revision_executor.py."""
+        return RevisionExecutor._join_section_paragraphs(paragraphs)
 
     async def _revise_section_paragraphs(
         self,
@@ -6487,100 +5017,42 @@ class MetaDataAgent(ReActAgent):
         task_contract_base: Optional[Dict[str, Any]] = None,
         valid_citation_keys: Optional[set] = None,
     ) -> Optional[str]:
-        """
-        Revise selected paragraphs, then reassemble the section.
-        - **Description**:
-            - Applies targeted paragraph-level revision prompts
-            - Falls back to whole-section revision if paragraph pass fails
-        """
-        paragraphs = self._split_section_paragraphs(current_content)
-        if not paragraphs:
-            return await self._revise_section(
-                section_type=section_type,
-                current_content=current_content,
-                revision_prompt=fallback_prompt,
-                metadata=metadata,
-                memory=memory,
-                task_contract=task_contract_base,
-                valid_citation_keys=valid_citation_keys,
-            )
-
-        revised_any = False
-        for pidx in sorted(set(target_paragraphs)):
-            if pidx < 0 or pidx >= len(paragraphs):
-                continue
-            instruction = paragraph_instructions.get(
-                pidx,
-                "Improve this paragraph according to reviewer feedback while preserving factual correctness.",
-            )
-            revised_paragraph = await self._revise_paragraph(
-                section_type=section_type,
-                paragraph_index=pidx,
-                paragraph_text=paragraphs[pidx],
-                instruction=instruction,
-                memory=memory,
-                task_contract=task_contract_base,
-                valid_citation_keys=valid_citation_keys,
-            )
-            if revised_paragraph and revised_paragraph.strip():
-                paragraphs[pidx] = revised_paragraph.strip()
-                revised_any = True
-
-        if revised_any:
-            return self._join_section_paragraphs(paragraphs)
-
-        # Fallback to section-level rewrite if paragraph-level pass yields no change.
-        return await self._revise_section(
+        """Delegation stub — see revision_executor.py."""
+        return await self._executor._revise_section_paragraphs(
             section_type=section_type,
             current_content=current_content,
-            revision_prompt=fallback_prompt,
+            target_paragraphs=target_paragraphs,
+            paragraph_instructions=paragraph_instructions,
+            fallback_prompt=fallback_prompt,
             metadata=metadata,
             memory=memory,
-            task_contract=task_contract_base,
+            task_contract_base=task_contract_base,
             valid_citation_keys=valid_citation_keys,
         )
-    
+
+    async def _revise_section_sentences(
+        self,
+        section_type: str,
+        current_content: str,
+        sentence_feedbacks: List[Dict[str, Any]],
+        metadata: PaperMetaData,
+        memory: Optional[SessionMemory] = None,
+        valid_citation_keys: Optional[set] = None,
+    ) -> Optional[str]:
+        """Delegation stub — see revision_executor.py."""
+        return await self._executor._revise_section_sentences(
+            section_type=section_type,
+            current_content=current_content,
+            sentence_feedbacks=sentence_feedbacks,
+            metadata=metadata,
+            memory=memory,
+            valid_citation_keys=valid_citation_keys,
+        )
+
     def _get_sections_fingerprint(self, sections: Dict[str, str]) -> str:
-        """
-        Build a stable fingerprint for section content.
-        - **Description**:
-            - Generates a hash string from section contents
-            - Used to detect no-op revisions
-        
-        - **Args**:
-            - `sections` (Dict[str, str]): Section contents
-        
-        - **Returns**:
-            - `fingerprint` (str): SHA-256 fingerprint
-        """
-        import hashlib
-        hasher = hashlib.sha256()
-        for section_type in sorted(sections.keys()):
-            hasher.update(section_type.encode("utf-8"))
-            hasher.update(b"\n")
-            hasher.update(sections[section_type].encode("utf-8"))
-            hasher.update(b"\n")
-        return hasher.hexdigest()
-
-    @staticmethod
-    def _compute_config_hash(metadata: "PaperMetaData") -> str:
-        """
-        Compute an integrity hash from metadata for checkpoint validation.
-
-        - **Args**:
-            - `metadata` (PaperMetaData): Paper metadata
-
-        - **Returns**:
-            - `str`: SHA-256 hex digest
-        """
-        import hashlib
-        hasher = hashlib.sha256()
-        hasher.update(metadata.title.encode("utf-8"))
-        hasher.update((metadata.style_guide or "").encode("utf-8"))
-        hasher.update(metadata.idea_hypothesis.encode("utf-8"))
-        hasher.update(metadata.method.encode("utf-8"))
-        return hasher.hexdigest()
-
+        """Delegation stub — see revision_executor.py."""
+        return self._executor._get_sections_fingerprint(sections=sections)
+    
     async def _run_review_orchestration(
         self,
         generated_sections: Dict[str, str],
@@ -6598,859 +5070,28 @@ class MetaDataAgent(ReActAgent):
         target_pages: Optional[int],
         paper_dir: Optional[Path],
         memory: Optional[SessionMemory] = None,
-        emitter: Optional[ProgressEmitter] = None,
-        feedback_queue: Optional[asyncio.Queue] = None,
-        feedback_timeout: float = 300.0,
-        progress_callback: Optional[ProgressCallback] = None,
-        enable_user_feedback: bool = False,
-        ref_pool: Optional[Any] = None,
-        artifacts_prefix: str = "",
+        evidence_dag: Optional[EvidenceDAG] = None,
     ) -> Tuple[Dict[str, str], List[SectionResult], int, Optional[int], Optional[str], List[str]]:
-        """
-        Run unified review orchestration across reviewer and VLM.
-        - **Description**:
-            - Executes reviewer checks and VLM review in a single loop
-            - Applies revisions, recompiles, and rechecks until pass or limit
-        
-        - **Args**:
-            - `generated_sections` (Dict[str, str]): Section contents
-            - `sections_results` (List[SectionResult]): Section result list
-            - `metadata` (PaperMetaData): Paper metadata
-            - `parsed_refs` (List[Dict[str, Any]]): Parsed references
-            - `paper_plan` (Optional[PaperPlan]): Paper plan with targets
-            - `template_path` (Optional[str]): Template path for PDF
-            - `figures_source_dir` (Optional[str]): Figure source directory
-            - `converted_tables` (Dict[str, str]): Converted table LaTeX
-            - `max_review_iterations` (int): Maximum review iterations
-            - `enable_review` (bool): Enable ReviewerAgent checks
-            - `compile_pdf` (bool): Compile PDF if template_path is provided
-            - `enable_vlm_review` (bool): Enable VLM-based PDF review
-            - `target_pages` (Optional[int]): Target page count
-            - `paper_dir` (Optional[Path]): Output directory
-        
-        - **Returns**:
-            - `generated_sections` (Dict[str, str]): Updated sections
-            - `sections_results` (List[SectionResult]): Updated results
-            - `review_iterations` (int): Iteration count used
-            - `target_word_count` (Optional[int]): Target word count from reviewer
-            - `pdf_path` (Optional[str]): Latest compiled PDF path
-            - `errors` (List[str]): Orchestration errors
-        """
-        if emitter is None:
-            emitter = ProgressEmitter(None)
-        errors: List[str] = []
-        review_iterations = 0
-        target_word_count = None
-        pdf_path = None
-        last_fingerprint = self._get_sections_fingerprint(generated_sections)
-        last_compiled_fingerprint = last_fingerprint  # track what was last compiled
-        last_vlm_result = None
-
-        if enable_user_feedback:
-            max_review_iterations = max(max_review_iterations, 99)
-
-        if enable_review:
-            label = "Review loop (user-controlled)" if enable_user_feedback else f"Review loop (max {max_review_iterations} iterations)"
-            await emitter.phase_start(Phase.REVIEW_LOOP, label)
-            print(f"[MetaDataAgent] Unified Review Loop (max {max_review_iterations} iterations, user_feedback={enable_user_feedback})...")
-        baseline_gap_audit = self._perform_baseline_gap_audit(
+        """Delegation stub — see orchestrator.py."""
+        return await self._orchestrator._run_review_orchestration(
             generated_sections=generated_sections,
+            sections_results=sections_results,
+            metadata=metadata,
+            parsed_refs=parsed_refs,
+            paper_plan=paper_plan,
+            template_path=template_path,
+            figures_source_dir=figures_source_dir,
+            converted_tables=converted_tables,
+            max_review_iterations=max_review_iterations,
             enable_review=enable_review,
+            compile_pdf=compile_pdf,
             enable_vlm_review=enable_vlm_review,
+            target_pages=target_pages,
+            paper_dir=paper_dir,
+            memory=memory,
+            evidence_dag=evidence_dag,
         )
-        if memory is not None:
-            memory.log(
-                "metadata",
-                "review_init",
-                "baseline_gap_audit",
-                narrative="Captured baseline capability-gap audit for LLM enhancement rollout.",
-                audit=baseline_gap_audit,
-            )
-        
-        for iteration in range(max_review_iterations):
-            review_iterations = iteration + 1
-            await emitter.review_start(iteration=review_iterations, max_iterations=max_review_iterations)
-            iteration_decision_trace: List[Dict[str, Any]] = []
-            iteration_conflicts: List[ConflictResolutionRecord] = []
-            iteration_semantic_checks: List[SemanticCheckRecord] = []
-            iteration_revision_plan: List[Dict[str, Any]] = []
-            iteration_writer_response_section: List[Dict[str, Any]] = []
-            iteration_writer_response_paragraph: List[Dict[str, Any]] = []
-            iteration_reviewer_verification: List[Dict[str, Any]] = []
-            print(f"[MetaDataAgent] Review iteration {review_iterations}/{max_review_iterations}")
-            print(
-                "[MetaDataAgent] Review context: "
-                f"target_pages={target_pages or 8} enable_review={enable_review} enable_vlm_review={enable_vlm_review}"
-            )
-            
-            word_counts = {
-                sr.section_type: sr.word_count
-                for sr in sections_results
-                if sr.status == "ok"
-            }
-            
-            review_result = ReviewResult(iteration=iteration)
-
-            # Reference coverage pass: proactively integrate uncited assigned refs.
-            ref_revised_sections: Set[str] = set()
-            if paper_plan:
-                ref_revised_sections = await self._enforce_reference_coverage(
-                    generated_sections=generated_sections,
-                    sections_results=sections_results,
-                    paper_plan=paper_plan,
-                    metadata=metadata,
-                    valid_ref_keys=self._extract_valid_citation_keys(parsed_refs),
-                    memory=memory,
-                    max_sections_to_revise=2,
-                )
-                if ref_revised_sections:
-                    if memory:
-                        memory.log(
-                            "metadata",
-                            f"review_iter_{review_iterations}",
-                            "reference_coverage_revised",
-                            narrative=(
-                                "Applied targeted revisions to improve citation coverage "
-                                f"in sections: {', '.join(sorted(ref_revised_sections))}."
-                            ),
-                            revised_sections=sorted(ref_revised_sections),
-                        )
-
-            if enable_review:
-                # Build section_targets from plan so Reviewer uses
-                # the same targets as the Planner (unified ratios).
-                section_targets = None
-                if paper_plan and paper_plan.sections:
-                    section_targets = {
-                        s.section_type: s.get_estimated_words()
-                        for s in paper_plan.sections
-                    }
-                section_structure_signals = None
-                if paper_plan and paper_plan.sections:
-                    section_structure_signals = {
-                        s.section_type: {
-                            "topic_clusters": list(s.topic_clusters or []),
-                            "transition_intents": list(s.transition_intents or []),
-                            "sectioning_recommended": bool(s.sectioning_recommended),
-                            "paragraph_count": len(s.paragraphs or []),
-                        }
-                        for s in paper_plan.sections
-                    }
-                await emitter.agent_step(agent="ReviewerAgent", iteration=review_iterations, description=f"Reviewing all sections (iteration {review_iterations})", phase=Phase.REVIEW_LOOP)
-                if progress_callback:
-                    set_llm_progress_context(progress_callback, "ReviewerAgent", Phase.REVIEW_LOOP)
-                reviewer_result, target_word_count = await self._call_reviewer(
-                    sections=generated_sections,
-                    word_counts=word_counts,
-                    target_pages=target_pages,
-                    style_guide=metadata.style_guide,
-                    template_path=template_path,
-                    iteration=iteration,
-                    section_targets=section_targets,
-                    section_structure_signals=section_structure_signals,
-                    memory=memory,
-                )
-                clear_llm_progress_context()
-                if reviewer_result is None:
-                    print("[MetaDataAgent] Reviewer not available, skipping content review")
-                else:
-                    review_result = ReviewResult(**reviewer_result)
-                    iteration_decision_trace.append({
-                        "source": "reviewer_orchestrator",
-                        "summary": review_result.orchestrator_summary or "Reviewer orchestration completed.",
-                        "num_tasks": len(review_result.revision_tasks),
-                    })
-                    # Build paragraph-level executable plan and project it to section feedbacks.
-                    iteration_revision_plan = await self._llm_plan_revision_tasks(review_result)
-                    self._apply_revision_plan_to_feedbacks(review_result, iteration_revision_plan)
-                    print(
-                        "[Reviewer] Result: "
-                        f"passed={review_result.passed} "
-                        f"sections_to_revise={list(review_result.requires_revision.keys())}"
-                    )
-                    await emitter.review_result(
-                        iteration=review_iterations,
-                        passed=review_result.passed,
-                        issues_count=len(review_result.feedbacks),
-                        summary=review_result.orchestrator_summary or "",
-                        revision_tasks=[
-                            {"target": t.target_id or t.section_type, "instruction": t.instruction[:200]}
-                            for t in review_result.revision_tasks[:10]
-                        ] if review_result.revision_tasks else None,
-                    )
-
-                    # User feedback injection point
-                    if enable_user_feedback and not review_result.passed:
-                        # Compile PDF before pausing so the user can preview it
-                        if compile_pdf and template_path and paper_dir:
-                            await emitter.compile_start(iteration=review_iterations)
-                            pre_fb_dir = paper_dir / f"iteration_{review_iterations:02d}"
-                            pre_fb_dir.mkdir(parents=True, exist_ok=True)
-                            figure_base_path = os.getcwd()
-                            figure_paths = self._collect_figure_paths(metadata.figures, base_path=figure_base_path)
-                            pre_fb_pdf, _, _, _ = await self._compile_pdf(
-                                generated_sections=generated_sections,
-                                template_path=template_path,
-                                references=parsed_refs,
-                                output_dir=pre_fb_dir,
-                                paper_title=metadata.title,
-                                figures_source_dir=figures_source_dir,
-                                figure_paths=figure_paths,
-                                converted_tables=converted_tables,
-                                paper_plan=paper_plan,
-                                figures=metadata.figures,
-                                metadata_tables=metadata.tables,
-                            )
-                            if pre_fb_pdf:
-                                pdf_path = pre_fb_pdf
-                                await emitter.compile_complete(success=True, pdf_path=pdf_path)
-                                _sa_pre = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
-                                await _sa_pre(paper_dir, "output.pdf",
-                                              Path(pre_fb_pdf).read_bytes(), emitter, "output", "Paper PDF")
-                            else:
-                                await emitter.compile_complete(success=False, pdf_path=None)
-
-                        # Save intermediate artifacts so FileTree is populated
-                        if paper_dir:
-                            _sa_pre = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
-                            latex_content = self._assemble_paper(
-                                title=metadata.title,
-                                sections=generated_sections,
-                                references=parsed_refs,
-                                valid_citation_keys=self._extract_valid_citation_keys(parsed_refs),
-                            )
-                            await _sa_pre(paper_dir, "main.tex", latex_content, emitter, "root", "Main LaTeX")
-                            if ref_pool:
-                                await _sa_pre(paper_dir, "references.bib",
-                                              ref_pool.to_bibtex(), emitter, "references", "References BibTeX")
-                            for sec_type, sec_content in generated_sections.items():
-                                sec_label = sec_type.replace(" ", "_")
-                                await _sa_pre(paper_dir, f"sections/{sec_label}.tex",
-                                              sec_content, emitter, "section", f"{sec_label}.tex")
-                            if pre_fb_dir and pre_fb_dir.is_dir():
-                                await self._save_compilation_output(
-                                    pre_fb_dir, paper_dir, emitter, artifacts_prefix,
-                                )
-
-                        sections_status_map = {
-                            sr.section_type: {
-                                "word_count": sr.word_count,
-                                "status": sr.status,
-                            }
-                            for sr in sections_results if sr.status == "ok"
-                        }
-                        sf_dicts = [sf.model_dump() for sf in review_result.section_feedbacks]
-                        rt_dicts = [
-                            {"target": t.target_id or t.section_type, "instruction": t.instruction}
-                            for t in review_result.revision_tasks
-                        ]
-                        from .models import ReviewCheckpoint
-                        checkpoint = ReviewCheckpoint(
-                            task_id="",
-                            generated_sections=generated_sections,
-                            sections_results=sections_results,
-                            review_result=review_result.model_dump(),
-                            metadata=metadata.model_dump(),
-                            paper_plan=paper_plan.model_dump() if paper_plan and hasattr(paper_plan, "model_dump") else None,
-                            ref_pool=ref_pool.to_dict() if ref_pool else {},
-                            memory=memory.to_dict() if memory else {},
-                            converted_tables=converted_tables,
-                            review_iterations=review_iterations,
-                            max_review_iterations=max_review_iterations,
-                            target_word_count=target_word_count,
-                            pdf_path=str(pdf_path) if pdf_path else None,
-                            template_path=template_path,
-                            figures_source_dir=figures_source_dir,
-                            enable_review=enable_review,
-                            compile_pdf=compile_pdf,
-                            enable_vlm_review=enable_vlm_review,
-                            target_pages=target_pages,
-                            paper_dir=str(paper_dir) if paper_dir else None,
-                            last_vlm_result=last_vlm_result,
-                            config_hash=self._compute_config_hash(metadata),
-                        )
-                        ckpt_path = None
-                        if paper_dir:
-                            ckpt_dir = Path(paper_dir) / "checkpoints"
-                            ckpt_dir.mkdir(parents=True, exist_ok=True)
-                            ckpt_path = ckpt_dir / f"checkpoint_{review_iterations}.json"
-                            ckpt_path.write_text(
-                                checkpoint.model_dump_json(indent=2),
-                                encoding="utf-8",
-                            )
-                            print(f"[ReviewLoop] Checkpoint saved: {ckpt_path}")
-
-                        await emitter.review_feedback_request(
-                            iteration=review_iterations,
-                            review_summary=review_result.orchestrator_summary or "",
-                            sections_status=sections_status_map,
-                            requires_revision={k: v for k, v in review_result.requires_revision.items()},
-                            section_feedbacks=sf_dicts,
-                            revision_tasks=rt_dicts,
-                            current_sections=dict(generated_sections),
-                            checkpoint_path=str(ckpt_path) if ckpt_path else None,
-                        )
-                        return (
-                            generated_sections,
-                            sections_results,
-                            review_iterations,
-                            target_word_count,
-                            str(pdf_path) if pdf_path else None,
-                            [f"__paused_for_feedback__:{ckpt_path or ''}"],
-                        )
-                    elif feedback_queue is not None and not review_result.passed:
-                        sections_status_map = {
-                            sr.section_type: {
-                                "word_count": sr.word_count,
-                                "status": sr.status,
-                            }
-                            for sr in sections_results if sr.status == "ok"
-                        }
-                        await emitter.review_feedback_request(
-                            iteration=review_iterations,
-                            review_summary=review_result.orchestrator_summary or "",
-                            sections_status=sections_status_map,
-                        )
-                        try:
-                            user_feedback = await asyncio.wait_for(
-                                feedback_queue.get(), timeout=feedback_timeout
-                            )
-                            fb_action = user_feedback.get("action", "continue")
-                            fb_text = user_feedback.get("feedback_text", "")
-                            await emitter.review_feedback_received(
-                                feedback_text=fb_text, action=fb_action
-                            )
-                            if fb_action == "accept":
-                                review_result.passed = True
-                                print("[ReviewLoop] User accepted current state")
-                            elif fb_action == "stop":
-                                print("[ReviewLoop] User requested stop")
-                                break
-                            elif fb_text:
-                                targets = user_feedback.get("section_targets", [])
-                                for tgt in (targets or list(review_result.requires_revision.keys())[:2]):
-                                    review_result.revision_tasks.append(
-                                        RevisionTask(
-                                            section_type=tgt,
-                                            target_id=tgt,
-                                            instruction=f"User feedback: {fb_text}",
-                                        )
-                                    )
-                        except asyncio.TimeoutError:
-                            print("[ReviewLoop] Feedback timeout, proceeding automatically")
-
-                    # Conflict resolution: if the previous VLM iteration detected
-                    # page overflow, suppress any Reviewer "expand" feedback.
-                    # Page limits are a hard constraint; word count targets are soft.
-                    if last_vlm_result and last_vlm_result.get("needs_trim"):
-                        suppressed = [
-                            sf.section_type
-                            for sf in review_result.section_feedbacks
-                            if sf.action == "expand"
-                        ]
-                        if suppressed:
-                            review_result.section_feedbacks = [
-                                sf for sf in review_result.section_feedbacks
-                                if sf.action != "expand"
-                            ]
-                            for sec in suppressed:
-                                review_result.requires_revision.pop(sec, None)
-                            print(
-                                f"[ReviewLoop] Suppressed Reviewer 'expand' for "
-                                f"{suppressed} (VLM overflow active)"
-                            )
-            
-            reviewer_revised_sections = await self._apply_revisions(
-                review_result=review_result,
-                generated_sections=generated_sections,
-                sections_results=sections_results,
-                valid_citation_keys=self._extract_valid_citation_keys(parsed_refs),
-                metadata=metadata,
-                memory=memory,
-                semantic_checks=iteration_semantic_checks,
-                decision_trace=iteration_decision_trace,
-                writer_response_section=iteration_writer_response_section,
-                writer_response_paragraph=iteration_writer_response_paragraph,
-                reviewer_verification=iteration_reviewer_verification,
-            )
-            if reviewer_revised_sections:
-                print(f"[ReviewLoop] Reviewer revised: {sorted(reviewer_revised_sections)}")
-                for rev_sec in reviewer_revised_sections:
-                    await emitter.revision_applied(
-                        section_type=rev_sec,
-                        iteration=review_iterations,
-                    )
-                    if paper_dir and rev_sec in generated_sections:
-                        _plan_titles = paper_plan.get_section_titles() if paper_plan else {}
-                        sec_label = _plan_titles.get(rev_sec, rev_sec.replace("_", " ").title())
-                        _sa_review = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
-                        await _sa_review(paper_dir, f"sections/{sec_label}.tex",
-                                         generated_sections[rev_sec], emitter, "section", f"{sec_label}.tex")
-            self._resolve_section_feedbacks(
-                section_feedbacks=review_result.section_feedbacks,
-                revised_sections=reviewer_revised_sections,
-                review_result=review_result,
-            )
-            word_counts = {
-                sr.section_type: sr.word_count
-                for sr in sections_results
-                if sr.status == "ok"
-            }
-            print(f"[ReviewLoop] Word counts: {word_counts}")
-            
-            # Compile PDF and run VLM review if enabled
-            compile_succeeded = False
-            last_compiled_fingerprint = self._get_sections_fingerprint(generated_sections)
-            if compile_pdf and template_path and paper_dir:
-                await emitter.compile_start(iteration=review_iterations)
-                iteration_dir = paper_dir / f"iteration_{review_iterations:02d}"
-                iteration_dir.mkdir(parents=True, exist_ok=True)
-                print(f"[ReviewLoop] PDF output dir: {iteration_dir}")
-                figure_base_path = os.getcwd()
-                figure_paths = self._collect_figure_paths(metadata.figures, base_path=figure_base_path)
-                pdf_result_path, _, compile_errors, section_errors = await self._compile_pdf(
-                    generated_sections=generated_sections,
-                    template_path=template_path,
-                    references=parsed_refs,
-                    output_dir=iteration_dir,
-                    paper_title=metadata.title,
-                    figures_source_dir=figures_source_dir,
-                    figure_paths=figure_paths,
-                    converted_tables=converted_tables,
-                    paper_plan=paper_plan,
-                    figures=metadata.figures,
-                    metadata_tables=metadata.tables,
-                )
-                if pdf_result_path:
-                    pdf_path = pdf_result_path
-                    compile_succeeded = True
-                    await emitter.compile_complete(success=True, pdf_path=pdf_path)
-                else:
-                    # Compilation failed -> treat as review feedback, not a hard exit
-                    print(f"[ReviewLoop] PDF compilation failed, treating as Typesetter review feedback")
-                    ts_feedbacks, ts_section_feedbacks = self._build_typesetter_feedback(
-                        compile_errors=compile_errors,
-                        section_errors=section_errors,
-                        generated_sections=generated_sections,
-                    )
-                    for fb in ts_feedbacks:
-                        review_result.add_feedback(fb)
-                    
-                    # Merge typesetter section feedbacks
-                    merged_seed = self._merge_section_feedbacks(
-                        review_result.section_feedbacks,
-                        ts_section_feedbacks,
-                        prefer_vlm=False,  # Typesetter fixes take priority via action="fix_latex"
-                    )
-                    merged_section_feedbacks, ts_conflicts = await self._resolve_conflicts_with_llm(
-                        reviewer_feedbacks=review_result.section_feedbacks,
-                        external_feedbacks=merged_seed,
-                    )
-                    iteration_conflicts.extend(ts_conflicts)
-                    review_result.section_feedbacks = merged_section_feedbacks
-                    for sf in ts_section_feedbacks:
-                        review_result.add_section_revision(sf.section_type, "Typesetter LaTeX fix")
-                    
-                    review_result.passed = False
-                    # Skip VLM review this iteration (no PDF to review)
-                
-                if compile_succeeded and enable_vlm_review and pdf_path:
-                    print(f"[MetaDataAgent] VLM Review: pdf_path={pdf_path}")
-                    last_vlm_result = await self._call_vlm_review(
-                        pdf_path=pdf_path,
-                        page_limit=target_pages or 8,
-                        template_type=metadata.style_guide or "ICML",
-                        sections_info={
-                            sr.section_type: {"word_count": sr.word_count}
-                            for sr in sections_results if sr.word_count
-                        },
-                        memory=memory,
-                    )
-                    if last_vlm_result:
-                        print(
-                            "[VLMReview] Result: "
-                            f"passed={last_vlm_result.get('passed', False)} "
-                            f"overflow_pages={last_vlm_result.get('overflow_pages', 0)} "
-                            f"needs_trim={last_vlm_result.get('needs_trim', False)} "
-                            f"needs_expand={last_vlm_result.get('needs_expand', False)} "
-                            f"sections={list((last_vlm_result.get('section_recommendations') or {}).keys())}"
-                        )
-                        
-                        # ==========================================================
-                        # Smart page-limit control: plan & execute structural actions
-                        # BEFORE building VLM feedback so context is in prompts
-                        # ==========================================================
-                        planned_structural_actions: List[StructuralAction] = []
-                        if last_vlm_result.get("needs_trim"):
-                            overflow = last_vlm_result.get("overflow_pages", 0)
-                            if overflow > 0:
-                                section_order = list(generated_sections.keys())
-                                if paper_plan and paper_plan.sections:
-                                    section_order = [s.section_type for s in paper_plan.sections]
-                                
-                                planned_structural_actions = self._plan_overflow_strategy(
-                                    overflow_pages=overflow,
-                                    generated_sections=generated_sections,
-                                    paper_plan=paper_plan,
-                                    figures=metadata.figures,
-                                )
-                                if planned_structural_actions:
-                                    self._execute_structural_actions(
-                                        planned_structural_actions,
-                                        generated_sections,
-                                        section_order,
-                                    )
-                                    # Update sections_results after structural changes
-                                    for sr in sections_results:
-                                        if sr.section_type in generated_sections:
-                                            sr.latex_content = generated_sections[sr.section_type]
-                                            sr.word_count = len(generated_sections[sr.section_type].split())
-                                    print(
-                                        f"[ReviewLoop] Structural actions applied: "
-                                        f"{len(planned_structural_actions)} actions, "
-                                        f"total estimated savings ~"
-                                        f"{sum(a.estimated_savings for a in planned_structural_actions):.1f} pages"
-                                    )
-                        
-                        # Build VLM feedback with structural context baked in
-                        vlm_feedbacks, vlm_section_feedbacks = self._build_vlm_feedback(
-                            last_vlm_result,
-                            structural_actions=planned_structural_actions or None,
-                        )
-                        # LLM translation: VLM -> executable text/structure revision tasks
-                        translated_vlm_plan = await self._translate_vlm_to_revision_plan(
-                            vlm_result=last_vlm_result,
-                            generated_sections=generated_sections,
-                        )
-                        for p in translated_vlm_plan:
-                            st = str(p.get("section_type", ""))
-                            if not st:
-                                continue
-                            action = str(p.get("action", "ok"))
-                            delta = int(p.get("delta_words", 0) or 0)
-                            prompt = str(p.get("rationale", "")) or "Apply VLM-guided layout refinements."
-                            section_struct_actions = []
-                            if planned_structural_actions:
-                                section_struct_actions = [
-                                    f"{a.action_type}:{a.target_id}"
-                                    for a in planned_structural_actions
-                                    if a.section == st
-                                ]
-                            vlm_section_feedbacks.append(SectionFeedback(
-                                section_type=st,
-                                current_word_count=0,
-                                target_word_count=0,
-                                action=action,
-                                delta_words=delta,
-                                revision_prompt=prompt,
-                                structural_actions=section_struct_actions,
-                                target_paragraphs=self._normalize_target_paragraphs(
-                                    p.get("target_paragraphs", [])
-                                ),
-                                paragraph_instructions=self._normalize_paragraph_instructions(
-                                    p.get("paragraph_instructions", {}),
-                                    target_paragraphs=self._normalize_target_paragraphs(
-                                        p.get("target_paragraphs", [])
-                                    ),
-                                    fallback_instruction=prompt,
-                                ),
-                            ))
-                        if translated_vlm_plan:
-                            iteration_decision_trace.append({
-                                "source": "vlm_translator_llm",
-                                "summary": f"Translated {len(translated_vlm_plan)} VLM recommendation(s) into revision plan.",
-                            })
-                        for fb in vlm_feedbacks:
-                            review_result.add_feedback(fb)
-                        
-                        prefer_vlm = bool(last_vlm_result.get("needs_trim") or last_vlm_result.get("needs_expand"))
-                        merged_seed = self._merge_section_feedbacks(
-                            review_result.section_feedbacks,
-                            vlm_section_feedbacks,
-                            prefer_vlm=prefer_vlm,
-                        )
-                        merged_section_feedbacks, conflicts = await self._resolve_conflicts_with_llm(
-                            reviewer_feedbacks=review_result.section_feedbacks,
-                            external_feedbacks=merged_seed,
-                        )
-                        iteration_conflicts.extend(conflicts)
-                        review_result.section_feedbacks = merged_section_feedbacks
-                        for sf in review_result.section_feedbacks:
-                            if sf.section_type in word_counts:
-                                sf.current_word_count = word_counts.get(sf.section_type, 0)
-                            if paper_plan:
-                                section_plan = paper_plan.get_section(sf.section_type)
-                                if section_plan:
-                                    est = section_plan.get_estimated_words()
-                                    if est > 0:
-                                        sf.target_word_count = est
-                        
-                        for sf in merged_section_feedbacks:
-                            if sf.action != "ok":
-                                review_result.add_section_revision(sf.section_type, "VLM adjustment")
-                    else:
-                        print("[MetaDataAgent] VLM review unavailable, skipping")
-            elif enable_vlm_review:
-                errors.append("VLM review skipped: PDF not compiled (missing template or output path)")
-            
-            # Apply revisions from VLM feedback and/or Typesetter LaTeX-fix feedback
-            post_compile_revised = await self._apply_revisions(
-                review_result=review_result,
-                generated_sections=generated_sections,
-                sections_results=sections_results,
-                valid_citation_keys=self._extract_valid_citation_keys(parsed_refs),
-                metadata=metadata,
-                memory=memory,
-                semantic_checks=iteration_semantic_checks,
-                decision_trace=iteration_decision_trace,
-                writer_response_section=iteration_writer_response_section,
-                writer_response_paragraph=iteration_writer_response_paragraph,
-                reviewer_verification=iteration_reviewer_verification,
-            )
-            if post_compile_revised:
-                sources = "VLM/Typesetter" if not compile_succeeded else "VLM"
-                print(f"[ReviewLoop] {sources} revised: {sorted(post_compile_revised)}")
-                for rev_sec in post_compile_revised:
-                    if paper_dir and rev_sec in generated_sections:
-                        _plan_titles = paper_plan.get_section_titles() if paper_plan else {}
-                        sec_label = _plan_titles.get(rev_sec, rev_sec.replace("_", " ").title())
-                        _sa_review = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
-                        await _sa_review(paper_dir, f"sections/{sec_label}.tex",
-                                         generated_sections[rev_sec], emitter, "section", f"{sec_label}.tex")
-            self._resolve_section_feedbacks(
-                section_feedbacks=review_result.section_feedbacks,
-                revised_sections=post_compile_revised,
-                review_result=review_result,
-            )
-            review_result.conflict_resolution = iteration_conflicts
-            review_result.semantic_checks = iteration_semantic_checks
-            review_result.decision_trace = iteration_decision_trace
-            
-            # Record review iteration in session memory
-            if memory is not None:
-                # Build section feedback summary for the record
-                section_fb_dict = {}
-                for sf in review_result.section_feedbacks:
-                    section_fb_dict[sf.section_type] = {
-                        "action": sf.action,
-                        "delta_words": sf.delta_words,
-                        "target_paragraphs": sf.target_paragraphs,
-                        "paragraph_instructions": sf.paragraph_instructions,
-                        "paragraph_feedbacks": [
-                            pf.model_dump() if hasattr(pf, "model_dump") else pf
-                            for pf in (sf.paragraph_feedbacks if hasattr(sf, "paragraph_feedbacks") else [])
-                        ],
-                    }
-                agent_feedbacks: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-                for fb in review_result.feedbacks:
-                    agent_name = str(fb.checker_name or "reviewer")
-                    if agent_name not in agent_feedbacks:
-                        agent_feedbacks[agent_name] = {
-                            "document_feedbacks": [],
-                            "section_feedbacks": [],
-                            "paragraph_feedbacks": [],
-                            "sentence_feedbacks": [],
-                        }
-                    agent_feedbacks[agent_name]["document_feedbacks"].append({
-                        "level": "document",
-                        "agent": agent_name,
-                        "checker": fb.checker_name,
-                        "target_id": "document",
-                        "severity": fb.severity.value if hasattr(fb.severity, "value") else str(fb.severity),
-                        "issue_type": fb.suggested_action or fb.checker_name,
-                        "message": fb.message,
-                        "details": fb.details,
-                    })
-                for hf in (review_result.hierarchical_feedbacks or []):
-                    item = hf.model_dump() if hasattr(hf, "model_dump") else hf
-                    agent_name = str(item.get("agent", "reviewer"))
-                    item["source_agent"] = str(item.get("source_agent") or agent_name)
-                    item["source_stage"] = str(item.get("source_stage") or item["source_agent"])
-                    if agent_name not in agent_feedbacks:
-                        agent_feedbacks[agent_name] = {
-                            "document_feedbacks": [],
-                            "section_feedbacks": [],
-                            "paragraph_feedbacks": [],
-                            "sentence_feedbacks": [],
-                        }
-                    level = str(item.get("level", "section"))
-                    bucket = f"{level}_feedbacks"
-                    if bucket not in agent_feedbacks[agent_name]:
-                        bucket = "section_feedbacks"
-                    agent_feedbacks[agent_name][bucket].append(item)
-                for sf in review_result.section_feedbacks:
-                    source_agent = "reviewer"
-                    if sf.action == "fix_latex":
-                        source_agent = "typesetter"
-                    elif sf.structural_actions:
-                        source_agent = "vlm_review"
-                    elif "VLM" in (sf.revision_prompt or "") or "page limit" in (sf.revision_prompt or "").lower():
-                        source_agent = "vlm_review"
-                    if source_agent not in agent_feedbacks:
-                        agent_feedbacks[source_agent] = {
-                            "document_feedbacks": [],
-                            "section_feedbacks": [],
-                            "paragraph_feedbacks": [],
-                            "sentence_feedbacks": [],
-                        }
-                    sec_item = {
-                        "level": "section",
-                        "agent": source_agent,
-                        "source_agent": source_agent,
-                        "source_stage": source_agent,
-                        "checker": source_agent,
-                        "target_id": sf.target_id or sf.section_type,
-                        "section_type": sf.section_type,
-                        "severity": "warning",
-                        "issue_type": sf.action,
-                        "message": sf.revision_prompt[:400],
-                        "target_paragraphs": sf.target_paragraphs,
-                    }
-                    agent_feedbacks[source_agent]["section_feedbacks"].append(sec_item)
-                    for pf in sf.paragraph_feedbacks or []:
-                        pf_item = pf.model_dump() if hasattr(pf, "model_dump") else pf
-                        agent_feedbacks[source_agent]["paragraph_feedbacks"].append({
-                            "level": "paragraph",
-                            "agent": source_agent,
-                            "source_agent": source_agent,
-                            "source_stage": source_agent,
-                            "checker": source_agent,
-                            "target_id": f"{sf.section_type}.p{pf_item.get('paragraph_index', 0)}",
-                            "section_type": sf.section_type,
-                            "paragraph_index": pf_item.get("paragraph_index", 0),
-                            "severity": str(pf_item.get("severity", "warning")),
-                            "issue_type": sf.action,
-                            "message": "; ".join(pf_item.get("issues", []))[:400],
-                            "suggestion": pf_item.get("suggestion", ""),
-                        })
-                actions_taken = sorted(
-                    reviewer_revised_sections | post_compile_revised
-                )
-                lifecycle_result = memory.update_issue_lifecycle(
-                    iteration=review_iterations,
-                    hierarchical_feedbacks=[
-                        hf.model_dump() if hasattr(hf, "model_dump") else hf
-                        for hf in (review_result.hierarchical_feedbacks or [])
-                    ],
-                    writer_response_section=iteration_writer_response_section,
-                    writer_response_paragraph=iteration_writer_response_paragraph,
-                )
-                word_snapshot = {
-                    sr.section_type: sr.word_count
-                    for sr in sections_results if sr.status == "ok"
-                }
-                record = ReviewRecord(
-                    iteration=review_iterations,
-                    reviewer="unified",
-                    passed=review_result.passed,
-                    feedback_summary="; ".join(
-                        f.message for f in review_result.feedbacks if not f.passed
-                    )[:500],
-                    section_feedbacks=section_fb_dict,
-                    hierarchical_feedbacks=[
-                        hf.model_dump() if hasattr(hf, "model_dump") else hf
-                        for hf in (review_result.hierarchical_feedbacks or [])
-                    ],
-                    agent_feedbacks=agent_feedbacks,
-                    decision_trace=iteration_decision_trace + [
-                        dt if isinstance(dt, dict) else {"event": str(dt)}
-                        for dt in (review_result.decision_trace or [])
-                    ],
-                    revision_plan=iteration_revision_plan + [
-                        t.model_dump() if hasattr(t, "model_dump") else t
-                        for t in (review_result.revision_tasks or [])
-                    ],
-                    before_after_semantic_check=[
-                        s.model_dump() if hasattr(s, "model_dump") else s
-                        for s in iteration_semantic_checks
-                    ],
-                    conflict_resolution=[
-                        c.model_dump() if hasattr(c, "model_dump") else c
-                        for c in iteration_conflicts
-                    ],
-                    baseline_gap_audit=baseline_gap_audit,
-                    issue_lifecycle=lifecycle_result.get("issue_lifecycle", []),
-                    writer_response_section=iteration_writer_response_section,
-                    writer_response_paragraph=iteration_writer_response_paragraph,
-                    reviewer_verification=iteration_reviewer_verification,
-                    regression_report=lifecycle_result.get("regression_report", {}),
-                    actions_taken=[f"revised:{s}" for s in actions_taken],
-                    result_snapshot=word_snapshot,
-                )
-                memory.add_review(record)
-                review_narr = f"Review iteration {review_iterations}: "
-                if review_result.passed:
-                    review_narr += "All checks passed."
-                else:
-                    failed_msgs = [f.message for f in review_result.feedbacks if not f.passed]
-                    review_narr += f"Found {len(failed_msgs)} issue(s). "
-                    if failed_msgs:
-                        review_narr += failed_msgs[0][:150]
-                if actions_taken:
-                    review_narr += f" Revised sections: {', '.join(actions_taken)}."
-                memory.log("metadata", f"review_iter_{review_iterations}",
-                           "review_completed",
-                           narrative=review_narr,
-                           passed=review_result.passed,
-                           revised=actions_taken)
-                # Update memory sections with latest content
-                for stype, content in generated_sections.items():
-                    memory.update_section(stype, content)
-
-            current_fingerprint = self._get_sections_fingerprint(generated_sections)
-            if current_fingerprint == last_fingerprint:
-                if review_result.passed and (not last_vlm_result or last_vlm_result.get("passed", True)):
-                    print("[MetaDataAgent] Review passed with no further changes (fingerprint stable)")
-                elif not compile_succeeded:
-                    errors.append("LaTeX compilation failed and revisions did not change content")
-                    print("[MetaDataAgent] Exiting: compilation failed with no effective revisions (fingerprint stable)")
-                else:
-                    if last_vlm_result and not last_vlm_result.get("passed", True):
-                        errors.append(last_vlm_result.get("summary", "VLM review failed"))
-                        print("[MetaDataAgent] Exiting due to VLM failure with no changes")
-                break
-            
-            last_fingerprint = current_fingerprint
-            if not reviewer_revised_sections and not post_compile_revised and review_result.passed and (not last_vlm_result or last_vlm_result.get("passed", True)):
-                print("[MetaDataAgent] Exiting: no revisions needed and review passed")
-                break
-        
-        # =====================================================================
-        # Final compilation pass
-        # After the loop, revisions may have been applied (VLM/Typesetter)
-        # that were never compiled.  Run one more compile if content changed.
-        # =====================================================================
-        if compile_pdf and template_path and paper_dir:
-            final_fp = self._get_sections_fingerprint(generated_sections)
-            if final_fp != last_compiled_fingerprint:
-                print("[MetaDataAgent] Final pass: content changed since last compile — recompiling")
-                final_dir = paper_dir / f"iteration_{review_iterations:02d}_final"
-                final_dir.mkdir(parents=True, exist_ok=True)
-                figure_base_path = os.getcwd()
-                figure_paths = self._collect_figure_paths(metadata.figures, base_path=figure_base_path)
-                final_pdf, _, final_errors, _ = await self._compile_pdf(
-                    generated_sections=generated_sections,
-                    template_path=template_path,
-                    references=parsed_refs,
-                    output_dir=final_dir,
-                    paper_title=metadata.title,
-                    figures_source_dir=figures_source_dir,
-                    figure_paths=figure_paths,
-                    converted_tables=converted_tables,
-                    paper_plan=paper_plan,
-                    figures=metadata.figures,
-                    metadata_tables=metadata.tables,
-                )
-                if final_pdf:
-                    pdf_path = final_pdf
-                    print(f"[MetaDataAgent] Final pass compiled: {final_pdf}")
-                elif final_errors:
-                    errors.extend(final_errors)
-                    print(f"[MetaDataAgent] Final pass compile errors: {final_errors[:2]}")
-            else:
-                print("[MetaDataAgent] Final pass: no content changes since last compile — skipping")
-        
-        return generated_sections, sections_results, review_iterations, target_word_count, pdf_path, errors
+    
     
     async def _call_reviewer(
         self,
@@ -7463,60 +5104,21 @@ class MetaDataAgent(ReActAgent):
         section_targets: Optional[Dict[str, int]] = None,
         section_structure_signals: Optional[Dict[str, Any]] = None,
         memory: Optional[SessionMemory] = None,
+        evidence_dag: Optional[EvidenceDAG] = None,
     ) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
-        """
-        Call Reviewer Agent directly (no HTTP) to check the paper.
-        - **Description**:
-            - Builds a ReviewContext and calls self._reviewer.review() directly.
-            - Passes memory so checkers can read prior issues natively.
-
-        - **Returns**:
-            - Tuple of (review_result_dict, target_word_count) or (None, None) on failure
-        """
-        try:
-            from ..reviewer_agent.models import ReviewContext as RC
-
-            review_ctx = RC(
-                sections=sections,
-                word_counts=word_counts,
-                target_pages=target_pages or 8,
-                style_guide=style_guide,
-                template_path=template_path,
-                metadata={},
-            )
-            review_ctx.metadata["review_structure_gate_enabled"] = bool(
-                getattr(self.tools_config, "review_structure_gate_enabled", True)
-            ) if self.tools_config else True
-            review_ctx.metadata["structure_gate_min_paragraph_threshold"] = int(
-                getattr(self.tools_config, "structure_gate_min_paragraph_threshold", 5)
-            ) if self.tools_config else 5
-            if section_structure_signals:
-                review_ctx.metadata["section_structure_signals"] = section_structure_signals
-            if memory is not None:
-                review_ctx.metadata["issue_memory"] = memory.get_issue_context(limit=40)
-            if section_targets:
-                review_ctx.section_targets = section_targets
-
-            review_result = await self._reviewer.review(
-                context=review_ctx,
-                iteration=iteration,
-                memory=memory,
-            )
-
-            result = review_result.model_dump()
-
-            target_word_count = None
-            for fb in result.get("feedbacks", []):
-                details = fb.get("details", {})
-                if "target_words" in details:
-                    target_word_count = details["target_words"]
-                    break
-
-            return result, target_word_count
-
-        except Exception as e:
-            print(f"[MetaDataAgent] Review error: {e}")
-            return None, None
+        """Delegation stub — see revision_executor.py."""
+        return await self._executor._call_reviewer(
+            sections=sections,
+            word_counts=word_counts,
+            target_pages=target_pages,
+            style_guide=style_guide,
+            template_path=template_path,
+            iteration=iteration,
+            section_targets=section_targets,
+            section_structure_signals=section_structure_signals,
+            memory=memory,
+            evidence_dag=evidence_dag,
+        )
     
     async def _revise_section(
         self,
@@ -7528,101 +5130,16 @@ class MetaDataAgent(ReActAgent):
         task_contract: Optional[Dict[str, Any]] = None,
         valid_citation_keys: Optional[set] = None,
     ) -> Optional[str]:
-        """
-        Revise a section based on feedback — delegates to WriterAgent.
-        - **Description**:
-            - Packs the revision instructions + current content as a user_prompt
-              and delegates to WriterAgent, which can consult memory/planner/reviewer
-              via AskTool during the ReAct loop.
-
-        - **Args**:
-            - `section_type` (str): Type of section to revise
-            - `current_content` (str): Current section LaTeX content
-            - `revision_prompt` (str): Instructions for the revision
-            - `metadata` (PaperMetaData): Paper metadata for context
-            - `memory` (SessionMemory, optional): Session memory
-
-        - **Returns**:
-            - Revised content string, or None on failure
-        """
-        try:
-            system_prompt = (
-                "You are an expert academic writer revising a paper section.\n"
-                "Follow the revision instructions carefully to improve the content.\n"
-                "Maintain academic writing quality.\n"
-                "Output ONLY the revised LaTeX content, no explanations or preamble."
-            )
-
-            # Build user message with revision context from memory
-            revision_ctx = ""
-            if memory:
-                revision_ctx = memory.get_revision_context(section_type)
-                issue_ctx = memory.get_issue_context(limit=20)
-                unresolved = issue_ctx.get("unresolved_issues", [])
-                if unresolved:
-                    pinned = []
-                    for item in unresolved[:8]:
-                        if str(item.get("section_type", "")) in ("", section_type):
-                            pinned.append(
-                                f"- [{item.get('locked_mode', 'soft')}] {item.get('target_id', '')}: {str(item.get('message', ''))[:180]}"
-                            )
-                    if pinned:
-                        revision_ctx = (
-                            revision_ctx
-                            + ("\n\n" if revision_ctx else "")
-                            + "## Unresolved Memory Issues\n"
-                            + "\n".join(pinned)
-                        )
-
-            if "Current content" in revision_prompt or current_content in revision_prompt:
-                user_message = revision_prompt
-            else:
-                user_message = (
-                    f"{revision_prompt}\n\n"
-                    f"Current content of the {section_type} section to revise:\n"
-                    f"{current_content}"
-                )
-
-            if revision_ctx:
-                user_message = f"{revision_ctx}\n\n{user_message}"
-            # Strong citation preservation guard for revision mode.
-            user_message += (
-                "\n\nCitation guardrails:\n"
-                "- Preserve all existing valid \\cite{...} commands unless explicitly instructed to remove invalid ones.\n"
-                "- Do not drop citations during style or structure edits.\n"
-            )
-
-            result = await self._writer.run(
-                system_prompt=system_prompt,
-                user_prompt=user_message,
-                section_type=section_type,
-                enable_review=False,
-                valid_citation_keys=sorted(list(valid_citation_keys or [])),
-                mode="revision",
-                current_content=current_content,
-                revision_plan={
-                    **(task_contract or {}),
-                    "section_type": section_type,
-                    "target": str((task_contract or {}).get("target") or section_type),
-                    "target_level": "section",
-                    "instruction": str((task_contract or {}).get("instruction") or revision_prompt),
-                    "constraints": (
-                        (task_contract or {}).get("constraints")
-                        or {
-                            "preserve_claims": ["Preserve factual claims and citations."],
-                            "do_not_change": [],
-                        }
-                    ),
-                },
-                memory=memory,
-                peers={"planner": self._planner, "reviewer": self._reviewer},
-            )
-            revised = result.get("generated_content", "")
-            return revised if revised else None
-
-        except Exception as e:
-            print(f"[MetaDataAgent] Revision error for {section_type}: {e}")
-            return None
+        """Delegation stub — see revision_executor.py."""
+        return await self._executor._revise_section(
+            section_type=section_type,
+            current_content=current_content,
+            revision_prompt=revision_prompt,
+            metadata=metadata,
+            memory=memory,
+            task_contract=task_contract,
+            valid_citation_keys=valid_citation_keys,
+        )
 
     async def _revise_paragraph(
         self,
@@ -7634,84 +5151,13 @@ class MetaDataAgent(ReActAgent):
         task_contract: Optional[Dict[str, Any]] = None,
         valid_citation_keys: Optional[set] = None,
     ) -> Optional[str]:
-        """
-        Revise a single paragraph using WriterAgent.
-        - **Description**:
-            - Uses a focused prompt to avoid unnecessary edits to other paragraphs
-            - Returns revised paragraph text only
-        """
-        try:
-            system_prompt = (
-                "You are an expert academic editor revising one paragraph.\n"
-                "Keep the same scientific meaning and preserve LaTeX correctness.\n"
-                "Return ONLY the revised paragraph text."
-            )
-            revision_ctx = ""
-            if memory:
-                revision_ctx = memory.get_revision_context(section_type)
-                issue_ctx = memory.get_issue_context(limit=20)
-                unresolved = issue_ctx.get("unresolved_issues", [])
-                if unresolved:
-                    pinned = []
-                    for item in unresolved[:12]:
-                        target_id = str(item.get("target_id", ""))
-                        if target_id.endswith(f".p{paragraph_index}") or str(item.get("section_type", "")) == section_type:
-                            pinned.append(
-                                f"- [{item.get('locked_mode', 'soft')}] {target_id}: {str(item.get('message', ''))[:180]}"
-                            )
-                    if pinned:
-                        revision_ctx = (
-                            revision_ctx
-                            + ("\n\n" if revision_ctx else "")
-                            + "## Memory Issues For This Paragraph\n"
-                            + "\n".join(pinned)
-                        )
-
-            user_message = (
-                f"Section: {section_type}\n"
-                f"Paragraph index: {paragraph_index}\n"
-                f"Instruction: {instruction}\n\n"
-                f"Current paragraph:\n{paragraph_text}"
-            )
-            if revision_ctx:
-                user_message = f"{revision_ctx}\n\n{user_message}"
-            user_message += (
-                "\n\nCitation guardrails:\n"
-                "- Preserve existing valid citations in this paragraph.\n"
-                "- Only remove citations when they are explicitly marked invalid.\n"
-            )
-
-            result = await self._writer.run(
-                system_prompt=system_prompt,
-                user_prompt=user_message,
-                section_type=section_type,
-                enable_review=False,
-                valid_citation_keys=sorted(list(valid_citation_keys or [])),
-                mode="revision",
-                current_content=paragraph_text,
-                revision_plan={
-                    **(task_contract or {}),
-                    "section_type": section_type,
-                    "target": f"{section_type}.p{paragraph_index}",
-                    "target_level": "paragraph",
-                    "instruction": instruction,
-                    "constraints": (
-                        (task_contract or {}).get("constraints")
-                        or {
-                            "preserve_claims": ["Preserve the original scientific claim and evidence links."],
-                            "do_not_change": [],
-                        }
-                    ),
-                    "target_paragraphs": [paragraph_index],
-                    "paragraph_instructions": {paragraph_index: instruction},
-                },
-                memory=memory,
-                peers={"planner": self._planner, "reviewer": self._reviewer},
-            )
-            revised = result.get("generated_content", "")
-            return revised if revised else None
-        except Exception as e:
-            print(
-                f"[MetaDataAgent] Paragraph revision error for {section_type}.p{paragraph_index}: {e}"
-            )
-            return None
+        """Delegation stub — see revision_executor.py."""
+        return await self._executor._revise_paragraph(
+            section_type=section_type,
+            paragraph_index=paragraph_index,
+            paragraph_text=paragraph_text,
+            instruction=instruction,
+            memory=memory,
+            task_contract=task_contract,
+            valid_citation_keys=valid_citation_keys,
+        )

@@ -1,0 +1,25 @@
+Decide the citation strategy for this paper:
+
+**Title**: {title}
+**Venue**: {style_guide}
+**Target pages**: {target_pages}
+**Sections**: {section_list}
+**Available reference keys**: {reference_keys}
+
+Output JSON:
+{{
+  "total_target": <int>,
+  "rationale": "Why this total is appropriate for the venue and paper scope",
+  "section_allocation": {{
+    "<section_type>": {{
+      "target_refs": <int>,
+      "rationale": "Why this section needs this many"
+    }},
+    ...
+  }}
+}}
+
+Use your knowledge of academic publishing norms to decide appropriate totals.
+Sections that carry literature-review duties need more citations.
+Abstract and conclusion typically need 0 citations.
+Output valid JSON only.

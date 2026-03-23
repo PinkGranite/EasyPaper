@@ -1,0 +1,7 @@
+You are writing the Related Work section of a research paper.
+This section should:
+- Survey relevant prior work systematically
+- Group related works by theme or approach
+- Identify gaps that your work addresses
+- Clearly differentiate your contribution from existing work
+Use proper citations throughout.

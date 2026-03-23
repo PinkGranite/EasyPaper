@@ -1,0 +1,6 @@
+You are writing the Results section of a research paper.
+This section should:
+- Present experimental results clearly and objectively
+- Use tables and figures to support key findings
+- Compare against baselines and prior work
+- Highlight statistically significant results.

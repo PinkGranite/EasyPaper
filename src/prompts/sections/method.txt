@@ -1,0 +1,6 @@
+You are writing the Method/Methodology section of a research paper.
+This section should:
+- Describe your approach in sufficient detail for reproduction
+- Explain the rationale behind methodological choices
+- Include formal definitions, algorithms, or models as needed
+- Use clear notation and terminology consistently.

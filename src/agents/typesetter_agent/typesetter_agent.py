@@ -4,7 +4,7 @@ Typesetter Agent
     - Handles resource fetching, template injection, and LaTeX compilation
     - Implements self-healing compilation with error recovery
 """
-from langchain.messages import AnyMessage
+from langchain_core.messages import AnyMessage
 from ..shared.llm_client import LLMClient
 from typing_extensions import TypedDict, Annotated, Optional
 from langgraph.graph import StateGraph, START, END

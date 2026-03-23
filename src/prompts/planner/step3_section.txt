@@ -1,0 +1,64 @@
+Plan the **{section_title}** ({section_type}) section:
+
+**Paper title**: {title}
+**Paper type**: {paper_type}
+**Venue**: {style_guide}
+**Space budget for this section**: ~{section_words} words (~{section_paragraphs} paragraphs)
+**Contributions**: {contributions}
+
+**Available figures**: {figure_info}
+**Available tables**: {table_info}
+**Available references**: {reference_keys}
+**Code assets**: {code_writing_assets_summary}
+
+**Content sources**:
+- Idea/Hypothesis: {idea_hypothesis}
+- Method: {method}
+- Data: {data}
+- Experiments: {experiments}
+
+Output JSON:
+{{
+  "paragraphs": [
+    {{
+      "key_point": "The main argument of this paragraph",
+      "supporting_points": ["Evidence 1", "Evidence 2"],
+      "approx_sentences": 5,
+      "role": "motivation|problem_statement|definition|evidence|comparison|transition|summary",
+      "references_to_cite": ["ref_key1"],
+      "figures_to_reference": [],
+      "tables_to_reference": []
+    }}
+  ],
+  "figures": [
+    {{"figure_id": "fig:X", "position_hint": "early|middle|late", "caption_guidance": "..."}}
+  ],
+  "tables": [],
+  "topic_clusters": ["Theme A", "Theme B"],
+  "transition_intents": ["From X to Y"],
+  "sectioning_recommended": false,
+  "code_focus": {{
+    "must_use_evidence_ids": [],
+    "key_assets": [],
+    "allowed_claim_scope": "",
+    "notes": ""
+  }},
+  "writing_guidance": "Specific guidance for the writer"
+}}
+
+IMPORTANT:
+- Plan enough paragraphs to fill ~{section_words} words. Each paragraph is ~150-250 words.
+- Each paragraph should have 3-8 sentences.
+- For narrative sections (introduction, discussion), plan **4-8 cohesive paragraphs**
+  with substantial depth each, rather than 10+ short fragmented paragraphs.
+  An academic paragraph should develop a complete idea, not a single bullet point.
+- Use sectioning_recommended sparingly; prefer false for narrative sections
+  like introduction or discussion where continuous prose flow is expected.
+- Do NOT set sectioning_recommended to true for introduction or discussion
+  unless the section is exceptionally long and structurally complex.
+- FIGURE PLACEMENT RULES:
+  - Only include figures marked "DEFINE in this section" in the "figures" array.
+  - For figures marked "REFERENCE ONLY", use them in paragraphs' "figures_to_reference"
+    but do NOT add them to the "figures" array (they are defined elsewhere).
+  - NEVER create a \begin{{figure}} environment for a REFERENCE ONLY figure.
+Output valid JSON only.

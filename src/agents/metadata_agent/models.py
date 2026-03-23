@@ -184,6 +184,41 @@ class PaperMetaData(BaseModel):
     code_repository: Optional[CodeRepositorySpec] = None
     export_prompt_traces: bool = False
 
+    def to_document_input(self) -> "DocumentInput":
+        """
+        Convert paper-specific metadata to the generic DocumentInput interface.
+        - **Description**:
+            - Maps the five natural-language paper fields into a content_brief dict
+            - Preserves figures, tables, references, template, and code_repository
+            - Attaches GenerationConstraints from style_guide and target_pages
+
+        - **Returns**:
+            - `DocumentInput`: Generic document input
+        """
+        from ...models.document_spec import DocumentInput, GenerationConstraints
+
+        constraints = GenerationConstraints(
+            max_pages=self.target_pages,
+            style_guide=self.style_guide,
+            output_format="latex",
+            citation_format="bibtex",
+        )
+        return DocumentInput(
+            title=self.title,
+            content_brief={
+                "idea_hypothesis": self.idea_hypothesis,
+                "method": self.method,
+                "data": self.data,
+                "experiments": self.experiments,
+            },
+            references=list(self.references),
+            figures=[f.model_dump() for f in self.figures],
+            tables=[t.model_dump() for t in self.tables],
+            template_path=self.template_path,
+            code_repository=self.code_repository,
+            constraints=constraints,
+        )
+
 
 class PaperGenerationRequest(BaseModel):
     """
@@ -386,6 +421,17 @@ class StructuralAction(BaseModel):
     section: str = ""
     params: Dict[str, Any] = Field(default_factory=dict)
     estimated_savings: float = 0.0
+
+    def to_unified_action(self) -> "Action":
+        """Convert to the unified Action model from ``src.models``."""
+        from ...models.action_space import from_legacy_action
+        return from_legacy_action(
+            self.action_type,
+            target_id=self.target_id,
+            section=self.section,
+            params=self.params,
+            estimated_impact=self.estimated_savings,
+        )
 
 
 class SpaceEstimate(BaseModel):

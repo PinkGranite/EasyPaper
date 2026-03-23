@@ -10,17 +10,19 @@ Writer Agent
         - Type 2 (Fixed Sequence): mini_review executes CitationValidatorTool,
           WordCountTool, and KeyPointCoverageTool in fixed deterministic order
 """
-from langchain.messages import AnyMessage
+from langchain_core.messages import AnyMessage
 from typing_extensions import TypedDict, Annotated, Optional
 from langgraph.graph import StateGraph, START, END
 import operator
 import re
+import logging
 from typing import List, Dict, Any, Set
 from fastapi import APIRouter
 from ...config.schema import ModelConfig, ToolsConfig
+from ...prompts import PromptLoader as _PromptLoader
 from ..react_base import ReActAgent
 from .router import create_writer_router
-from .models import GeneratedContent, ReviewResult
+from .models import GeneratedContent, ReviewResult, ParagraphResult
 from ..shared.tools import (
     ToolRegistry,
     CitationValidatorTool,
@@ -29,7 +31,12 @@ from ..shared.tools import (
 )
 
 
-WRITER_SYSTEM_BASE = """You are an expert academic writer specializing in research paper composition.
+logger = logging.getLogger("uvicorn.error")
+
+_prompt_loader = _PromptLoader()
+
+
+_WRITER_SYSTEM_BASE_DEFAULT = """You are an expert academic writer specializing in research paper composition.
 Your task is to generate high-quality LaTeX content for a specific section of a research paper.
 
 You have access to UI rendering tools (`show_markdown`, `show_json_data`). Use them to show intermediate thoughts, tabular data, or highlighted literature to the user in the Canvas while generating content.
@@ -90,8 +97,12 @@ FORMATTING GUIDELINES:
 OUTPUT FORMAT:
 Return ONLY the LaTeX content for the section. Do not include explanations or comments outside the LaTeX."""
 
+WRITER_SYSTEM_BASE = _prompt_loader.load(
+    "writer", "writer_system_base", default=_WRITER_SYSTEM_BASE_DEFAULT
+)
 
-REVISION_SYSTEM_PROMPT = """You are revising a section of an academic paper based on review feedback.
+
+_REVISION_SYSTEM_PROMPT_DEFAULT = """You are revising a section of an academic paper based on review feedback.
 Your task is to fix the issues identified while maintaining the overall quality and structure.
 
 IMPORTANT:
@@ -134,6 +145,10 @@ REVISION STRATEGIES BY ISSUE TYPE:
    - Avoid collapsing multiple themes into one undifferentiated paragraph chain
 
 Return ONLY the revised LaTeX content."""
+
+REVISION_SYSTEM_PROMPT = _prompt_loader.load(
+    "writer", "revision_system", default=_REVISION_SYSTEM_PROMPT_DEFAULT
+)
 
 
 class WriterAgentState(TypedDict):
@@ -835,3 +850,169 @@ class WriterAgent(ReActAgent):
                 "output_model": "SectionWriteResult"
             }
         ]
+
+    # -----------------------------------------------------------------
+    # Decomposed generation: paragraph-level
+    # -----------------------------------------------------------------
+
+    async def generate_paragraph(
+        self,
+        paragraph_prompt: str,
+        section_type: str,
+        paragraph_index: int,
+        valid_refs: List[str],
+        claim_id: str = "",
+        max_retries: int = 2,
+    ) -> "ParagraphResult":
+        """
+        Generate a single paragraph from a focused paragraph-level prompt.
+
+        - **Description**:
+            - Used by the decomposed (claim-level) generation pipeline in
+              MetaDataAgent._generate_section_decomposed.
+            - Generates LaTeX content for one paragraph, validates citations,
+              counts words, and returns a ParagraphResult.
+
+        - **Args**:
+            - ``paragraph_prompt`` (str): The compiled paragraph prompt.
+            - ``section_type`` (str): Parent section type (for logging).
+            - ``paragraph_index`` (int): 0-based index of the paragraph.
+            - ``valid_refs`` (List[str]): Allowed citation keys.
+            - ``claim_id`` (str): Claim ID from the evidence DAG.
+            - ``max_retries`` (int): Retry count for citation violations.
+
+        - **Returns**:
+            - ``ParagraphResult``: Generated content + metadata.
+        """
+        from langchain_core.messages import SystemMessage, HumanMessage
+
+        system_msg = SystemMessage(content=WRITER_SYSTEM_BASE)
+        human_msg = HumanMessage(content=paragraph_prompt)
+
+        valid_set = set(valid_refs)
+        latex_content = ""
+        used_citations: List[str] = []
+        attempt = 0
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = await self.client.ainvoke(
+                    messages=[system_msg, human_msg],
+                    model_name=self.model_name,
+                )
+                raw = response.content if hasattr(response, "content") else str(response)
+                latex_content = raw.strip()
+
+                cite_pattern = re.compile(r"\\cite\{([^}]+)\}")
+                used_citations = []
+                for match in cite_pattern.finditer(latex_content):
+                    for key in match.group(1).split(","):
+                        k = key.strip()
+                        if k:
+                            used_citations.append(k)
+
+                invalid_cites = [c for c in used_citations if c not in valid_set]
+                if not invalid_cites:
+                    break
+
+                for ic in invalid_cites:
+                    latex_content = latex_content.replace(f"\\cite{{{ic}}}", "")
+                    latex_content = re.sub(
+                        r"~?\\cite\{" + re.escape(ic) + r"\}", "", latex_content
+                    )
+                used_citations = [c for c in used_citations if c in valid_set]
+                logger.warning(
+                    "writer.generate_paragraph citation_fix attempt=%d section=%s para=%d invalid=%s",
+                    attempt, section_type, paragraph_index, invalid_cites,
+                )
+            except Exception as e:
+                logger.error(
+                    "writer.generate_paragraph error attempt=%d section=%s para=%d: %s",
+                    attempt, section_type, paragraph_index, str(e),
+                )
+                if attempt >= max_retries:
+                    return ParagraphResult(
+                        paragraph_index=paragraph_index,
+                        claim_id=claim_id,
+                        attempt=attempt,
+                    )
+
+        word_count = len(latex_content.split())
+        return ParagraphResult(
+            latex_content=latex_content,
+            paragraph_index=paragraph_index,
+            claim_id=claim_id,
+            used_citations=list(set(used_citations)),
+            word_count=word_count,
+            attempt=attempt,
+        )
+
+    # -----------------------------------------------------------------
+    # Template-slot degraded generation
+    # -----------------------------------------------------------------
+
+    async def generate_from_template(
+        self,
+        template_prompt: str,
+        section_type: str,
+        paragraph_index: int,
+        valid_refs: List[str],
+    ) -> "ParagraphResult":
+        """
+        Generate content by filling a structured template (degraded mode).
+
+        - **Description**:
+            - When normal generation exceeds retry limits or the paragraph has
+              a ``paragraph_template`` set in its plan, this method fills
+              pre-defined slots to ensure coverage of required claims.
+            - Produces conservative but structurally correct output.
+
+        - **Args**:
+            - ``template_prompt`` (str): Compiled template fill prompt.
+            - ``section_type`` (str): Parent section type.
+            - ``paragraph_index`` (int): 0-based index.
+            - ``valid_refs`` (List[str]): Allowed citation keys.
+
+        - **Returns**:
+            - ``ParagraphResult``: Generated content from template.
+        """
+        from langchain_core.messages import SystemMessage, HumanMessage
+
+        system_msg = SystemMessage(content=(
+            "You are filling a structured template for an academic paper paragraph. "
+            "Fill each slot with appropriate academic content. "
+            "Use ONLY the provided citation keys. Output LaTeX only."
+        ))
+        human_msg = HumanMessage(content=template_prompt)
+
+        try:
+            response = await self.client.ainvoke(
+                messages=[system_msg, human_msg],
+                model_name=self.model_name,
+            )
+            raw = response.content if hasattr(response, "content") else str(response)
+            latex_content = raw.strip()
+
+            valid_set = set(valid_refs)
+            cite_pattern = re.compile(r"\\cite\{([^}]+)\}")
+            used_citations: List[str] = []
+            for match in cite_pattern.finditer(latex_content):
+                for key in match.group(1).split(","):
+                    k = key.strip()
+                    if k and k in valid_set:
+                        used_citations.append(k)
+
+            word_count = len(latex_content.split())
+            return ParagraphResult(
+                latex_content=latex_content,
+                paragraph_index=paragraph_index,
+                used_citations=list(set(used_citations)),
+                word_count=word_count,
+                verification_passed=True,
+            )
+        except Exception as e:
+            logger.error(
+                "writer.generate_from_template error section=%s para=%d: %s",
+                section_type, paragraph_index, str(e),
+            )
+            return ParagraphResult(paragraph_index=paragraph_index)

@@ -1,0 +1,7 @@
+You are writing the Abstract section of a research paper.
+The abstract should:
+- Summarize the research problem and motivation (1-2 sentences)
+- Describe the methodology briefly (1-2 sentences)
+- Present key results and findings (1-2 sentences)
+- State the main conclusions and implications (1-2 sentences)
+Keep it concise, typically 150-250 words.

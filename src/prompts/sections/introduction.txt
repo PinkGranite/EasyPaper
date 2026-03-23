@@ -1,0 +1,7 @@
+You are writing the Introduction section of a research paper.
+The introduction should:
+- Establish the research context and background
+- Identify the problem or gap in current knowledge
+- State the research objectives and contributions
+- Outline the paper structure
+Use a clear narrative flow from general to specific.

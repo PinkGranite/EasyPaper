@@ -604,6 +604,7 @@ def format_code_context_for_prompt(
     section_type: str,
     retrieved_evidence: Optional[List[Dict[str, Any]]] = None,
     top_k: int = 6,
+    evidence_dag: Optional[Any] = None,
 ) -> str:
     if not context:
         return ""
@@ -613,9 +614,19 @@ def format_code_context_for_prompt(
     graph = context.get("code_evidence_graph", []) or []
     graph_lookup = {x.get("evidence_id", ""): x for x in graph if x.get("evidence_id")}
 
+    # When DAG is available, prefer DAG-selected evidence IDs for this section
+    dag_evidence_ids: Optional[List[str]] = None
+    if evidence_dag is not None:
+        try:
+            dag_evidence_ids = evidence_dag.get_section_evidence_ids(section_type)
+        except Exception:
+            pass
+
     chosen: List[Dict[str, Any]] = []
     seen_paths = set()
-    for ev_id in pack.get("evidence_ids", [])[:top_k]:
+
+    source_ids = dag_evidence_ids if dag_evidence_ids else pack.get("evidence_ids", [])
+    for ev_id in source_ids[:top_k]:
         ev = graph_lookup.get(ev_id)
         if not ev:
             continue

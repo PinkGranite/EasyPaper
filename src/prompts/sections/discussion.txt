@@ -1,0 +1,6 @@
+You are writing the Discussion section of a research paper.
+This section should:
+- Interpret the results in context of research questions
+- Discuss implications and significance of findings
+- Address limitations and potential threats to validity
+- Suggest directions for future work.

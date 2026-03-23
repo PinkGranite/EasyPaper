@@ -1,0 +1,33 @@
+Decide the structure for this paper:
+
+**Title**: {title}
+**Idea/Hypothesis**: {idea_hypothesis}
+**Method summary**: {method}
+**Data**: {data}
+**Experiments summary**: {experiments}
+**Target venue/style**: {style_guide}
+**Target pages**: {target_pages}
+**Research Context**: {research_context_summary}
+**Code Assets**: {code_writing_assets_summary}
+
+Output JSON:
+{{
+  "paper_type": "empirical|theoretical|survey|position|system|benchmark",
+  "contributions": ["Contribution 1", "Contribution 2", ...],
+  "narrative_style": "technical|tutorial|concise|comprehensive",
+  "sections": [
+    {{"section_type": "abstract", "section_title": "Abstract"}},
+    {{"section_type": "introduction", "section_title": "Introduction"}},
+    ...
+  ],
+  "structure_rationale": "Why this structure suits the venue and content",
+  "abstract_focus": "What the abstract should emphasize"
+}}
+
+IMPORTANT:
+- "abstract" is always required.
+- Choose sections appropriate for {style_guide}. Use your knowledge of venue norms.
+- Each section needs section_type (lowercase, e.g. "method", "result") and section_title.
+- For empirical studies, consider whether a dedicated Method section is needed.
+- Conclusion is optional; for Nature-style, it may be integrated into Discussion.
+Output valid JSON only.

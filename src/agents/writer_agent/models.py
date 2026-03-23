@@ -107,6 +107,23 @@ class SectionDraft(BaseModel):
     paragraphs: List[ParagraphUnit] = Field(default_factory=list)
 
 
+class ParagraphResult(BaseModel):
+    """
+    Result from paragraph-level (claim-level) generation.
+    - **Description**:
+        - Returned by WriterAgent.generate_paragraph() in decomposed generation mode.
+        - Tracks claim coverage and citation usage for immediate verification.
+    """
+    latex_content: str = ""
+    paragraph_index: int = 0
+    claim_id: str = ""
+    used_citations: List[str] = Field(default_factory=list)
+    word_count: int = 0
+    claim_coverage: float = 1.0
+    verification_passed: bool = False
+    attempt: int = 1
+
+
 class WriterResult(BaseModel):
     """
     Result from Writer Agent

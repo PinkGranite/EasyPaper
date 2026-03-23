@@ -45,6 +45,7 @@ class ReviewRecord(BaseModel):
     conflict_resolution: List[Dict[str, Any]] = Field(default_factory=list)
     baseline_gap_audit: Dict[str, Any] = Field(default_factory=dict)
     issue_lifecycle: List[Dict[str, Any]] = Field(default_factory=list)
+    hallucination_stats: Dict[str, Any] = Field(default_factory=dict)
     writer_response_section: List[Dict[str, Any]] = Field(default_factory=list)
     writer_response_paragraph: List[Dict[str, Any]] = Field(default_factory=list)
     reviewer_verification: List[Dict[str, Any]] = Field(default_factory=list)

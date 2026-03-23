@@ -12,6 +12,7 @@ import re
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
 
 from .base import FeedbackChecker
+from ....prompts import PromptLoader as _PromptLoader
 
 if TYPE_CHECKING:
     from ..models import ReviewContext, FeedbackResult
@@ -19,11 +20,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("uvicorn.error")
 
-# Default system prompt when no skill is loaded from the registry
-_DEFAULT_LOGIC_PROMPT = """You are a meticulous academic paper reviewer focusing on logical consistency.
-Analyze the provided paper sections and identify issues at the PARAGRAPH level.
+_prompt_loader = _PromptLoader()
+
+_LOGIC_PROMPT_INLINE_DEFAULT = """You are a meticulous academic paper reviewer focusing on logical consistency.
+Analyze the provided paper sections and identify issues at both PARAGRAPH and SENTENCE level.
 
 For each section, paragraphs are separated by blank lines. Index them starting from 0.
+Within each paragraph, sentences end with '.', '!' or '?'. Index them starting from 0.
 
 Issue categories:
 1. **Contradictions**: Statements that conflict with each other across sections.
@@ -36,6 +39,8 @@ For each issue found, provide:
 - The section name
 - The paragraph_index (0-based) within that section
 - The first ~50 characters of the paragraph (paragraph_preview)
+- The sentence_index (0-based) within that paragraph, if you can pinpoint the exact sentence
+- The first ~40 characters of the sentence (sentence_preview), if applicable
 - The problematic text (quoted)
 - Why it is a problem
 - A suggested fix
@@ -47,6 +52,8 @@ Output your analysis as a JSON object:
       "section": "section name",
       "paragraph_index": 0,
       "paragraph_preview": "first ~50 chars...",
+      "sentence_index": 0,
+      "sentence_preview": "first ~40 chars...",
       "severity": "high" | "medium" | "low",
       "category": "contradiction" | "terminology" | "chinglish" | "ambiguous_ref" | "unsupported_claim",
       "text": "the problematic text",
@@ -56,7 +63,13 @@ Output your analysis as a JSON object:
   ],
   "passed": true | false,
   "summary": "one-sentence overall assessment"
-}"""
+}
+
+Note: sentence_index and sentence_preview are optional — include them when the issue can be pinpointed to a specific sentence."""
+
+_DEFAULT_LOGIC_PROMPT = _prompt_loader.load(
+    "reviewer", "logic_check", default=_LOGIC_PROMPT_INLINE_DEFAULT
+)
 
 # Maximum content length sent to LLM (in characters)
 _MAX_CONTENT_CHARS = 12000
@@ -236,6 +249,8 @@ class LogicChecker(FeedbackChecker):
 
         # Build paragraph_feedbacks (grouped by section)
         paragraph_feedbacks: Dict[str, List[Dict]] = {}
+        # Build sentence_feedbacks (grouped by section) for issues with sentence_index
+        sentence_feedbacks: Dict[str, List[Dict]] = {}
         for issue in issues:
             sec = issue.get("section", "unknown")
             if sec not in paragraph_feedbacks:
@@ -247,6 +262,18 @@ class LogicChecker(FeedbackChecker):
                 "severity": issue.get("severity", "medium"),
                 "suggestion": issue.get("suggestion", ""),
             })
+            if issue.get("sentence_index") is not None:
+                if sec not in sentence_feedbacks:
+                    sentence_feedbacks[sec] = []
+                sentence_feedbacks[sec].append({
+                    "section": sec,
+                    "paragraph_index": issue.get("paragraph_index", 0),
+                    "sentence_index": issue.get("sentence_index", 0),
+                    "sentence_preview": issue.get("sentence_preview", ""),
+                    "issue": f"[{issue.get('category', 'issue')}] {issue.get('text', '')}: {issue.get('reason', '')}",
+                    "suggestion": issue.get("suggestion", ""),
+                    "severity": issue.get("severity", "medium"),
+                })
 
         section_feedbacks: List[Dict] = []
         for sec, pfb in paragraph_feedbacks.items():
@@ -292,6 +319,7 @@ class LogicChecker(FeedbackChecker):
                 "issues": issues,
                 "sections_to_revise": sections_to_revise,
                 "paragraph_feedbacks": paragraph_feedbacks,
+                "sentence_feedbacks": sentence_feedbacks,
                 "section_feedbacks": section_feedbacks,
                 "document_feedbacks": document_feedbacks,
             },

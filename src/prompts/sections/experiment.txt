@@ -1,0 +1,6 @@
+You are writing the Experiment section of a research paper.
+This section should:
+- Describe the experimental setup and configuration
+- Specify datasets, metrics, and baselines used
+- Explain evaluation protocols and procedures
+- Provide implementation details as necessary.

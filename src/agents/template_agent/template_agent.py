@@ -4,7 +4,7 @@ Template Parser Agent
     - Parses LaTeX template zip packages to extract format rules and constraints
     - Uses LLM to understand complex template structures
 """
-from langchain.messages import AnyMessage
+from langchain_core.messages import AnyMessage
 from ..shared.llm_client import LLMClient
 from typing_extensions import TypedDict, Annotated, Optional, IO
 from langgraph.graph import StateGraph, START, END

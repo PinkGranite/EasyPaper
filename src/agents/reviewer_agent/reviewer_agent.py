@@ -30,6 +30,7 @@ from .checkers.word_count import WordCountChecker
 from .checkers.style_check import StyleChecker
 from .checkers.logic_check import LogicChecker
 from .checkers.structure_check import StructureChecker
+from .checkers.evidence_check import EvidenceChecker
 
 if TYPE_CHECKING:
     from ...skills.registry import SkillRegistry
@@ -85,17 +86,16 @@ class ReviewerAgent(BaseAgent):
 
     def _register_skill_checkers(self) -> None:
         """
-        Dynamically register StyleChecker and LogicChecker.
+        Dynamically register checkers.
 
         - **Description**:
             - StyleChecker is always registered (works with or without registry)
             - LogicChecker is registered only when an LLM client can be created
+            - EvidenceChecker is always registered (fail-open when no DAG available)
         """
-        # StyleChecker: pure rule-based, always available
         self.register_checker(StyleChecker(skill_registry=self._skill_registry))
         self.register_checker(StructureChecker())
 
-        # LogicChecker: needs LLM client
         try:
             llm_client = LLMClient(
                 api_key=self.config.api_key,
@@ -112,6 +112,8 @@ class ReviewerAgent(BaseAgent):
             logger.warning(
                 "ReviewerAgent: could not initialize LogicChecker: %s", e
             )
+
+        self.register_checker(EvidenceChecker())
     
     @property
     def name(self) -> str:
@@ -456,6 +458,35 @@ class ReviewerAgent(BaseAgent):
                                 acceptance_criteria=self._default_acceptance_criteria(self._coerce_issue_type(checker.name)),
                             )
                             result.section_feedbacks.append(section_fb)
+
+                    # Route sentence-level feedbacks from checkers that provide them
+                    raw_sentence_feedbacks = feedback.details.get("sentence_feedbacks", {})
+                    if isinstance(raw_sentence_feedbacks, dict):
+                        for sec_type, sent_items in raw_sentence_feedbacks.items():
+                            for sf_item in sent_items:
+                                para_idx = int(sf_item.get("paragraph_index", 0))
+                                sent_idx = int(sf_item.get("sentence_index", 0))
+                                raw_sev = str(sf_item.get("severity", "medium")).lower()
+                                sev = Severity.WARNING
+                                if raw_sev in ("error", "high", "critical"):
+                                    sev = Severity.ERROR
+                                elif raw_sev in ("info", "low"):
+                                    sev = Severity.INFO
+                                result.add_hierarchical_feedback(HierarchicalFeedbackItem(
+                                    level=FeedbackLevel.SENTENCE,
+                                    agent="reviewer",
+                                    checker=checker.name,
+                                    target_id=f"{sec_type}.p{para_idx}.s{sent_idx}",
+                                    section_type=sec_type,
+                                    paragraph_index=para_idx,
+                                    sentence_index=sent_idx,
+                                    severity=sev,
+                                    issue_type=checker.name,
+                                    message=str(sf_item.get("issue", ""))[:500],
+                                    suggested_action="refine_sentence",
+                                    revision_instruction=str(sf_item.get("suggestion", "")),
+                                    evidence=sf_item if isinstance(sf_item, dict) else {},
+                                ))
                         
             except Exception as e:
                 logger.error("reviewer.checker_error name=%s error=%s", checker.name, str(e))

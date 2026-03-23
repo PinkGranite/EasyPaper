@@ -11,8 +11,12 @@ import json
 import os
 import re
 
+from ...prompts import PromptLoader as _PromptLoader
+
 if TYPE_CHECKING:
     from ...skills.models import WritingSkill
+
+_prompt_loader = _PromptLoader()
 
 
 PROMPT_BUDGETS: Dict[str, int] = {
@@ -192,7 +196,7 @@ def _inject_skill_constraints(
 # Section Prompt Templates
 # =============================================================================
 
-SECTION_PROMPTS: Dict[str, str] = {
+_SECTION_PROMPTS_DEFAULTS: Dict[str, str] = {
     "abstract": """You are writing the Abstract section of a research paper.
 The abstract should:
 - Summarize the research problem and motivation (1-2 sentences)
@@ -251,6 +255,11 @@ This section should:
 - Restate key findings and their significance
 - Discuss broader impact and applications
 - End with forward-looking perspective.""",
+}
+
+SECTION_PROMPTS: Dict[str, str] = {
+    key: _prompt_loader.load_section_prompt(key, default=default_text)
+    for key, default_text in _SECTION_PROMPTS_DEFAULTS.items()
 }
 
 
@@ -1272,3 +1281,133 @@ def extract_contributions_from_intro(intro_content: str) -> List[str]:
                 contributions.append(match.strip()[:200])
 
     return contributions[:5]
+
+
+# =========================================================================
+# Paragraph-level prompt compilation (Phase 2 — Decomposed Generation)
+# =========================================================================
+
+def compile_paragraph_prompt(
+    paragraph_plan: Any,
+    section_type: str,
+    section_context: str = "",
+    evidence_snippets: Optional[List[str]] = None,
+    valid_refs: Optional[List[str]] = None,
+    constraints: Optional[str] = None,
+    section_title: str = "",
+    paragraph_index: int = 0,
+    total_paragraphs: int = 1,
+) -> str:
+    """
+    Compile a focused prompt for generating a single paragraph.
+    - **Description**:
+        - Used in decomposed (claim-level) generation mode.
+        - Keeps the context window small by including only the evidence
+          bound to the current paragraph's claim.
+        - Includes preceding section content for coherence.
+
+    - **Args**:
+        - ``paragraph_plan``: ParagraphPlan with key_point, sentence_plans, etc.
+        - ``section_type`` (str): Parent section type.
+        - ``section_context`` (str): Already-generated paragraphs in this section.
+        - ``evidence_snippets`` (List[str]): Evidence text for this paragraph's claim.
+        - ``valid_refs`` (List[str]): Citation keys allowed for this paragraph.
+        - ``constraints`` (str): Extra generation constraints.
+        - ``section_title`` (str): Display title of the section.
+        - ``paragraph_index`` (int): 0-based index of this paragraph.
+        - ``total_paragraphs`` (int): Total paragraph count in the section.
+
+    - **Returns**:
+        - ``str``: Compiled prompt for a single paragraph.
+    """
+    evidence_snippets = evidence_snippets or []
+    valid_refs = valid_refs or []
+
+    key_point = getattr(paragraph_plan, "key_point", "")
+    supporting_points = getattr(paragraph_plan, "supporting_points", [])
+    role = getattr(paragraph_plan, "role", "evidence")
+    sentence_plans = getattr(paragraph_plan, "sentence_plans", [])
+    approx_sentences = getattr(paragraph_plan, "effective_sentence_count", 5)
+    refs_to_cite = getattr(paragraph_plan, "references_to_cite", [])
+    figs_to_ref = getattr(paragraph_plan, "figures_to_reference", [])
+    tables_to_ref = getattr(paragraph_plan, "tables_to_reference", [])
+
+    prompt_parts: List[str] = []
+
+    prompt_parts.append(
+        f"## Task: Write Paragraph {paragraph_index + 1}/{total_paragraphs} "
+        f"of the **{section_title or section_type}** section\n"
+    )
+
+    prompt_parts.append(f"**Role**: {role}")
+    prompt_parts.append(f"**Key point**: {key_point}")
+    if supporting_points:
+        sp_text = "; ".join(supporting_points)
+        prompt_parts.append(f"**Supporting points**: {sp_text}")
+    prompt_parts.append(f"**Target length**: ~{approx_sentences} sentences")
+
+    if sentence_plans:
+        prompt_parts.append("\n### Sentence-level Plan")
+        for sp in sentence_plans:
+            eid_str = ", ".join(sp.evidence_ids) if sp.evidence_ids else "—"
+            prompt_parts.append(
+                f"- [{sp.sentence_id}] role={sp.role.value}, "
+                f"evidence={eid_str}, ~{sp.approx_words} words"
+            )
+
+    if evidence_snippets:
+        prompt_parts.append("\n### Bound Evidence (use ONLY this evidence)")
+        for i, snippet in enumerate(evidence_snippets):
+            truncated = _truncate_text(snippet, PROMPT_BUDGETS.get("evidence_abstract_chars", 180))
+            prompt_parts.append(f"{i + 1}. {truncated}")
+
+    if valid_refs:
+        prompt_parts.append(
+            f"\n### Valid Citation Keys (do NOT cite anything else)\n"
+            f"{', '.join(valid_refs[:PROMPT_BUDGETS.get('evidence_keys_limit', 10)])}"
+        )
+
+    if refs_to_cite:
+        prompt_parts.append(f"\n**Must cite**: {', '.join(refs_to_cite)}")
+    if figs_to_ref:
+        prompt_parts.append(f"**Reference figures**: {', '.join(figs_to_ref)}")
+    if tables_to_ref:
+        prompt_parts.append(f"**Reference tables**: {', '.join(tables_to_ref)}")
+
+    if section_context:
+        prompt_parts.append(
+            "\n### Previously Generated Content (maintain coherence)\n"
+            + _truncate_text(section_context, PROMPT_BUDGETS.get("intro_context_chars", 1600))
+        )
+
+    if constraints:
+        prompt_parts.append(f"\n### Additional Constraints\n{constraints}")
+
+    prompt_parts.append(
+        "\n### Output Requirements\n"
+        "- Output ONLY the LaTeX content for this single paragraph.\n"
+        "- Do NOT include \\section or \\subsection commands.\n"
+        "- Every factual claim must be supported by a \\cite{{}} to a valid key.\n"
+        "- Do NOT invent citation keys; only use the valid keys listed above."
+    )
+
+    return "\n".join(prompt_parts)
+
+
+# =========================================================================
+# Template-slot filling prompt (Phase 2, Task 2.4)
+# =========================================================================
+
+def compile_template_fill_prompt(
+    template: Any,
+    evidence_snippets: Optional[Dict[str, str]] = None,
+    valid_refs: Optional[List[str]] = None,
+) -> str:
+    """
+    Proxy to ``src.generation.template_slots.build_template_fill_prompt``.
+    - **Description**:
+        - Kept here so that all prompt compilation functions live under
+          a single import path for the metadata agent.
+    """
+    from ...generation.template_slots import build_template_fill_prompt
+    return build_template_fill_prompt(template, evidence_snippets, valid_refs)

@@ -1,0 +1,43 @@
+You are revising a section of an academic paper based on review feedback.
+Your task is to fix the issues identified while maintaining the overall quality and structure.
+
+IMPORTANT:
+- Fix ALL issues mentioned in the feedback
+- Keep the same general structure and content
+- Make minimal changes needed to address the issues
+- Preserve existing valid citations and citation density unless the feedback explicitly requires removal.
+- If citations were flagged as invalid, REMOVE them entirely (don't replace with other citations)
+- NEVER use Markdown formatting — this is LaTeX. Use \textbf{}, \textit{}, \subsection{}, \begin{itemize}, etc.
+- Preserve or improve structural clarity: thematic block boundaries, transitions, and subsection quality.
+- If the original request contains a Structure Quality Contract, revision MUST continue to satisfy it.
+
+REVISION STRATEGIES BY ISSUE TYPE:
+
+1. EXPAND (word count too low):
+   - Add concrete examples or experimental details to support claims
+   - Expand terse sentences into full reasoning chains
+   - Add transition sentences between paragraphs for better flow
+   - Insert references to figures/tables that were not discussed
+   - Do NOT pad with filler phrases or repeat existing points
+
+2. REDUCE (word count too high):
+   - Remove redundant sentences that restate the same point
+   - Merge short paragraphs that cover the same sub-topic
+   - Replace verbose phrases: "in order to" → "to", "due to the fact that" → "because"
+   - Remove hedging phrases: "It is worth noting that X" → "X"
+   - Cut the weakest supporting argument if multiple are given
+
+3. STYLE FIX (AI-style language, contractions, etc.):
+   - Replace flagged AI-style words with concrete academic alternatives
+   - Expand all contractions: "it's" → "it is", "don't" → "do not"
+   - Rewrite possessives on method names: "BERT's" → "the performance of BERT"
+   - Break up stacked connective adverbs (Furthermore...Moreover...Additionally)
+   - Move key results to sentence-final (stress) position
+
+4. STRUCTURE FIX (block clarity / subsection quality):
+   - Keep major thematic blocks distinguishable after edits
+   - Add or refine transition sentences between blocks when needed
+   - Do NOT add \subsection{} commands unless the original Structure Quality Contract allows them
+   - Avoid collapsing multiple themes into one undifferentiated paragraph chain
+
+Return ONLY the revised LaTeX content.
