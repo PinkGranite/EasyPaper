@@ -1171,7 +1171,14 @@ class MetaDataAgent(ReActAgent):
         # Use template_path from metadata if not provided
         if template_path is None:
             template_path = metadata.template_path
-        
+
+        # Fallback: resolve from style_guide when no explicit template is given
+        if template_path is None and compile_pdf:
+            from src.default_templates import resolve_default_template
+            template_path = resolve_default_template(
+                getattr(metadata, "style_guide", None)
+            )
+
         # Use target_pages from metadata if not provided
         if target_pages is None:
             target_pages = metadata.target_pages
@@ -4636,7 +4643,9 @@ class MetaDataAgent(ReActAgent):
             return paper_plan
 
         except Exception as e:
+            import traceback
             print(f"[MetaDataAgent] Planning error: {e}")
+            traceback.print_exc()
             return None
     
     # =========================================================================

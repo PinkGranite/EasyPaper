@@ -406,23 +406,26 @@ class PlannerAgent(BaseAgent):
         if summary:
             lines.append(f"- Landscape summary: {summary}")
 
-        trends = research_context.get("research_trends", []) or []
+        raw_trends = research_context.get("research_trends", []) or []
+        trends = list(raw_trends) if isinstance(raw_trends, (list, tuple)) else []
         if trends:
             lines.append("- Key trends:")
             for t in trends[:3]:
                 lines.append(f"  - {t}")
 
-        gaps = research_context.get("gaps", []) or []
+        raw_gaps = research_context.get("gaps", []) or []
+        gaps = list(raw_gaps) if isinstance(raw_gaps, (list, tuple)) else []
         if gaps:
             lines.append("- Key gaps/opportunities:")
             for g in gaps[:3]:
                 lines.append(f"  - {g}")
 
         ranking = research_context.get("contribution_ranking", {}) or {}
-        if ranking:
+        if isinstance(ranking, dict):
             lines.append("- Contribution ranking hints:")
             for band in ("P0", "P1", "P2"):
-                items = ranking.get(band, []) or []
+                raw_items = ranking.get(band, []) or []
+                items = list(raw_items) if isinstance(raw_items, (list, tuple)) else []
                 if not items:
                     continue
                 top_text = ", ".join(
