@@ -160,6 +160,7 @@ class EasyPaper:
         from .agents.writer_agent.writer_agent import WriterAgent
         from .agents.reviewer_agent.reviewer_agent import ReviewerAgent
         from .agents.planner_agent.planner_agent import PlannerAgent
+        from .agents.typesetter_agent.typesetter_agent import TypesetterAgent
 
         agent_map: Dict[str, AgentConfig] = {
             a.name: a for a in config.agents
@@ -229,6 +230,16 @@ class EasyPaper:
             vlm_service=vlm_service,
         )
 
+        # Typesetter is optional in SDK mode; when configured it enables
+        # self-contained in-process PDF compilation (no HTTP dependency).
+        typesetter_agent = None
+        typesetter_cfg = agent_map.get("typesetter")
+        if typesetter_cfg and typesetter_cfg.model:
+            try:
+                typesetter_agent = TypesetterAgent(config=typesetter_cfg.model)
+            except Exception:
+                typesetter_agent = None
+
         # VLMReviewAgent is optional
         vlm_review_agent = None
         vlm_cfg = agent_map.get("vlm_review")
@@ -253,6 +264,8 @@ class EasyPaper:
             "reviewer": reviewer,
             "planner": planner,
         }
+        if typesetter_agent is not None:
+            peers["typesetter"] = typesetter_agent
         if vlm_review_agent is not None:
             peers["vlm_review"] = vlm_review_agent
         meta_agent.set_peers(peers)

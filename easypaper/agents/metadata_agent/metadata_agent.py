@@ -186,6 +186,7 @@ class MetaDataAgent(ReActAgent):
         self._reviewer = None
         self._planner = None
         self._vlm_reviewer = None
+        self._typesetter = None
 
     def set_peers(self, agents: Dict[str, "BaseAgent"]) -> None:
         """
@@ -202,6 +203,7 @@ class MetaDataAgent(ReActAgent):
         self._reviewer = agents.get("reviewer")
         self._planner = agents.get("planner")
         self._vlm_reviewer = agents.get("vlm_review")
+        self._typesetter = agents.get("typesetter")
     
     @property
     def name(self) -> str:
@@ -3510,6 +3512,46 @@ class MetaDataAgent(ReActAgent):
                 ids.add(token)
         return sorted(ids)
 
+    @staticmethod
+    def _build_typesetter_compile_payload(
+        generated_sections: Dict[str, str],
+        section_order: List[str],
+        section_titles: Dict[str, str],
+        template_path: str,
+        paper_title: str,
+        typesetter_refs: List[Dict[str, str]],
+        figure_ids: List[str],
+        output_dir: Path,
+        figures_source_dir: Optional[str],
+        figure_paths: Optional[Dict[str, str]],
+        converted_tables: Optional[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """
+        Build a normalized payload for Typesetter compilation.
+        - **Description**:
+            - Shared payload for both in-process peer invocation and HTTP fallback.
+            - Keeps compile input parity between SDK mode and server mode.
+
+        - **Returns**:
+            - `Dict[str, Any]`: Typesetter compile payload.
+        """
+        return {
+            "sections": generated_sections,
+            "section_order": section_order,
+            "section_titles": section_titles,
+            "template_path": template_path,
+            "template_config": {
+                "paper_title": paper_title,
+                "paper_authors": "EasyPaper",
+            },
+            "references": typesetter_refs,
+            "figure_ids": figure_ids,
+            "output_dir": str(output_dir),
+            "figures_source_dir": figures_source_dir,
+            "figure_paths": figure_paths or {},
+            "converted_tables": converted_tables or {},
+        }
+
     # =========================================================================
     # Pre-Generation Search Judgment (Phase A)
     # =========================================================================
@@ -3923,52 +3965,37 @@ class MetaDataAgent(ReActAgent):
                 figure_paths=figure_paths,
             )
             
-            # Call Typesetter Agent API with multi-file sections dict
-            async with httpx.AsyncClient(timeout=600.0) as client:
-                response = await client.post(
-                    f"{os.getenv('AGENTSYS_SELF_URL', 'http://127.0.0.1:8000')}/agent/typesetter/compile",
-                    json={
-                        "request_id": str(uuid.uuid4()),
-                        "payload": {
-                            "sections": generated_sections,
-                            "section_order": section_order,
-                            "section_titles": section_titles,
-                            "template_path": template_path,
-                            "template_config": {
-                                "paper_title": paper_title,
-                                "paper_authors": "EasyPaper",
-                            },
-                            "references": typesetter_refs,
-                            "figure_ids": figure_ids,
-                            "output_dir": str(output_dir),
-                            "figures_source_dir": figures_source_dir,
-                            "figure_paths": figure_paths or {},
-                            "converted_tables": converted_tables or {},
-                        }
-                    }
-                )
-                
-                if response.status_code != 200:
-                    print(f"[MetaDataAgent] Typesetter error: {response.status_code} - {response.text}")
-                    return None, None, [f"Typesetter HTTP {response.status_code}"], {}
-                
-                result = response.json()
-                
-                if result.get("status") == "ok" and result.get("result"):
-                    compilation_result = result["result"]
-                    pdf_path = compilation_result.get("pdf_path")
-                    latex_path = compilation_result.get("source_path")
-                    compile_warnings = compilation_result.get("warnings", [])
-                    section_errors = compilation_result.get("section_errors", {})
-                    
-                    if pdf_path:
-                        print(f"[MetaDataAgent] PDF compiled successfully: {pdf_path}")
-                        if compile_warnings:
-                            print(f"[MetaDataAgent] Compile warnings: {compile_warnings[:5]}")
-                        if section_errors:
-                            print(f"[MetaDataAgent] Section errors (on success): {section_errors}")
-                    else:
-                        print(f"[MetaDataAgent] PDF compilation failed: compilation result has no pdf_path")
+            payload = self._build_typesetter_compile_payload(
+                generated_sections=generated_sections,
+                section_order=section_order,
+                section_titles=section_titles,
+                template_path=template_path,
+                paper_title=paper_title,
+                typesetter_refs=typesetter_refs,
+                figure_ids=figure_ids,
+                output_dir=output_dir,
+                figures_source_dir=figures_source_dir,
+                figure_paths=figure_paths,
+                converted_tables=converted_tables,
+            )
+
+            def _parse_compile_result(
+                *,
+                compilation_result: Dict[str, Any],
+                error_msg: str,
+            ) -> Tuple[Optional[str], Optional[str], List[str], Dict[str, List[str]]]:
+                pdf_path = compilation_result.get("pdf_path")
+                latex_path = compilation_result.get("source_path")
+                compile_warnings = compilation_result.get("warnings", [])
+                section_errors = compilation_result.get("section_errors", {}) or {}
+                compile_errors = compilation_result.get("errors", []) or []
+
+                if pdf_path:
+                    print(f"[MetaDataAgent] PDF compiled successfully: {pdf_path}")
+                    if compile_warnings:
+                        print(f"[MetaDataAgent] Compile warnings: {compile_warnings[:5]}")
+                    if section_errors:
+                        print(f"[MetaDataAgent] Section errors (on success): {section_errors}")
 
                     # Guard: ensure final main.tex contains required structure.
                     if latex_path:
@@ -3977,23 +4004,60 @@ class MetaDataAgent(ReActAgent):
                         if structure_errors:
                             print(f"[MetaDataAgent] main.tex structure validation failed: {structure_errors}")
                             return None, None, structure_errors, section_errors
-
                     return pdf_path, latex_path, [], section_errors
-                else:
-                    # Compilation failed - extract errors from result
-                    compile_errors: List[str] = []
-                    section_errors: Dict[str, List[str]] = {}
-                    error_msg = result.get("error", "Unknown error")
-                    if result.get("result"):
-                        compile_errors = result["result"].get("errors", [])
-                        section_errors = result["result"].get("section_errors", {})
-                    if not compile_errors:
-                        compile_errors = [e.strip() for e in error_msg.split(";") if e.strip()]
-                    print(f"[MetaDataAgent] PDF compilation failed: {error_msg}")
-                    print(f"[Typesetter] Compile errors: {compile_errors}")
-                    if section_errors:
-                        print(f"[Typesetter] Section errors: {section_errors}")
-                    return None, None, compile_errors, section_errors
+
+                # Compilation failed
+                if not compile_errors:
+                    compile_errors = [e.strip() for e in error_msg.split(";") if e.strip()]
+                print(f"[MetaDataAgent] PDF compilation failed: {error_msg}")
+                print(f"[Typesetter] Compile errors: {compile_errors}")
+                if section_errors:
+                    print(f"[Typesetter] Section errors: {section_errors}")
+                return None, None, compile_errors, section_errors
+
+            # Path A: in-process typesetter peer (preferred for SDK self-contained mode)
+            if self._typesetter is not None:
+                try:
+                    print("[MetaDataAgent] Typesetter compile path: peer")
+                    peer_result = await self._typesetter.run(**payload)
+                    compilation_result = peer_result.get("compilation_result") if isinstance(peer_result, dict) else None
+                    if hasattr(compilation_result, "model_dump"):
+                        compilation_result = compilation_result.model_dump()
+                    if isinstance(compilation_result, dict):
+                        return _parse_compile_result(
+                            compilation_result=compilation_result,
+                            error_msg="Typesetter peer compilation failed",
+                        )
+                    print("[MetaDataAgent] Typesetter peer returned unexpected result shape, falling back to HTTP")
+                except Exception as peer_err:
+                    print(f"[MetaDataAgent] Typesetter peer error: {peer_err}; falling back to HTTP")
+
+            # Path B: HTTP endpoint fallback (server mode / external deployment)
+            print("[MetaDataAgent] Typesetter compile path: http")
+            async with httpx.AsyncClient(timeout=600.0) as client:
+                response = await client.post(
+                    f"{os.getenv('AGENTSYS_SELF_URL', 'http://127.0.0.1:8000')}/agent/typesetter/compile",
+                    json={
+                        "request_id": str(uuid.uuid4()),
+                        "payload": payload,
+                    }
+                )
+
+                if response.status_code != 200:
+                    print(f"[MetaDataAgent] Typesetter error: {response.status_code} - {response.text}")
+                    return None, None, [f"Typesetter HTTP {response.status_code}"], {}
+
+                result = response.json()
+                compilation_result = result.get("result") if isinstance(result, dict) else None
+                if isinstance(compilation_result, dict):
+                    return _parse_compile_result(
+                        compilation_result=compilation_result,
+                        error_msg=result.get("error", "Unknown error"),
+                    )
+
+                error_msg = result.get("error", "Unknown error") if isinstance(result, dict) else "Unknown error"
+                compile_errors = [e.strip() for e in str(error_msg).split(";") if e.strip()]
+                return None, None, compile_errors, {}
                 
         except httpx.ConnectError:
             print("[MetaDataAgent] Error: Could not connect to Typesetter Agent")

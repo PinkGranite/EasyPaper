@@ -40,7 +40,14 @@ Run the EasyPaper end-to-end paper generation workflow with guided setup and met
      options = request.to_generate_options()
      result = await ep.generate(metadata, **options)
      ```
-   - **Report results**: Show status, output files, absolute paths, summary
+   - **Report results**: Show status, output files, absolute paths, summary.
+   - **Final PDF selection rule**:
+     1. Use `result.pdf_path` first.
+     2. If missing, search `result.output_path` in order:
+        - `iteration_*_final/**/*.pdf`
+        - latest `iteration_*` directory PDF
+        - root `paper.pdf`
+     3. If still missing, report final PDF unavailable and include compile error summary.
 
 ## Path Requirements
 
@@ -61,6 +68,7 @@ The skill will automatically convert relative paths to absolute paths, but users
 - **Flexibility**: Allow users to provide complete metadata or collect interactively
 - **Path conversion**: Automatically convert relative paths to absolute and inform user
 - **Reference**: When users ask about structure, reference `examples/meta.json` as the template (note: paths should be absolute)
-- **Direct import**: Use EasyPaper as Python SDK - no API server needed
+- **Direct import**: Use EasyPaper as Python SDK - no API server needed for generation.
+- **Typesetter path**: PDF compilation prefers in-process Typesetter (self-contained SDK) and falls back to HTTP Typesetter endpoint when peer is unavailable.
 
 $ARGUMENTS

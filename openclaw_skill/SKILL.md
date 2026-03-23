@@ -100,6 +100,8 @@ sudo dnf install poppler-utils
 
 **Recommended workflow:** Prepare a `metadata.json` (see [`examples/meta.json`](https://github.com/PinkGranite/EasyPaper/blob/master/examples/meta.json)), parse it as `PaperGenerationRequest`, then run with `to_metadata()` + `to_generate_options()`.
 
+**Typesetter behavior (SDK + Server):** PDF compilation prefers in-process Typesetter when available (SDK self-contained). If no local peer is available, EasyPaper falls back to the HTTP Typesetter endpoint (`AGENTSYS_SELF_URL`).
+
 ### Load from file and generate
 
 ```python
@@ -178,6 +180,17 @@ When working with EasyPaper, refer to these files in the repository:
 - `style_guide` (venue name), `target_pages`, `template_path`, `figures`, `tables`, `code_repository`, `export_prompt_traces`
 
 See [`examples/meta.json`](https://github.com/PinkGranite/EasyPaper/blob/master/examples/meta.json) and [`economist_example/metadata.json`](https://github.com/PinkGranite/EasyPaper/blob/master/economist_example/metadata.json) for full examples. Treat `examples/meta.json` as a full `PaperGenerationRequest` sample: use `request = PaperGenerationRequest.model_validate_json_file(...)`, then `request.to_metadata()` and `request.to_generate_options()` for SDK generation.
+
+## Final PDF Selection
+
+When review loop is enabled, multiple iteration PDFs can exist. Always report the final artifact using this priority:
+
+1. `result.pdf_path` (authoritative final output)
+2. Under `result.output_path`: `iteration_*_final/**/*.pdf`
+3. Under `result.output_path`: latest `iteration_*` directory PDF
+4. `result.output_path/paper.pdf` (last fallback)
+
+If no PDF is found, report that final PDF is unavailable and include recent compile errors.
 
 ## Streaming Generation
 

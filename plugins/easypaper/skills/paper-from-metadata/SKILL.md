@@ -195,6 +195,16 @@ Before generating:
    - List output files: `paper.tex`, `references.bib`, `paper.pdf` (if compiled)
    - Provide absolute file paths
    - Show summary: word count, sections generated, etc.
+   - **Select final PDF with strict priority**:
+     1. `result.pdf_path` (authoritative)
+     2. `result.output_path/iteration_*_final/**/*.pdf`
+     3. latest `result.output_path/iteration_*` directory PDF
+     4. `result.output_path/paper.pdf` fallback
+   - If no PDF exists, explicitly report final PDF unavailable and include compile errors.
+
+**Typesetter execution mode:**
+- Prefer in-process Typesetter (SDK self-contained) when peer agent is available.
+- Fallback to HTTP Typesetter endpoint (`AGENTSYS_SELF_URL`) if peer is unavailable.
 
 ## Path Handling Rules
 
@@ -265,6 +275,7 @@ The metadata should match the structure in `examples/meta.json`, but with **abso
 - **Validation**: Validate each field immediately and ask for correction if invalid
 - **Path conversion**: Always convert relative paths to absolute paths immediately upon collection
 - **Reference**: Always reference `examples/meta.json` when users ask about structure (but note paths should be absolute). Treat it as a full `PaperGenerationRequest` sample and use `to_metadata()` + `to_generate_options()`.
+- **Final artifact selection**: Always prefer `result.pdf_path`; never assume the first PDF in output dir is final.
 - **Flexibility**: Allow users to provide metadata in different formats (paste full JSON, or answer questions)
 - **Direct import**: Use `from easypaper import EasyPaper, PaperMetaData, PaperGenerationRequest` directly - no API calls needed
 - **Config handling**: Ask user for config path if not found, or use default `configs/dev.yaml` (convert to absolute)

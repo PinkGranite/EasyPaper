@@ -29,6 +29,8 @@ Install from PyPI:
 pip install easypaper
 ```
 
+PDF compilation in SDK mode is self-contained when your config includes a `typesetter` model. The SDK now prefers in-process Typesetter execution and falls back to the HTTP endpoint (`AGENTSYS_SELF_URL`) when needed.
+
 ### One-shot generation
 
 **Inline metadata:**
@@ -81,6 +83,54 @@ For a minimal metadata-only JSON (no runtime options), you can use:
 ```python
 metadata = PaperMetaData.model_validate_json_file("metadata.json")
 result = await ep.generate(metadata)
+```
+
+### Finding the final PDF
+
+When review loop is enabled, EasyPaper may compile multiple PDFs (one per iteration). Use this priority to locate the final artifact:
+
+1. Use `result.pdf_path` first (authoritative final path).
+2. If missing, search under `result.output_path` in this order:
+   - `iteration_*_final/**/*.pdf` (highest priority)
+   - Latest `iteration_*` directory PDF
+   - Root `paper.pdf` as last fallback
+
+```python
+from pathlib import Path
+import re
+
+def resolve_final_pdf(result) -> str | None:
+    if getattr(result, "pdf_path", None):
+        p = Path(result.pdf_path)
+        if p.exists():
+            return str(p.resolve())
+
+    out = getattr(result, "output_path", None)
+    if not out:
+        return None
+    base = Path(out)
+    if not base.exists():
+        return None
+
+    finals = sorted(base.glob("iteration_*_final/**/*.pdf"))
+    if finals:
+        return str(finals[-1].resolve())
+
+    iter_dirs = []
+    for d in base.glob("iteration_*"):
+        m = re.match(r"iteration_(\\d+)$", d.name)
+        if m and d.is_dir():
+            iter_dirs.append((int(m.group(1)), d))
+    if iter_dirs:
+        iter_dirs.sort(key=lambda x: x[0])
+        pdfs = sorted(iter_dirs[-1][1].glob("**/*.pdf"))
+        if pdfs:
+            return str(pdfs[-1].resolve())
+
+    root_pdf = base / "paper.pdf"
+    if root_pdf.exists():
+        return str(root_pdf.resolve())
+    return None
 ```
 
 ### Streaming generation

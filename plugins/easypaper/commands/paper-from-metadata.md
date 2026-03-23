@@ -20,7 +20,14 @@ Generate a paper directly from metadata using EasyPaper Python SDK.
    - Initialize with config: `ep = EasyPaper(config_path="...")` (config path should be absolute)
    - Prefer loading from file via `PaperGenerationRequest.model_validate_json_file(path)`, then use `to_metadata()` + `to_generate_options()`; otherwise build or convert to `PaperMetaData` (with all paths absolute).
    - Generate: `result = await ep.generate(metadata, **options)`
+   - PDF compile path: prefer in-process Typesetter; fallback to HTTP Typesetter endpoint if peer is unavailable.
    - Report results with absolute file paths and summary
+   - Select final PDF using this priority:
+     1. `result.pdf_path`
+     2. `result.output_path/iteration_*_final/**/*.pdf`
+     3. latest `result.output_path/iteration_*` directory PDF
+     4. `result.output_path/paper.pdf`
+   - If no PDF is found, report final PDF unavailable and include compile error summary.
 
 ## Path Requirements
 
