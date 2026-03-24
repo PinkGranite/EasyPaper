@@ -2076,6 +2076,7 @@ class PlannerAgent(BaseAgent):
         paper_summaries = []
         for p in analysis_papers:
             paper_summaries.append({
+                "citation_key": p.get("ref_id", p.get("citation_key", "")),
                 "title": p.get("title", ""),
                 "year": p.get("year"),
                 "venue": p.get("venue", ""),
