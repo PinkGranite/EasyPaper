@@ -1299,6 +1299,7 @@ class PlannerAgent(BaseAgent):
         discovered: Dict[str, List[Dict[str, Any]]],
         core_ref_keys: List[str],
         paper_search_config: Optional[Dict[str, Any]] = None,
+        research_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Distribute references to sections, populating SectionPlan.assigned_refs.
@@ -1309,12 +1310,18 @@ class PlannerAgent(BaseAgent):
               so every section can cite them.
             - Abstract and conclusion get NO refs (citations forbidden there).
             - A single ref can appear in multiple sections.
+            - If research_context is provided with claim_evidence_matrix, use it
+              for smarter reference assignment (refs that support claims get priority).
 
         - **Args**:
             - `plan` (PaperPlan): The paper plan to mutate in-place.
             - `discovered` (Dict[str, List[Dict]]): section_type -> papers from
               discover_references().
             - `core_ref_keys` (List[str]): Citation keys of user-provided refs.
+            - `paper_search_config` (Optional[Dict[str, Any]]): Search configuration.
+            - `research_context` (Optional[Dict[str, Any]]): Research context from
+              _generate_research_context(), containing claim_evidence_matrix for
+              smarter reference assignment.
         """
         cfg = paper_search_config or {}
         budget_enabled = cfg.get("citation_budget_enabled", True)

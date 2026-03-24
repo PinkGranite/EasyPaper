@@ -1512,20 +1512,8 @@ class MetaDataAgent(ReActAgent):
                                    narrative=f"Planner discovered {disc_count} additional references via academic search to support the paper plan.",
                                    count=disc_count)
 
-                    # Phase 0c: Assign references to sections
-                    print("[MetaDataAgent] Phase 0c: Assigning references to sections...")
-                    self._planner.assign_references(
-                        plan=paper_plan,
-                        discovered=discovered,
-                        core_ref_keys=list(ref_pool.valid_citation_keys
-                                           - {p["ref_id"] for papers in discovered.values() for p in papers}),
-                        paper_search_config=search_cfg,
-                    )
-                    for sp in paper_plan.sections:
-                        if sp.assigned_refs:
-                            print(f"  [{sp.section_type}] {len(sp.assigned_refs)} refs assigned")
-
-                    # Phase 0d: Generate research context (if enabled)
+                    # Phase 0d: Generate research context (if enabled) - MOVED BEFORE Phase 0c
+                    research_context_v2 = None
                     if rc_enabled and discovered:
                         print("[MetaDataAgent] Phase 0d: Generating research context...")
                         try:
@@ -1546,6 +1534,20 @@ class MetaDataAgent(ReActAgent):
                                 )
                         except Exception as e:
                             print(f"[MetaDataAgent] Warning: Failed to generate research context: {e}")
+
+                    # Phase 0c: Assign references to sections - NOW USES research_context_v2
+                    print("[MetaDataAgent] Phase 0c: Assigning references to sections...")
+                    self._planner.assign_references(
+                        plan=paper_plan,
+                        discovered=discovered,
+                        core_ref_keys=list(ref_pool.valid_citation_keys
+                                           - {p["ref_id"] for papers in discovered.values() for p in papers}),
+                        paper_search_config=search_cfg,
+                        research_context=research_context_v2,  # NOW PASSES research_context_v2
+                    )
+                    for sp in paper_plan.sections:
+                        if sp.assigned_refs:
+                            print(f"  [{sp.section_type}] {len(sp.assigned_refs)} refs assigned")
                     await emitter.plan_created(
                         sections=len(paper_plan.sections),
                         estimated_words=paper_plan.get_total_estimated_words(),
