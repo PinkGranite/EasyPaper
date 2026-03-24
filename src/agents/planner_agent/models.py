@@ -96,6 +96,19 @@ class ParagraphPlan(BaseModel):
         return len(self.sentence_plans) if self.sentence_plans else self.approx_sentences
 
 
+class SubSectionPlan(BaseModel):
+    """
+    Planning details for a subsection within a section.
+    - **Description**:
+        - Groups multiple ParagraphPlans under a subsection title
+        - Enables hierarchical structure within a section (e.g., multiple experiments
+          within the Experiments section, multiple components within Method)
+        - Each subsection has a clear title and ordered paragraphs
+    """
+    title: str = ""
+    paragraphs: List[ParagraphPlan] = Field(default_factory=list)
+
+
 class FigurePlacement(BaseModel):
     """
     VLM-informed figure placement decision.
@@ -142,6 +155,7 @@ class SectionPlan(BaseModel):
     section_type: str
     section_title: str = ""
     paragraphs: List[ParagraphPlan] = Field(default_factory=list)
+    subsections: List[SubSectionPlan] = Field(default_factory=list)
     figures: List[FigurePlacement] = Field(default_factory=list)
     tables: List[TablePlacement] = Field(default_factory=list)
     figures_to_reference: List[str] = Field(default_factory=list)
@@ -161,22 +175,29 @@ class SectionPlan(BaseModel):
     writing_guidance: str = ""
     order: int = 0
 
+    def _all_paragraphs(self) -> List[ParagraphPlan]:
+        """Collect all paragraphs (flat + from subsections)."""
+        paras = list(self.paragraphs)
+        for sub in self.subsections:
+            paras.extend(sub.paragraphs)
+        return paras
+
     def get_total_sentences(self) -> int:
-        """Sum of effective sentence counts across all paragraphs."""
-        return sum(p.effective_sentence_count for p in self.paragraphs)
+        """Sum of effective sentence counts across all paragraphs (including subsections)."""
+        return sum(p.effective_sentence_count for p in self._all_paragraphs())
 
     def get_estimated_words(self) -> int:
         """Rough word estimate from sentence count."""
         return self.get_total_sentences() * WORDS_PER_SENTENCE
 
     def get_key_points(self) -> List[str]:
-        """Collect key_point from each paragraph."""
-        return [p.key_point for p in self.paragraphs if p.key_point]
+        """Collect key_point from each paragraph (flat + from subsections)."""
+        return [p.key_point for p in self._all_paragraphs() if p.key_point]
 
     def get_all_references(self) -> List[str]:
-        """Collect unique references across all paragraphs."""
+        """Collect unique references across all paragraphs (flat + from subsections)."""
         refs: List[str] = []
-        for p in self.paragraphs:
+        for p in self._all_paragraphs():
             for r in p.references_to_cite:
                 if r not in refs:
                     refs.append(r)
