@@ -152,7 +152,7 @@ class PaperMetaData(BaseModel):
         - Minimal input for paper generation
         - 5 natural language fields + BibTeX references
         - Optional figures and tables
-        
+
     - **Args**:
         - `title` (str): Paper title
         - `idea_hypothesis` (str): Research idea or hypothesis
@@ -167,6 +167,7 @@ class PaperMetaData(BaseModel):
         - `tables` (List[TableSpec], optional): Table specifications
         - `code_repository` (CodeRepositorySpec, optional): External project code/docs source
         - `export_prompt_traces` (bool): Whether to export prompt/evidence traces
+        - `graph_structure` (CanvasGraphStructure, optional): User's canvas graph for DAG
     """
     title: str = "Untitled Paper"
     idea_hypothesis: str
@@ -177,12 +178,15 @@ class PaperMetaData(BaseModel):
     template_path: Optional[str] = None  # Path to .zip template file
     style_guide: Optional[str] = None    # Writing style (can be extracted from template)
     target_pages: Optional[int] = None   # Target page count (overrides venue default)
-    
+
     # Figures and tables (optional)
     figures: List[FigureSpec] = Field(default_factory=list)  # Optional figures
     tables: List[TableSpec] = Field(default_factory=list)    # Optional tables
     code_repository: Optional[CodeRepositorySpec] = None
     export_prompt_traces: bool = False
+
+    # Canvas graph structure for DAG construction (optional)
+    graph_structure: Optional[Any] = None  # CanvasGraphStructure from commander
 
     def to_document_input(self) -> "DocumentInput":
         """

@@ -72,9 +72,14 @@ class DAGBuilder:
         tables: Optional[List[Any]] = None,
         paper_plan: Optional[Any] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        graph_structure: Optional[Any] = None,
     ) -> EvidenceDAG:
         """
         Construct the complete EvidenceDAG.
+
+        - **Args**:
+            - `graph_structure` (Optional): CanvasGraphStructure from user's canvas
+              for preserving reasoning flow in DAG
 
         - **Returns**:
             - `EvidenceDAG`: The populated graph with nodes, edges, and bindings.
@@ -84,6 +89,7 @@ class DAGBuilder:
         self._ingest_code_evidence(code_context, dag)
         self._ingest_literature_evidence(research_context, dag)
         self._ingest_visual_evidence(figures or [], tables or [], dag)
+        self._ingest_canvas_graph_evidence(graph_structure, dag)
         self._extract_claims(paper_plan, metadata, dag)
         self._build_edges(dag)
         self._run_bipartite_matching(dag)
@@ -206,6 +212,65 @@ class DAGBuilder:
                 confidence=0.9,
                 metadata={"caption": caption, "section": section},
             ))
+
+    def _ingest_canvas_graph_evidence(
+        self,
+        graph_structure: Optional[Any],
+        dag: EvidenceDAG,
+    ) -> None:
+        """
+        Convert user's canvas graph nodes/edges into DAG evidence nodes and reasoning edges.
+
+        Canvas nodes represent the user's explicit reasoning flow (hypothesis -> method -> result).
+        These are added as evidence nodes with high confidence since they represent user input.
+        """
+        if not graph_structure:
+            return
+
+        # Import here to avoid circular imports at module level
+        from src.models.evidence_graph import EvidenceNodeType, EdgeType
+
+        nodes = getattr(graph_structure, "nodes", []) or []
+        edges = getattr(graph_structure, "edges", []) or []
+
+        if not nodes:
+            return
+
+        node_id_map = {}  # canvas_node_id -> dag_node_id
+
+        # Add canvas nodes as evidence nodes
+        for cn in nodes:
+            node_id = getattr(cn, "node_id", "") or ""
+            node_type = getattr(cn, "node_type", "") or ""
+            content = getattr(cn, "content", "") or ""
+            label = getattr(cn, "label", "") or ""
+
+            ev_node = EvidenceNode(
+                node_id=f"CANVAS_{node_id}",
+                node_type=EvidenceNodeType.CANVAS,
+                content=content,
+                source_path=node_id,
+                confidence=1.0,  # User-provided content has highest confidence
+                metadata={"canvas_node_type": node_type, "label": label},
+            )
+            dag.add_evidence(ev_node)
+            node_id_map[node_id] = ev_node.node_id
+
+        # Add reasoning edges between canvas-derived evidence nodes
+        for edge in edges:
+            src = getattr(edge, "source_id", "") or ""
+            tgt = getattr(edge, "target_id", "") or ""
+            edge_type = getattr(edge, "edge_type", "reasoning") or "reasoning"
+
+            if src in node_id_map and tgt in node_id_map:
+                dag.add_edge(DAGEdge(
+                    source_id=node_id_map[src],
+                    target_id=node_id_map[tgt],
+                    edge_type=EdgeType.REASONING,
+                    weight=0.9,  # High weight - user explicitly connected these
+                    reason=f"User reasoning: {edge_type}",
+                    is_bound=True,  # Explicit user binding
+                ))
 
     # ------------------------------------------------------------------
     # Claim extraction

@@ -1568,6 +1568,7 @@ class MetaDataAgent(ReActAgent):
                         figures=metadata.figures,
                         tables=metadata.tables,
                         paper_plan=paper_plan,
+                        graph_structure=metadata.graph_structure,
                     )
                     paper_plan.evidence_dag = evidence_dag.to_serializable()
 
