@@ -1416,15 +1416,8 @@ class MetaDataAgent(ReActAgent):
                     if disc_count:
                         print(f"[MetaDataAgent] Discovered {disc_count} new references")
 
-                    # Phase 0c: Assign references to sections
-                    self._planner.assign_references(
-                        plan=paper_plan, discovered=discovered,
-                        core_ref_keys=list(ref_pool.valid_citation_keys
-                                           - {p["ref_id"] for papers in discovered.values() for p in papers}),
-                        paper_search_config=search_cfg,
-                    )
-
-                    # Phase 0d: Research context v2
+                    # Phase 0d: Generate research context (if enabled) - MOVED BEFORE Phase 0c
+                    research_context_v2 = None
                     if rc_enabled and discovered:
                         try:
                             merged_discovered: Dict[str, List[Dict[str, Any]]] = dict(discovered)
@@ -1440,6 +1433,21 @@ class MetaDataAgent(ReActAgent):
                         except Exception as e:
                             print(f"[MetaDataAgent] Warning: Failed to generate research context: {e}")
 
+<<<<<<< HEAD
+=======
+                    # Phase 0c: Assign references to sections - NOW USES research_context_v2
+                    print("[MetaDataAgent] Phase 0c: Assigning references to sections...")
+                    self._planner.assign_references(
+                        plan=paper_plan,
+                        discovered=discovered,
+                        core_ref_keys=list(ref_pool.valid_citation_keys
+                                           - {p["ref_id"] for papers in discovered.values() for p in papers}),
+                        paper_search_config=search_cfg,
+                        research_context=research_context_v2,  # NOW PASSES research_context_v2
+                    )
+                    for sp in paper_plan.sections:
+                        if sp.assigned_refs:
+                            print(f"  [{sp.section_type}] {len(sp.assigned_refs)} refs assigned")
                     await emitter.plan_created(
                         sections=len(paper_plan.sections),
                         estimated_words=paper_plan.get_total_estimated_words(),
@@ -1451,11 +1459,14 @@ class MetaDataAgent(ReActAgent):
             # Phase 0d.5: Build Evidence DAG
             if paper_plan:
                 try:
-                    dag_builder = DAGBuilder()
-                    evidence_dag = dag_builder.build(
-                        code_context=code_context, research_context=research_context,
-                        figures=metadata.figures, tables=metadata.tables,
+                    dag_builder = DAGBuilder(llm_client=self.client)
+                    evidence_dag = await dag_builder.build(
+                        code_context=code_context,
+                        research_context=research_context,
+                        figures=metadata.figures,
+                        tables=metadata.tables,
                         paper_plan=paper_plan,
+                        graph_structure=metadata.graph_structure,
                     )
                     paper_plan.evidence_dag = evidence_dag.to_serializable()
 

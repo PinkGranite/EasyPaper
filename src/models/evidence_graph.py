@@ -26,6 +26,7 @@ class EvidenceNodeType(str, Enum):
     FIGURE = "figure"
     TABLE = "table"
     METRIC = "metric"
+    CANVAS = "canvas"  # User's canvas graph nodes
 
 
 class ClaimNodeType(str, Enum):
@@ -43,6 +44,7 @@ class EdgeType(str, Enum):
     CONTRADICTS = "contradicts"
     CONTEXTUALIZES = "contextualizes"
     DERIVED_FROM = "derived_from"
+    REASONING = "reasoning"  # User canvas edge - explicit reasoning flow
 
 
 # ---------------------------------------------------------------------------

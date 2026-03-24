@@ -18,6 +18,7 @@ from ...config.schema import ModelConfig
 from .models import (
     PaperPlan,
     SectionPlan,
+    SubSectionPlan,
     PlanRequest,
     PlanResult,
     ParagraphPlan,
@@ -164,7 +165,8 @@ Output JSON:
       "role": "motivation|problem_statement|definition|evidence|comparison|transition|summary",
       "references_to_cite": ["ref_key1"],
       "figures_to_reference": [],
-      "tables_to_reference": []
+      "tables_to_reference": [],
+      "cluster_index": 0
     }}
   ],
   "figures": [
@@ -919,7 +921,7 @@ class PlannerAgent(BaseAgent):
             else:
                 citation_budget = {}
 
-            sections.append(SectionPlan(
+            section = SectionPlan(
                 section_type=section_type,
                 section_title=section_title,
                 paragraphs=paragraphs,
@@ -946,7 +948,13 @@ class PlannerAgent(BaseAgent):
                 ),
                 writing_guidance=section_data.get("writing_guidance", ""),
                 order=order,
-            ))
+            )
+
+            # Split into subsections if recommended or multiple clusters detected
+            if section.sectioning_recommended and len(section.topic_clusters) > 1:
+                section = self._split_into_subsections(section, section.topic_clusters)
+
+            sections.append(section)
 
             logger.info(
                 "planner.step3_section section=%s paragraphs=%d sentences=%d",
@@ -956,19 +964,29 @@ class PlannerAgent(BaseAgent):
 
         # Whole-plan paragraph budget validation
         target_paras = estimate_target_paragraphs(total_words)
-        llm_total_paras = sum(len(sp.paragraphs) for sp in sections)
+        llm_total_paras = sum(len(sp._all_paragraphs()) for sp in sections)
         if llm_total_paras > 0 and llm_total_paras < target_paras * 0.5:
             scale = target_paras / max(1, llm_total_paras)
             for sp in sections:
                 if sp.section_type in ("abstract", "conclusion"):
                     continue
+                all_paras = sp._all_paragraphs()
                 section_target_sents = int(
-                    sum(p.approx_sentences for p in sp.paragraphs) * scale
+                    sum(p.approx_sentences for p in all_paras) * scale
                 )
-                sp.paragraphs = self._expand_paragraph_plan(
-                    sp.paragraphs, section_target_sents, sp.section_type,
-                )
-            expanded_total = sum(len(sp.paragraphs) for sp in sections)
+                if sp.subsections:
+                    # Expand paragraphs within each subsection proportionally
+                    for sub in sp.subsections:
+                        sub_ratio = len(sub.paragraphs) / max(1, len(all_paras))
+                        sub_sents = max(1, int(section_target_sents * sub_ratio))
+                        sub.paragraphs = self._expand_paragraph_plan(
+                            sub.paragraphs, sub_sents, sp.section_type,
+                        )
+                else:
+                    sp.paragraphs = self._expand_paragraph_plan(
+                        sp.paragraphs, section_target_sents, sp.section_type,
+                    )
+            expanded_total = sum(len(sp._all_paragraphs()) for sp in sections)
             logger.info(
                 "planner.plan_budget_expansion llm_paras=%d target=%d expanded=%d",
                 llm_total_paras, target_paras, expanded_total,
@@ -1299,6 +1317,7 @@ class PlannerAgent(BaseAgent):
         discovered: Dict[str, List[Dict[str, Any]]],
         core_ref_keys: List[str],
         paper_search_config: Optional[Dict[str, Any]] = None,
+        research_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Distribute references to sections, populating SectionPlan.assigned_refs.
@@ -1309,12 +1328,18 @@ class PlannerAgent(BaseAgent):
               so every section can cite them.
             - Abstract and conclusion get NO refs (citations forbidden there).
             - A single ref can appear in multiple sections.
+            - If research_context is provided with claim_evidence_matrix, use it
+              for smarter reference assignment (refs that support claims get priority).
 
         - **Args**:
             - `plan` (PaperPlan): The paper plan to mutate in-place.
             - `discovered` (Dict[str, List[Dict]]): section_type -> papers from
               discover_references().
             - `core_ref_keys` (List[str]): Citation keys of user-provided refs.
+            - `paper_search_config` (Optional[Dict[str, Any]]): Search configuration.
+            - `research_context` (Optional[Dict[str, Any]]): Research context from
+              _generate_research_context(), containing claim_evidence_matrix for
+              smarter reference assignment.
         """
         cfg = paper_search_config or {}
         budget_enabled = cfg.get("citation_budget_enabled", True)
@@ -1948,6 +1973,88 @@ class PlannerAgent(BaseAgent):
             # Return all papers if filtering fails
             return papers
 
+    async def _score_papers_by_relevance(
+        self,
+        research_topic: str,
+        papers: List[Dict[str, Any]],
+    ) -> List[tuple]:
+        """
+        Score papers by LLM-assessed relevance to the research topic.
+
+        - **Description**:
+            - Uses the LLM to score each paper's relevance to the research topic
+            - Returns a list of (paper, relevance_score) tuples sorted by score descending
+
+        - **Args**:
+            - `research_topic` (str): The research topic/title to score against
+            - `papers` (List[Dict[str, Any]]): List of paper dictionaries
+
+        - **Returns**:
+            - List[tuple]: Sorted list of (paper, relevance_score) tuples
+        """
+        if not papers:
+            return []
+
+        # Prepare paper summaries for LLM scoring
+        paper_summaries = []
+        for i, p in enumerate(papers):
+            paper_summaries.append({
+                "index": i,
+                "title": p.get("title", ""),
+                "abstract": p.get("abstract", "")[:300] if p.get("abstract") else "",
+            })
+
+        papers_json = json.dumps(paper_summaries, ensure_ascii=False)
+
+        system_msg = (
+            "You are an academic research analyst. Score each paper's relevance to the research topic. "
+            "Respond with JSON only."
+        )
+        user_prompt = (
+            f"Research topic: {research_topic}\n\n"
+            f"Papers to score:\n{papers_json}\n\n"
+            "Score each paper's relevance to the research topic on a scale of 0-10. "
+            "Consider: topical relevance, methodological relevance, and how directly the paper "
+            "informs or supports the research topic.\n\n"
+            "Output ONLY a JSON array of objects with 'index' and 'relevance_score' fields:\n"
+            "[{\"index\": 0, \"relevance_score\": 8.5}, {\"index\": 1, \"relevance_score\": 6.0}, ...]"
+        )
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+                max_tokens=800,
+            )
+            raw = response.choices[0].message.content or ""
+            scores_data = self._safe_load_json(raw, expected=list)
+
+            if scores_data is None:
+                logger.warning("planner.score_papers_by_relevance: failed to parse LLM output")
+                # Fallback: return papers with uniform score
+                return [(p, 0.0) for p in papers]
+
+            # Build index -> score mapping
+            score_map: Dict[int, float] = {}
+            for item in scores_data:
+                if isinstance(item, dict) and "index" in item and "relevance_score" in item:
+                    score_map[item["index"]] = float(item["relevance_score"])
+
+            # Return sorted list of (paper, score) tuples
+            scored_papers = [
+                (papers[i], score_map.get(i, 0.0)) for i in range(len(papers))
+            ]
+            scored_papers.sort(key=lambda x: x[1], reverse=True)
+            return scored_papers
+
+        except Exception as e:
+            logger.warning("planner.score_papers_by_relevance error: %s", e)
+            return [(p, 0.0) for p in papers]
+
     async def _generate_research_context(
         self,
         plan: "PaperPlan",
@@ -1984,19 +2091,17 @@ class PlannerAgent(BaseAgent):
                 "paper_assignments": {},
             }
 
-        # Prepare paper information for LLM (cap volume to reduce malformed/truncated outputs)
-        ranked_papers = sorted(
-            all_papers,
-            key=lambda p: (
-                int(p.get("citation_count") or 0),
-                int(p.get("year") or 0),
-            ),
-            reverse=True,
+        # Score papers by LLM-assessed relevance to the research topic
+        scored_papers = await self._score_papers_by_relevance(
+            research_topic=plan.title,
+            papers=all_papers,
         )
-        analysis_papers = ranked_papers[:24]
+        # scored_papers is List[tuple] of (paper, relevance_score), sorted by score descending
+        analysis_papers = [p for p, _ in scored_papers[:24]]
         paper_summaries = []
         for p in analysis_papers:
             paper_summaries.append({
+                "citation_key": p.get("ref_id", p.get("citation_key", "")),
                 "title": p.get("title", ""),
                 "year": p.get("year"),
                 "venue": p.get("venue", ""),
@@ -2402,8 +2507,85 @@ class PlannerAgent(BaseAgent):
                 references_to_cite=raw.get("references_to_cite", []),
                 figures_to_reference=raw.get("figures_to_reference", []),
                 tables_to_reference=raw.get("tables_to_reference", []),
+                cluster_index=raw.get("cluster_index"),
             ))
         return paragraphs
+
+    def _split_into_subsections(
+        self,
+        section: SectionPlan,
+        topic_clusters: List[str],
+    ) -> SectionPlan:
+        """
+        Split a section into subsections based on paragraph cluster_index values.
+
+        When topic_clusters are provided and paragraphs have cluster_index assignments,
+        groups paragraphs with the same cluster_index into subsections with
+        cluster-themed titles.
+
+        - **Args**:
+            - `section` (SectionPlan): Section to split
+            - `topic_clusters` (List[str]): Ordered list of cluster theme names
+
+        - **Returns**:
+            - `SectionPlan`: Section potentially updated with subsections
+        """
+        if not section.paragraphs:
+            return section
+
+        # Group paragraphs by cluster_index
+        clusters: Dict[int, List[ParagraphPlan]] = {}
+        unclustered: List[ParagraphPlan] = []
+
+        for para in section.paragraphs:
+            if para.cluster_index is not None:
+                idx = para.cluster_index
+                if idx not in clusters:
+                    clusters[idx] = []
+                clusters[idx].append(para)
+            else:
+                unclustered.append(para)
+
+        # If no meaningful clustering (all in one cluster or no clusters), return as-is
+        if len(clusters) <= 1 and not unclustered:
+            return section
+
+        # Build subsections from clusters
+        subsections: List[SubSectionPlan] = []
+
+        # Create subsections in cluster order
+        for cluster_idx in sorted(clusters.keys()):
+            paras = clusters[cluster_idx]
+            if cluster_idx < len(topic_clusters):
+                title = topic_clusters[cluster_idx]
+            else:
+                title = f"Theme {cluster_idx + 1}"
+            subsections.append(SubSectionPlan(title=title, paragraphs=paras))
+
+        # Add unclustered paragraphs to a catch-all subsection if any exist
+        if unclustered:
+            subsections.append(SubSectionPlan(title="General", paragraphs=unclustered))
+
+        # Return new SectionPlan with subsections (clear flat paragraphs)
+        return SectionPlan(
+            section_type=section.section_type,
+            section_title=section.section_title,
+            paragraphs=[],  # Subsections take over
+            subsections=subsections,
+            figures=section.figures,
+            tables=section.tables,
+            figures_to_reference=section.figures_to_reference,
+            tables_to_reference=section.tables_to_reference,
+            content_sources=section.content_sources,
+            depends_on=section.depends_on,
+            citation_budget=section.citation_budget,
+            topic_clusters=section.topic_clusters,
+            transition_intents=section.transition_intents,
+            sectioning_recommended=section.sectioning_recommended,
+            code_focus=section.code_focus,
+            writing_guidance=section.writing_guidance,
+            order=section.order,
+        )
 
     @staticmethod
     def _normalize_string_list(raw: Any, max_items: int = 5) -> List[str]:

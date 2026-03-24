@@ -53,6 +53,31 @@ class SectionHint(BaseModel):
     word_count_limit: Optional[int] = None
 
 
+class CanvasGraphNode(BaseModel):
+    """Represents a node in the user's canvas graph."""
+    node_id: str
+    node_type: str  # hypothesis, method, result, etc.
+    label: str
+    content: str
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CanvasGraphEdge(BaseModel):
+    """Represents an edge in the user's canvas graph."""
+    edge_id: str
+    source_id: str
+    target_id: str
+    edge_type: str = "reasoning"  # reasoning, supports, contradicts, etc.
+
+
+class CanvasGraphStructure(BaseModel):
+    """Preserves user's canvas graph as structured data for DAG construction."""
+    nodes: List[CanvasGraphNode] = Field(default_factory=list)
+    edges: List[CanvasGraphEdge] = Field(default_factory=list)
+    root_hypothesis_id: Optional[str] = None
+    terminal_result_ids: List[str] = Field(default_factory=list)
+
+
 class CanvasMetadata(BaseModel):
     """
     Structured metadata extracted from a research canvas by LLM.
