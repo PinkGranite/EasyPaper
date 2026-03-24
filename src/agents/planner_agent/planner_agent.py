@@ -1948,6 +1948,88 @@ class PlannerAgent(BaseAgent):
             # Return all papers if filtering fails
             return papers
 
+    async def _score_papers_by_relevance(
+        self,
+        research_topic: str,
+        papers: List[Dict[str, Any]],
+    ) -> List[tuple]:
+        """
+        Score papers by LLM-assessed relevance to the research topic.
+
+        - **Description**:
+            - Uses the LLM to score each paper's relevance to the research topic
+            - Returns a list of (paper, relevance_score) tuples sorted by score descending
+
+        - **Args**:
+            - `research_topic` (str): The research topic/title to score against
+            - `papers` (List[Dict[str, Any]]): List of paper dictionaries
+
+        - **Returns**:
+            - List[tuple]: Sorted list of (paper, relevance_score) tuples
+        """
+        if not papers:
+            return []
+
+        # Prepare paper summaries for LLM scoring
+        paper_summaries = []
+        for i, p in enumerate(papers):
+            paper_summaries.append({
+                "index": i,
+                "title": p.get("title", ""),
+                "abstract": p.get("abstract", "")[:300] if p.get("abstract") else "",
+            })
+
+        papers_json = json.dumps(paper_summaries, ensure_ascii=False)
+
+        system_msg = (
+            "You are an academic research analyst. Score each paper's relevance to the research topic. "
+            "Respond with JSON only."
+        )
+        user_prompt = (
+            f"Research topic: {research_topic}\n\n"
+            f"Papers to score:\n{papers_json}\n\n"
+            "Score each paper's relevance to the research topic on a scale of 0-10. "
+            "Consider: topical relevance, methodological relevance, and how directly the paper "
+            "informs or supports the research topic.\n\n"
+            "Output ONLY a JSON array of objects with 'index' and 'relevance_score' fields:\n"
+            "[{\"index\": 0, \"relevance_score\": 8.5}, {\"index\": 1, \"relevance_score\": 6.0}, ...]"
+        )
+
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.1,
+                max_tokens=800,
+            )
+            raw = response.choices[0].message.content or ""
+            scores_data = self._safe_load_json(raw, expected=list)
+
+            if scores_data is None:
+                logger.warning("planner.score_papers_by_relevance: failed to parse LLM output")
+                # Fallback: return papers with uniform score
+                return [(p, 0.0) for p in papers]
+
+            # Build index -> score mapping
+            score_map: Dict[int, float] = {}
+            for item in scores_data:
+                if isinstance(item, dict) and "index" in item and "relevance_score" in item:
+                    score_map[item["index"]] = float(item["relevance_score"])
+
+            # Return sorted list of (paper, score) tuples
+            scored_papers = [
+                (papers[i], score_map.get(i, 0.0)) for i in range(len(papers))
+            ]
+            scored_papers.sort(key=lambda x: x[1], reverse=True)
+            return scored_papers
+
+        except Exception as e:
+            logger.warning("planner.score_papers_by_relevance error: %s", e)
+            return [(p, 0.0) for p in papers]
+
     async def _generate_research_context(
         self,
         plan: "PaperPlan",
@@ -1984,16 +2066,13 @@ class PlannerAgent(BaseAgent):
                 "paper_assignments": {},
             }
 
-        # Prepare paper information for LLM (cap volume to reduce malformed/truncated outputs)
-        ranked_papers = sorted(
-            all_papers,
-            key=lambda p: (
-                int(p.get("citation_count") or 0),
-                int(p.get("year") or 0),
-            ),
-            reverse=True,
+        # Score papers by LLM-assessed relevance to the research topic
+        scored_papers = await self._score_papers_by_relevance(
+            research_topic=plan.title,
+            papers=all_papers,
         )
-        analysis_papers = ranked_papers[:24]
+        # scored_papers is List[tuple] of (paper, relevance_score), sorted by score descending
+        analysis_papers = [p for p, _ in scored_papers[:24]]
         paper_summaries = []
         for p in analysis_papers:
             paper_summaries.append({
