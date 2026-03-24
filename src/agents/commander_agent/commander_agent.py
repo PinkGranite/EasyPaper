@@ -935,7 +935,71 @@ class CommanderAgent(BaseAgent):
             style_guide=style_guide,
         )
 
-        return {"metadata": metadata}
+        # Extract graph structure preserving user's reasoning flow
+        graph_structure = await self.extract_graph_structure(canvas_data)
+
+        return {"metadata": metadata, "graph_structure": graph_structure}
+
+    async def extract_graph_structure(self, canvas_data: Dict[str, Any]) -> "CanvasGraphStructure":
+        """
+        Extract canvas graph as structured data preserving user's reasoning flow.
+
+        - **Description**:
+            - Converts raw canvas nodes/edges into structured CanvasGraphStructure
+            - Identifies root hypotheses and terminal results
+            - Preserves node types, labels, and content for DAG construction
+
+        - **Args**:
+            - `canvas_data` (dict): Contains 'nodes', 'edges'
+
+        - **Returns**:
+            - `CanvasGraphStructure`: Structured graph data for DAG builder
+        """
+        from .models import CanvasGraphStructure, CanvasGraphNode, CanvasGraphEdge
+
+        nodes = canvas_data.get("nodes", [])
+        edges = canvas_data.get("edges", [])
+
+        graph_nodes = []
+        node_map = {}
+        for node in nodes:
+            node_id = node.get("id", "")
+            node_type = node.get("type", "")
+            data = node.get("data", {})
+            graph_nodes.append(CanvasGraphNode(
+                node_id=node_id,
+                node_type=node_type,
+                label=data.get("title", data.get("label", "")),
+                content=data.get("content", ""),
+                metadata=data,
+            ))
+            node_map[node_id] = node_id
+
+        graph_edges = []
+        for edge in edges:
+            src = edge.get("source", edge.get("sourceNodeID", ""))
+            tgt = edge.get("target", edge.get("targetNodeID", ""))
+            graph_edges.append(CanvasGraphEdge(
+                edge_id=edge.get("id", ""),
+                source_id=src,
+                target_id=tgt,
+                edge_type=edge.get("edgeType", "reasoning"),
+            ))
+
+        # Identify root hypotheses and terminal results
+        source_nodes = {e.source_id for e in graph_edges}
+        target_nodes = {e.target_id for e in graph_edges}
+        root_ids = [n.node_id for n in graph_nodes
+                    if n.node_id not in source_nodes and n.node_type == "hypothesis"]
+        terminal_ids = [n.node_id for n in graph_nodes
+                       if n.node_id not in target_nodes and n.node_type == "result"]
+
+        return CanvasGraphStructure(
+            nodes=graph_nodes,
+            edges=graph_edges,
+            root_hypothesis_id=root_ids[0] if root_ids else None,
+            terminal_result_ids=terminal_ids,
+        )
 
     async def run(self, 
                   work_id: str,
