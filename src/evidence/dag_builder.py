@@ -53,18 +53,25 @@ class DAGBuilder:
         - Ingests code evidence, literature evidence, and visual evidence.
         - Extracts claims from PaperPlan paragraphs or metadata fields.
         - Creates heuristic edges based on role/scope affinity.
+        - Optionally uses LLM to find semantic claim-evidence matches.
         - Runs greedy bipartite matching to confirm bindings.
 
     - **Args**:
-        - `code_context` (Dict): Output of CodeContextBuilder.build()
-        - `research_context` (Dict): Output of PlannerAgent._generate_research_context()
-        - `figures` (List): FigureSpec dicts or objects
-        - `tables` (List): TableSpec dicts or objects
-        - `paper_plan` (PaperPlan, optional): If available, used for claim extraction
-        - `metadata` (Dict, optional): Raw PaperMetaData fields as fallback
+        - `llm_client` (Any, optional): LLM client for semantic matching.
+          Must have `chat.completions.create` method.
     """
 
-    def build(
+    def __init__(self, llm_client: Optional[Any] = None):
+        """
+        Initialize DAGBuilder with optional LLM client.
+
+        - **Args**:
+            - `llm_client` (Any, optional): Chat completions client for LLM-based
+              semantic matching. If not provided, only heuristic matching is used.
+        """
+        self._llm = llm_client
+
+    async def build(
         self,
         code_context: Optional[Dict[str, Any]] = None,
         research_context: Optional[Dict[str, Any]] = None,
@@ -73,6 +80,7 @@ class DAGBuilder:
         paper_plan: Optional[Any] = None,
         metadata: Optional[Dict[str, Any]] = None,
         graph_structure: Optional[Any] = None,
+        llm_client: Optional[Any] = None,
     ) -> EvidenceDAG:
         """
         Construct the complete EvidenceDAG.
@@ -80,6 +88,8 @@ class DAGBuilder:
         - **Args**:
             - `graph_structure` (Optional): CanvasGraphStructure from user's canvas
               for preserving reasoning flow in DAG
+            - `llm_client` (Optional[Any]): LLM client for semantic matching.
+              If provided, uses LLMDAGBuilder to find additional claim-evidence matches.
 
         - **Returns**:
             - `EvidenceDAG`: The populated graph with nodes, edges, and bindings.
@@ -92,10 +102,85 @@ class DAGBuilder:
         self._ingest_canvas_graph_evidence(graph_structure, dag)
         self._extract_claims(paper_plan, metadata, dag)
         self._build_edges(dag)
+
+        # Optional: Use LLM-based matching to add semantic edges
+        client = llm_client or self._llm
+        if client and research_context:
+            await self._add_llm_edges(dag, research_context)
+
         self._run_bipartite_matching(dag)
 
         logger.info("EvidenceDAG built: %s", dag.summary())
         return dag
+
+    async def _add_llm_edges(
+        self,
+        dag: EvidenceDAG,
+        research_context: Dict[str, Any],
+    ) -> None:
+        """
+        Use LLM to find semantic claim-evidence matches and add them as edges.
+
+        - **Args**:
+            - `dag` (EvidenceDAG): The DAG to add edges to
+            - `research_context` (Dict): Research context for paper topic
+        """
+        try:
+            from .llm_dag_builder import LLMDAGBuilder
+
+            llm_builder = LLMDAGBuilder(self._llm)
+
+            # Get paper topic from research context
+            paper_topic = research_context.get("research_area", "")
+            if not paper_topic and research_context.get("key_papers"):
+                # Fallback: use first paper title as topic
+                paper_topic = research_context["key_papers"][0].get("title", "")
+
+            # Convert claims and evidence to dict format for LLM
+            claims = [
+                {
+                    "node_id": c.node_id,
+                    "statement": c.statement,
+                    "section_scope": c.section_scope,
+                    "priority": c.priority,
+                }
+                for c in dag.claim_nodes.values()
+            ]
+            evidence = [
+                {
+                    "node_id": e.node_id,
+                    "content": e.content,
+                    "node_type": e.node_type.value if hasattr(e.node_type, "value") else str(e.node_type),
+                    "source_path": e.source_path,
+                }
+                for e in dag.evidence_nodes.values()
+            ]
+
+            # Find matches via LLM
+            matches = await llm_builder.find_claim_evidence_matches(
+                claims=claims,
+                evidence=evidence,
+                paper_topic=paper_topic,
+            )
+
+            # Add LLM-suggested edges with high confidence
+            for match in matches:
+                if match.confidence >= 0.6:
+                    dag.add_edge(DAGEdge(
+                        source_id=match.evidence_id,
+                        target_id=match.claim_id,
+                        edge_type=EdgeType.SUPPORTS,
+                        weight=match.confidence,
+                        reason=f"LLM semantic reasoning: {match.reasoning}",
+                        is_bound=False,  # Let bipartite matching decide final binding
+                    ))
+
+            logger.info("LLM matched %d claim-evidence pairs", len(matches))
+
+        except ImportError:
+            logger.warning("LLMDAGBuilder not available, skipping LLM matching")
+        except Exception as e:
+            logger.warning("LLM matching failed: %s", e)
 
     # ------------------------------------------------------------------
     # Evidence ingestion

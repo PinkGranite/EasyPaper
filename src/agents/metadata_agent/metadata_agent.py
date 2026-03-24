@@ -1561,8 +1561,8 @@ class MetaDataAgent(ReActAgent):
             # =================================================================
             if paper_plan:
                 try:
-                    dag_builder = DAGBuilder()
-                    evidence_dag = dag_builder.build(
+                    dag_builder = DAGBuilder(llm_client=self.client)
+                    evidence_dag = await dag_builder.build(
                         code_context=code_context,
                         research_context=research_context,
                         figures=metadata.figures,
