@@ -376,8 +376,9 @@ class DAGBuilder:
             sections = getattr(paper_plan, "sections", []) or []
             for sp in sections:
                 section_type = getattr(sp, "section_type", "")
-                paragraphs = getattr(sp, "paragraphs", []) or []
-                for pidx, para in enumerate(paragraphs):
+                # Use _all_paragraphs() to include paragraphs from subsections
+                all_paras = getattr(sp, "_all_paragraphs", lambda: getattr(sp, "paragraphs", []))()
+                for pidx, para in enumerate(all_paras):
                     key_point = getattr(para, "key_point", "")
                     if not key_point:
                         continue
