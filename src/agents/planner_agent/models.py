@@ -89,6 +89,8 @@ class ParagraphPlan(BaseModel):
     sentence_plans: List[SentencePlan] = Field(default_factory=list)
     # Template for degraded generation (populated by template-slot filling)
     paragraph_template: Optional[Dict[str, Any]] = None
+    # Topic cluster assignment for subsection grouping (populated by planner when topic_clusters present)
+    cluster_index: Optional[int] = None
 
     @property
     def effective_sentence_count(self) -> int:

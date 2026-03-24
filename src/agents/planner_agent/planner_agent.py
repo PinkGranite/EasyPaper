@@ -18,6 +18,7 @@ from ...config.schema import ModelConfig
 from .models import (
     PaperPlan,
     SectionPlan,
+    SubSectionPlan,
     PlanRequest,
     PlanResult,
     ParagraphPlan,
@@ -164,7 +165,8 @@ Output JSON:
       "role": "motivation|problem_statement|definition|evidence|comparison|transition|summary",
       "references_to_cite": ["ref_key1"],
       "figures_to_reference": [],
-      "tables_to_reference": []
+      "tables_to_reference": [],
+      "cluster_index": 0
     }}
   ],
   "figures": [
@@ -919,7 +921,7 @@ class PlannerAgent(BaseAgent):
             else:
                 citation_budget = {}
 
-            sections.append(SectionPlan(
+            section = SectionPlan(
                 section_type=section_type,
                 section_title=section_title,
                 paragraphs=paragraphs,
@@ -946,7 +948,13 @@ class PlannerAgent(BaseAgent):
                 ),
                 writing_guidance=section_data.get("writing_guidance", ""),
                 order=order,
-            ))
+            )
+
+            # Split into subsections if recommended or multiple clusters detected
+            if section.sectioning_recommended and len(section.topic_clusters) > 1:
+                section = self._split_into_subsections(section, section.topic_clusters)
+
+            sections.append(section)
 
             logger.info(
                 "planner.step3_section section=%s paragraphs=%d sentences=%d",
@@ -956,19 +964,29 @@ class PlannerAgent(BaseAgent):
 
         # Whole-plan paragraph budget validation
         target_paras = estimate_target_paragraphs(total_words)
-        llm_total_paras = sum(len(sp.paragraphs) for sp in sections)
+        llm_total_paras = sum(len(sp._all_paragraphs()) for sp in sections)
         if llm_total_paras > 0 and llm_total_paras < target_paras * 0.5:
             scale = target_paras / max(1, llm_total_paras)
             for sp in sections:
                 if sp.section_type in ("abstract", "conclusion"):
                     continue
+                all_paras = sp._all_paragraphs()
                 section_target_sents = int(
-                    sum(p.approx_sentences for p in sp.paragraphs) * scale
+                    sum(p.approx_sentences for p in all_paras) * scale
                 )
-                sp.paragraphs = self._expand_paragraph_plan(
-                    sp.paragraphs, section_target_sents, sp.section_type,
-                )
-            expanded_total = sum(len(sp.paragraphs) for sp in sections)
+                if sp.subsections:
+                    # Expand paragraphs within each subsection proportionally
+                    for sub in sp.subsections:
+                        sub_ratio = len(sub.paragraphs) / max(1, len(all_paras))
+                        sub_sents = max(1, int(section_target_sents * sub_ratio))
+                        sub.paragraphs = self._expand_paragraph_plan(
+                            sub.paragraphs, sub_sents, sp.section_type,
+                        )
+                else:
+                    sp.paragraphs = self._expand_paragraph_plan(
+                        sp.paragraphs, section_target_sents, sp.section_type,
+                    )
+            expanded_total = sum(len(sp._all_paragraphs()) for sp in sections)
             logger.info(
                 "planner.plan_budget_expansion llm_paras=%d target=%d expanded=%d",
                 llm_total_paras, target_paras, expanded_total,
@@ -2489,8 +2507,85 @@ class PlannerAgent(BaseAgent):
                 references_to_cite=raw.get("references_to_cite", []),
                 figures_to_reference=raw.get("figures_to_reference", []),
                 tables_to_reference=raw.get("tables_to_reference", []),
+                cluster_index=raw.get("cluster_index"),
             ))
         return paragraphs
+
+    def _split_into_subsections(
+        self,
+        section: SectionPlan,
+        topic_clusters: List[str],
+    ) -> SectionPlan:
+        """
+        Split a section into subsections based on paragraph cluster_index values.
+
+        When topic_clusters are provided and paragraphs have cluster_index assignments,
+        groups paragraphs with the same cluster_index into subsections with
+        cluster-themed titles.
+
+        - **Args**:
+            - `section` (SectionPlan): Section to split
+            - `topic_clusters` (List[str]): Ordered list of cluster theme names
+
+        - **Returns**:
+            - `SectionPlan`: Section potentially updated with subsections
+        """
+        if not section.paragraphs:
+            return section
+
+        # Group paragraphs by cluster_index
+        clusters: Dict[int, List[ParagraphPlan]] = {}
+        unclustered: List[ParagraphPlan] = []
+
+        for para in section.paragraphs:
+            if para.cluster_index is not None:
+                idx = para.cluster_index
+                if idx not in clusters:
+                    clusters[idx] = []
+                clusters[idx].append(para)
+            else:
+                unclustered.append(para)
+
+        # If no meaningful clustering (all in one cluster or no clusters), return as-is
+        if len(clusters) <= 1 and not unclustered:
+            return section
+
+        # Build subsections from clusters
+        subsections: List[SubSectionPlan] = []
+
+        # Create subsections in cluster order
+        for cluster_idx in sorted(clusters.keys()):
+            paras = clusters[cluster_idx]
+            if cluster_idx < len(topic_clusters):
+                title = topic_clusters[cluster_idx]
+            else:
+                title = f"Theme {cluster_idx + 1}"
+            subsections.append(SubSectionPlan(title=title, paragraphs=paras))
+
+        # Add unclustered paragraphs to a catch-all subsection if any exist
+        if unclustered:
+            subsections.append(SubSectionPlan(title="General", paragraphs=unclustered))
+
+        # Return new SectionPlan with subsections (clear flat paragraphs)
+        return SectionPlan(
+            section_type=section.section_type,
+            section_title=section.section_title,
+            paragraphs=[],  # Subsections take over
+            subsections=subsections,
+            figures=section.figures,
+            tables=section.tables,
+            figures_to_reference=section.figures_to_reference,
+            tables_to_reference=section.tables_to_reference,
+            content_sources=section.content_sources,
+            depends_on=section.depends_on,
+            citation_budget=section.citation_budget,
+            topic_clusters=section.topic_clusters,
+            transition_intents=section.transition_intents,
+            sectioning_recommended=section.sectioning_recommended,
+            code_focus=section.code_focus,
+            writing_guidance=section.writing_guidance,
+            order=section.order,
+        )
 
     @staticmethod
     def _normalize_string_list(raw: Any, max_items: int = 5) -> List[str]:
