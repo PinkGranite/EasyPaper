@@ -379,6 +379,45 @@ class ReviewCheckpoint(BaseModel):
     config_hash: str = ""
 
 
+class PlanResult(BaseModel):
+    """
+    Serializable snapshot of the planning phase output.
+    - **Description**:
+        - Captures all intermediate state produced by ``prepare_plan()``
+          so that ``execute_generation()`` can resume from this checkpoint.
+        - Designed to be returned to the frontend, optionally modified,
+          then sent back to start content generation.
+
+    - **Args**:
+        - `paper_plan` (Dict[str, Any]): Serialized PaperPlan (``PaperPlan.model_dump()``).
+        - `evidence_dag` (Dict[str, Any], optional): Serialized EvidenceDAG.
+        - `research_context` (Dict[str, Any], optional): Research context dict.
+        - `code_context` (Dict[str, Any], optional): Code repository context.
+        - `code_summary_markdown` (str, optional): Rendered code summary.
+        - `ref_pool_snapshot` (Dict[str, Any]): Serialized ReferencePool (``to_dict()``).
+        - `converted_tables` (Dict[str, str]): Table ID -> LaTeX mapping.
+        - `metadata_input` (Dict[str, Any]): Serialized PaperMetaData.
+        - `errors` (List[str]): Non-fatal errors collected during planning.
+        - `template_path` (str, optional): Resolved template path.
+        - `target_pages` (int, optional): Target page count.
+        - `artifacts_prefix` (str): Storage prefix for artifacts.
+        - `paper_dir` (str, optional): Output directory path.
+    """
+    paper_plan: Dict[str, Any]
+    evidence_dag: Optional[Dict[str, Any]] = None
+    research_context: Optional[Dict[str, Any]] = None
+    code_context: Optional[Dict[str, Any]] = None
+    code_summary_markdown: Optional[str] = None
+    ref_pool_snapshot: Dict[str, Any] = Field(default_factory=dict)
+    converted_tables: Dict[str, str] = Field(default_factory=dict)
+    metadata_input: Dict[str, Any] = Field(default_factory=dict)
+    errors: List[str] = Field(default_factory=list)
+    template_path: Optional[str] = None
+    target_pages: Optional[int] = None
+    artifacts_prefix: str = ""
+    paper_dir: Optional[str] = None
+
+
 class SectionGenerationRequest(BaseModel):
     """
     Request to generate a single section

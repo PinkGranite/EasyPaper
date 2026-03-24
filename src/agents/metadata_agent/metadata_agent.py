@@ -46,6 +46,7 @@ from .models import (
     PaperMetaData,
     PaperGenerationRequest,
     PaperGenerationResult,
+    PlanResult,
     SectionResult,
     SectionGenerationRequest,
     BODY_SECTION_SOURCES,
@@ -1158,56 +1159,47 @@ class MetaDataAgent(ReActAgent):
                 }
             )
         return rows
-    
-    async def generate_paper(
+
+    # ------------------------------------------------------------------
+    # prepare_plan: Phase 0 only — returns a serializable PlanResult
+    # ------------------------------------------------------------------
+
+    async def prepare_plan(
         self,
         metadata: PaperMetaData,
-        output_dir: Optional[str] = None,
-        save_output: bool = True,
-        compile_pdf: bool = True,
         template_path: Optional[str] = None,
-        figures_source_dir: Optional[str] = None,
         target_pages: Optional[int] = None,
-        enable_review: bool = True,
-        max_review_iterations: int = 3,
         enable_planning: bool = True,
-        enable_vlm_review: bool = False,
-        enable_user_feedback: bool = False,
+        save_output: bool = True,
+        output_dir: Optional[str] = None,
         progress_callback: Optional[ProgressCallback] = None,
-        feedback_queue: Optional[asyncio.Queue] = None,
-        feedback_timeout: float = 300.0,
         artifacts_prefix: str = "",
-    ) -> PaperGenerationResult:
+    ) -> PlanResult:
         """
-        Generate complete paper from MetaData
-        
-        Seven-phase process:
-        0. Planning - creates detailed paper plan (structure, word budgets, guidance)
-        1. Introduction (Leader) - sets tone, extracts contributions
-        2. Body Sections (can be parallel) - Method, Experiment, Results, Related Work
-        3. Synthesis Sections - Abstract and Conclusion
-        3.5. Review Loop - iterative feedback and revision
-        4. PDF Compilation (if template provided) - via Typesetter Agent
-        5. VLM Review (if enabled) - check page overflow and layout issues
-        
-        Args:
-            metadata: Paper metadata with 5 fields + references
-            output_dir: Directory for output files
-            save_output: Whether to save output to disk
-            compile_pdf: Whether to compile PDF (requires template_path)
-            template_path: Path to .zip template file
-            figures_source_dir: Directory containing figure files
-            target_pages: Target page count (uses venue default if not set)
-            enable_review: Whether to enable review loop
-            max_review_iterations: Maximum number of review iterations
-            enable_planning: Whether to create a paper plan before generation
-            enable_vlm_review: Whether to run VLM-based PDF review after compilation
+        Execute planning phases (0 through 0.5) and return a serializable snapshot.
+        - **Description**:
+            - Runs template resolution, reference pool init, file validation,
+              figure conversion, planning, DAG construction, code context,
+              and table conversion.
+            - Does NOT start content generation.
+            - The returned PlanResult can be sent to the frontend for review,
+              optionally modified, then passed to ``execute_generation()``.
+
+        - **Args**:
+            - `metadata` (PaperMetaData): Paper metadata with 5 fields + references.
+            - `template_path` (str, optional): Path to .zip template file.
+            - `target_pages` (int, optional): Target page count.
+            - `enable_planning` (bool): Whether to create a paper plan.
+            - `save_output` (bool): Whether to save intermediate files.
+            - `output_dir` (str, optional): Directory for output files.
+            - `progress_callback` (ProgressCallback, optional): SSE callback.
+            - `artifacts_prefix` (str): Storage prefix for artifacts.
+
+        - **Returns**:
+            - `PlanResult`: Serializable planning snapshot.
         """
-        # Use template_path from metadata if not provided
         if template_path is None:
             template_path = metadata.template_path
-
-        # Resolve default template if none provided
         if not template_path and not metadata.template_path:
             try:
                 from src.default_templates import resolve_default_template
@@ -1216,55 +1208,24 @@ class MetaDataAgent(ReActAgent):
                     template_path = resolved
             except ImportError:
                 pass
-
-        # Use target_pages from metadata if not provided
         if target_pages is None:
             target_pages = metadata.target_pages
 
-        # Progress emitter for real-time streaming
         emitter = ProgressEmitter(callback=progress_callback)
-        set_llm_progress_context(emitter)
-        await emitter.generation_started(
-            title=metadata.title,
-            target_pages=target_pages,
-        )
+        set_llm_progress_context(emitter, agent="MetaDataAgent")
+        await emitter.generation_started(title=metadata.title, target_pages=target_pages)
 
-        errors = []
-        sections_results = []
-        generated_sections: Dict[str, str] = {}
+        errors: List[str] = []
         paper_plan: Optional[PaperPlan] = None
-        review_iterations = 0
-        target_word_count = None
         research_context: Optional[Dict[str, Any]] = None
         research_context_v1: Optional[Dict[str, Any]] = None
         research_context_v2: Optional[Dict[str, Any]] = None
-        discovered_references_by_section: Dict[str, List[Dict[str, Any]]] = {}
         seed_discovered_references: List[Dict[str, Any]] = []
         core_refs_for_context: List[Dict[str, Any]] = []
-        citation_budget_usage: List[Dict[str, Any]] = []
         code_context: Optional[Dict[str, Any]] = None
         code_summary_markdown: Optional[str] = None
-        prompt_traces: List[Dict[str, Any]] = []
         evidence_dag: Optional[EvidenceDAG] = None
 
-        _sa = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
-
-        def _sec_filename(section_type: str) -> str:
-            """Resolve section filename from paper_plan title or fallback."""
-            if paper_plan:
-                titles = paper_plan.get_section_titles()
-                if section_type in titles:
-                    return titles[section_type]
-            return section_type.replace("_", " ").title()
-
-        # Initialize Session Memory for cross-agent coordination
-        memory = SessionMemory()
-        memory.log("metadata", "init", "session_started",
-                    narrative=f"Started paper generation session for '{metadata.title}' targeting {target_pages} pages.",
-                    title=metadata.title, target_pages=target_pages)
-        
-        # Initialize persistent reference pool from user's core references.
-        # Plain-text refs are resolved via search before falling back to heuristic.
         search_cfg_for_pool = {}
         if self.tools_config and self.tools_config.paper_search:
             ps = self.tools_config.paper_search
@@ -1277,34 +1238,28 @@ class MetaDataAgent(ReActAgent):
                 "cache_ttl_hours": ps.cache_ttl_hours,
             }
         ref_pool = await ReferencePool.create(
-            metadata.references,
-            paper_search_config=search_cfg_for_pool,
+            metadata.references, paper_search_config=search_cfg_for_pool,
         )
         print(f"[MetaDataAgent] Reference pool initialized: {ref_pool.summary()}")
-        print(f"[MetaDataAgent] Core citation keys: {ref_pool.valid_citation_keys}")
-        
-        # Keep parsed_refs for backward-compatible methods that still need it
-        parsed_refs = ref_pool.get_all_refs()
-        
-        # Validate figure/table file paths before proceeding
+
         validation_errors = self._validate_file_paths(metadata)
         if validation_errors:
-            print("[MetaDataAgent] File validation errors:")
-            for err in validation_errors:
-                print(f"  - {err}")
-            return PaperGenerationResult(
-                status="error",
-                paper_title=metadata.title,
+            return PlanResult(
+                paper_plan={},
+                metadata_input=metadata.model_dump(),
                 errors=validation_errors,
+                template_path=template_path,
+                target_pages=target_pages,
+                artifacts_prefix=artifacts_prefix,
+                ref_pool_snapshot=ref_pool.to_dict(),
             )
 
-        # Convert non-LaTeX figure formats (e.g. TIFF, BMP, WEBP) to PDF/PNG
         if metadata.figures:
             n_converted = self._convert_figures_for_latex(metadata)
             if n_converted:
                 print(f"[MetaDataAgent] Converted {n_converted} figure(s) to LaTeX-compatible format")
 
-        # Create output directory
+        paper_dir_str: Optional[str] = None
         if save_output:
             if output_dir:
                 paper_dir = Path(output_dir)
@@ -1313,13 +1268,12 @@ class MetaDataAgent(ReActAgent):
                 safe_title = re.sub(r'[^\w\-]', '_', metadata.title)[:50]
                 paper_dir = self.results_dir / f"{safe_title}_{timestamp}"
             paper_dir.mkdir(parents=True, exist_ok=True)
+            paper_dir_str = str(paper_dir)
         else:
             paper_dir = None
-        
+
         try:
-            # =================================================================
-            # Phase 0e-pre: Code repository understanding (optional, pre-plan)
-            # =================================================================
+            # Phase 0e-pre: Code repository context (optional, pre-plan)
             if metadata.code_repository:
                 print("[MetaDataAgent] Phase 0e-pre: Building code repository context...")
                 await emitter.phase_start(Phase.CODE_CONTEXT, "Building code repository context")
@@ -1327,11 +1281,6 @@ class MetaDataAgent(ReActAgent):
                     code_context = await self._build_code_repository_context(metadata)
                     if code_context:
                         code_summary_markdown = render_code_repository_summary_markdown(code_context)
-                        stats = code_context.get("scan_stats", {})
-                        print(
-                            "[MetaDataAgent] Code context ready (pre-plan): "
-                            f"{stats.get('indexed_files', 0)} files indexed"
-                        )
                 except Exception as e:
                     on_error = metadata.code_repository.on_error
                     msg = f"Code repository ingestion failed: {e}"
@@ -1340,26 +1289,26 @@ class MetaDataAgent(ReActAgent):
                         metadata.code_repository.type.value == "local_dir"
                         and isinstance(e, (FileNotFoundError, ValueError))
                     ):
-                        return PaperGenerationResult(
-                            status="error",
-                            paper_title=metadata.title,
-                            errors=[msg],
+                        return PlanResult(
+                            paper_plan={}, metadata_input=metadata.model_dump(),
+                            errors=[msg], ref_pool_snapshot=ref_pool.to_dict(),
+                            template_path=template_path, target_pages=target_pages,
+                            artifacts_prefix=artifacts_prefix, paper_dir=paper_dir_str,
                         )
                     if on_error == CodeRepoOnError.STRICT:
-                        return PaperGenerationResult(
-                            status="error",
-                            paper_title=metadata.title,
-                            errors=[msg],
+                        return PlanResult(
+                            paper_plan={}, metadata_input=metadata.model_dump(),
+                            errors=[msg], ref_pool_snapshot=ref_pool.to_dict(),
+                            template_path=template_path, target_pages=target_pages,
+                            artifacts_prefix=artifacts_prefix, paper_dir=paper_dir_str,
                         )
                     errors.append(msg)
                     code_context = None
                     code_summary_markdown = None
 
-            # =================================================================
-            # Phase 0: Planning (if enabled)
-            # =================================================================
+            # Phase 0: Planning
             if enable_planning:
-                print(f"[MetaDataAgent] Phase 0: Creating Paper Plan...")
+                print("[MetaDataAgent] Phase 0: Creating Paper Plan...")
                 await emitter.phase_start(Phase.PLANNING, "Creating paper plan")
                 search_cfg = {}
                 if self.tools_config and self.tools_config.paper_search:
@@ -1391,26 +1340,12 @@ class MetaDataAgent(ReActAgent):
                 rc_enabled = rc_cfg.enabled if rc_cfg else False
                 if rc_enabled and not core_refs_for_context:
                     core_refs_for_context = self._build_core_refs_for_research_context(ref_pool)
-                    core_with_abstract = sum(
-                        1 for r in core_refs_for_context if (r.get("abstract") or "").strip()
-                    )
-                    print(
-                        "[MetaDataAgent] Core refs prepared for context: "
-                        f"{len(core_refs_for_context)} total, {core_with_abstract} with abstract"
-                    )
 
-                # Phase 0a: build research context before planning decisions
+                # Phase 0a: research context v1 (pre-plan)
                 if rc_enabled and rc_first_enabled:
                     print("[MetaDataAgent] Phase 0a: Building research context v1 (pre-plan)...")
                     try:
                         core_refs_for_context = self._build_core_refs_for_research_context(ref_pool)
-                        core_with_abstract = sum(
-                            1 for r in core_refs_for_context if (r.get("abstract") or "").strip()
-                        )
-                        print(
-                            "[MetaDataAgent] Core refs in pre-plan context: "
-                            f"{len(core_refs_for_context)} total, {core_with_abstract} with abstract"
-                        )
                         seed_discovered_references = await self._planner.discover_seed_references(
                             title=metadata.title,
                             idea_hypothesis=metadata.idea_hypothesis,
@@ -1422,8 +1357,7 @@ class MetaDataAgent(ReActAgent):
                         )
                         for paper in seed_discovered_references:
                             ref_pool.add_discovered(
-                                paper.get("ref_id", ""),
-                                paper.get("bibtex", ""),
+                                paper.get("ref_id", ""), paper.get("bibtex", ""),
                                 source="planner_seed_discovery",
                             )
                         preplan_context_pool: List[Dict[str, Any]] = []
@@ -1432,102 +1366,66 @@ class MetaDataAgent(ReActAgent):
                         if preplan_context_pool:
                             seed_plan = PaperPlan(title=metadata.title, sections=[])
                             research_context_v1 = await self._planner._generate_research_context(
-                                plan=seed_plan,
-                                discovered={"global": preplan_context_pool},
+                                plan=seed_plan, discovered={"global": preplan_context_pool},
                             )
                             research_context = research_context_v1
-                            print(
-                                "[MetaDataAgent] Research context v1 ready: "
-                                f"{research_context_v1.get('research_area', 'N/A')}"
-                            )
                     except Exception as e:
                         print(f"[MetaDataAgent] Warning: Failed to build research context v1: {e}")
 
                 paper_plan = await self._orchestrator._create_paper_plan(
-                    metadata=metadata,
-                    target_pages=target_pages,
-                    style_guide=metadata.style_guide,
-                    research_context=research_context_v1,
+                    metadata=metadata, target_pages=target_pages,
+                    style_guide=metadata.style_guide, research_context=research_context_v1,
                     code_context=code_context,
                 )
                 if paper_plan:
-                    memory.plan = paper_plan
                     if self.tools_config and not getattr(
-                        self.tools_config,
-                        "planner_structure_signals_enabled",
-                        True,
+                        self.tools_config, "planner_structure_signals_enabled", True,
                     ):
                         for sp in paper_plan.sections:
                             sp.topic_clusters = []
                             sp.transition_intents = []
                             sp.sectioning_recommended = False
-                    memory.log("planner", "phase0", "plan_created",
-                               narrative=f"Planner created a {len(paper_plan.sections)}-section paper plan with ~{paper_plan.get_total_estimated_words()} estimated words.",
-                               sections=len(paper_plan.sections),
-                               estimated_words=paper_plan.get_total_estimated_words())
-                    print(f"[MetaDataAgent] Plan created: {len(paper_plan.sections)} sections, ~{paper_plan.get_total_estimated_words()} words (est.)")
-                    
-                    # Apply auto-detected wide flags from plan to metadata figures/tables
+
                     if paper_plan.wide_figures:
-                        print(f"[MetaDataAgent] Applying wide flag to figures: {paper_plan.wide_figures}")
                         for fig in metadata.figures:
                             if fig.id in paper_plan.wide_figures and not fig.wide:
                                 fig.wide = True
-                    
                     if paper_plan.wide_tables:
-                        print(f"[MetaDataAgent] Applying wide flag to tables: {paper_plan.wide_tables}")
                         for tbl in metadata.tables:
                             if tbl.id in paper_plan.wide_tables and not tbl.wide:
                                 tbl.wide = True
-                    
-                    # Save plan to output directory
+
                     if save_output and paper_dir:
                         planning_dir = paper_dir / "analysis" / "planning"
                         planning_dir.mkdir(parents=True, exist_ok=True)
                         plan_path = planning_dir / "paper_plan.json"
-                        plan_path.write_text(
-                            paper_plan.model_dump_json(indent=2),
-                            encoding="utf-8",
-                        )
+                        plan_path.write_text(paper_plan.model_dump_json(indent=2), encoding="utf-8")
 
-                    # Reference discovery: Planner searches for relevant papers
+                    # Phase 0b: Reference discovery
                     print("[MetaDataAgent] Phase 0b: Discovering references...")
                     discovered = await self._planner.discover_references(
                         plan=paper_plan,
                         existing_ref_keys=list(ref_pool.valid_citation_keys),
                         paper_search_config=search_cfg,
                     )
-                    discovered_references_by_section = discovered
                     disc_count = 0
                     for sec_type, papers in discovered.items():
                         for paper in papers:
-                            added = ref_pool.add_discovered(
-                                paper["ref_id"], paper["bibtex"], source="planner_discovery",
-                            )
-                            if added:
+                            if ref_pool.add_discovered(paper["ref_id"], paper["bibtex"], source="planner_discovery"):
                                 disc_count += 1
                     if disc_count:
-                        print(f"[MetaDataAgent] Discovered {disc_count} new references (pool: {ref_pool.summary()})")
-                        memory.log("planner", "phase0b", "references_discovered",
-                                   narrative=f"Planner discovered {disc_count} additional references via academic search to support the paper plan.",
-                                   count=disc_count)
+                        print(f"[MetaDataAgent] Discovered {disc_count} new references")
 
                     # Phase 0c: Assign references to sections
-                    print("[MetaDataAgent] Phase 0c: Assigning references to sections...")
                     self._planner.assign_references(
-                        plan=paper_plan,
-                        discovered=discovered,
+                        plan=paper_plan, discovered=discovered,
                         core_ref_keys=list(ref_pool.valid_citation_keys
                                            - {p["ref_id"] for papers in discovered.values() for p in papers}),
                         paper_search_config=search_cfg,
                     )
-                    for sp in paper_plan.sections:
-                        if sp.assigned_refs:
-                            print(f"  [{sp.section_type}] {len(sp.assigned_refs)} refs assigned")
 
-                    # Phase 0d: Generate research context (if enabled)
+                    # Phase 0d: Research context v2
                     if rc_enabled and discovered:
-                        print("[MetaDataAgent] Phase 0d: Generating research context...")
                         try:
                             merged_discovered: Dict[str, List[Dict[str, Any]]] = dict(discovered)
                             if seed_discovered_references:
@@ -1535,90 +1433,55 @@ class MetaDataAgent(ReActAgent):
                             if core_refs_for_context:
                                 merged_discovered["global_core"] = core_refs_for_context
                             research_context_v2 = await self._planner._generate_research_context(
-                                plan=paper_plan,
-                                discovered=merged_discovered,
+                                plan=paper_plan, discovered=merged_discovered,
                             )
                             if research_context_v2:
                                 research_context = research_context_v2
-                                print(
-                                    "[MetaDataAgent] Research context v2 generated: "
-                                    f"{research_context_v2.get('research_area', 'N/A')}"
-                                )
                         except Exception as e:
                             print(f"[MetaDataAgent] Warning: Failed to generate research context: {e}")
+
                     await emitter.plan_created(
                         sections=len(paper_plan.sections),
                         estimated_words=paper_plan.get_total_estimated_words(),
                     )
                     await emitter.phase_complete(Phase.PLANNING, f"Plan created with {len(paper_plan.sections)} sections")
                 else:
-                    print(f"[MetaDataAgent] Planning skipped or failed, using defaults")
+                    print("[MetaDataAgent] Planning skipped or failed, using defaults")
 
-            # =================================================================
             # Phase 0d.5: Build Evidence DAG
-            # =================================================================
             if paper_plan:
                 try:
                     dag_builder = DAGBuilder()
                     evidence_dag = dag_builder.build(
-                        code_context=code_context,
-                        research_context=research_context,
-                        figures=metadata.figures,
-                        tables=metadata.tables,
+                        code_context=code_context, research_context=research_context,
+                        figures=metadata.figures, tables=metadata.tables,
                         paper_plan=paper_plan,
                     )
                     paper_plan.evidence_dag = evidence_dag.to_serializable()
 
-                    # Write DAG bindings back to paragraph plans
                     for sp in paper_plan.sections:
                         for pidx, para in enumerate(sp.paragraphs):
                             if not para.claim_id:
                                 for claim in evidence_dag.claim_nodes.values():
                                     meta = claim.metadata
-                                    if (
-                                        meta.get("section_type") == sp.section_type
-                                        and meta.get("paragraph_index") == pidx
-                                    ):
+                                    if meta.get("section_type") == sp.section_type and meta.get("paragraph_index") == pidx:
                                         para.claim_id = claim.node_id
-                                        para.bound_evidence_ids = (
-                                            evidence_dag.get_bound_evidence_ids_for_claim(claim.node_id)
-                                        )
+                                        para.bound_evidence_ids = evidence_dag.get_bound_evidence_ids_for_claim(claim.node_id)
                                         break
 
-                    # Generate sentence plans for each paragraph with DAG bindings
                     from ..planner_agent.planner_agent import PlannerAgent as _PA
                     total_sp = 0
                     for sp in paper_plan.sections:
                         for pidx, para in enumerate(sp.paragraphs):
                             if para.claim_id and not para.sentence_plans:
-                                para.sentence_plans = _PA._generate_sentence_plans(
-                                    para, pidx, evidence_dag=evidence_dag,
-                                )
+                                para.sentence_plans = _PA._generate_sentence_plans(para, evidence_dag=evidence_dag)
                                 total_sp += len(para.sentence_plans)
                     if total_sp:
                         print(f"[MetaDataAgent] Generated {total_sp} sentence plans from DAG bindings")
 
-                    dag_summary = evidence_dag.summary()
-                    print(
-                        f"[MetaDataAgent] Evidence DAG built: "
-                        f"{dag_summary['evidence_count']} evidence, "
-                        f"{dag_summary['claim_count']} claims, "
-                        f"{dag_summary['bound_edge_count']} bindings, "
-                        f"{dag_summary['unsupported_claims']} unsupported"
-                    )
-                    memory.log(
-                        "metadata", "phase0d5", "evidence_dag_built",
-                        narrative=(
-                            f"Evidence DAG constructed with {dag_summary['evidence_count']} evidence nodes "
-                            f"and {dag_summary['claim_count']} claim nodes."
-                        ),
-                        **dag_summary,
-                    )
-
                     if save_output and paper_dir:
                         dag_path = paper_dir / "analysis" / "planning" / "evidence_dag.json"
                         dag_path.parent.mkdir(parents=True, exist_ok=True)
-                        import json
                         dag_path.write_text(
                             json.dumps(evidence_dag.to_serializable(), indent=2, ensure_ascii=False),
                             encoding="utf-8",
@@ -1627,70 +1490,184 @@ class MetaDataAgent(ReActAgent):
                     print(f"[MetaDataAgent] Warning: Evidence DAG construction failed: {e}")
                     evidence_dag = None
 
-            # =================================================================
-            # Phase 0e: Code repository understanding (optional)
-            # =================================================================
+            # Phase 0e: Code repository context (post-plan fallback)
             if metadata.code_repository and not code_context:
-                print("[MetaDataAgent] Phase 0e: Building code repository context...")
                 try:
                     code_context = await self._build_code_repository_context(metadata)
                     if code_context:
                         code_summary_markdown = render_code_repository_summary_markdown(code_context)
-                        stats = code_context.get("scan_stats", {})
-                        print(
-                            "[MetaDataAgent] Code context ready: "
-                            f"{stats.get('indexed_files', 0)} files indexed"
-                        )
                 except Exception as e:
                     on_error = metadata.code_repository.on_error
                     msg = f"Code repository ingestion failed: {e}"
-                    print(f"[MetaDataAgent] Warning: {msg}")
-                    # Always fail fast when user provides a local directory but path is invalid.
-                    # This avoids silently generating without code context when filesystem input is wrong.
                     if (
                         metadata.code_repository.type.value == "local_dir"
                         and isinstance(e, (FileNotFoundError, ValueError))
                     ):
-                        return PaperGenerationResult(
-                            status="error",
-                            paper_title=metadata.title,
-                            errors=[msg],
+                        return PlanResult(
+                            paper_plan=paper_plan.model_dump() if paper_plan else {},
+                            metadata_input=metadata.model_dump(), errors=[msg],
+                            ref_pool_snapshot=ref_pool.to_dict(),
+                            template_path=template_path, target_pages=target_pages,
+                            artifacts_prefix=artifacts_prefix, paper_dir=paper_dir_str,
                         )
                     if on_error == CodeRepoOnError.STRICT:
-                        return PaperGenerationResult(
-                            status="error",
-                            paper_title=metadata.title,
-                            errors=[msg],
+                        return PlanResult(
+                            paper_plan=paper_plan.model_dump() if paper_plan else {},
+                            metadata_input=metadata.model_dump(), errors=[msg],
+                            ref_pool_snapshot=ref_pool.to_dict(),
+                            template_path=template_path, target_pages=target_pages,
+                            artifacts_prefix=artifacts_prefix, paper_dir=paper_dir_str,
                         )
                     errors.append(msg)
                     code_context = None
                     code_summary_markdown = None
-            
-            # =================================================================
-            # Phase 0.5: Convert Tables (if any)
-            # =================================================================
+
+            # Phase 0.5: Convert tables
             converted_tables: Dict[str, str] = {}
             if metadata.tables:
                 print(f"[MetaDataAgent] Phase 0.5: Converting {len(metadata.tables)} tables...")
-                await emitter.phase_start(Phase.TABLE_CONVERSION,
-                                         f"Converting {len(metadata.tables)} tables to LaTeX")
-                # Determine base path for resolving file paths
-                base_path = None
-                if save_output and paper_dir:
-                    base_path = str(paper_dir.parent)  # Parent of output dir
-                
+                await emitter.phase_start(Phase.TABLE_CONVERSION, f"Converting {len(metadata.tables)} tables to LaTeX")
+                base_path = str(paper_dir.parent) if (save_output and paper_dir) else None
                 converted_tables = await convert_tables(
-                    tables=metadata.tables,
-                    llm_client=self.client,
-                    model_name=self.model_name,
-                    base_path=base_path,
+                    tables=metadata.tables, llm_client=self.client,
+                    model_name=self.model_name, base_path=base_path,
                 )
-                print(f"[MetaDataAgent] Converted {len(converted_tables)} tables to LaTeX")
-            
-            # =================================================================
-            # Phase 1: Introduction (Leader Section)
-            # =================================================================
-            print(f"[MetaDataAgent] Phase 1: Generating Introduction...")
+
+            return PlanResult(
+                paper_plan=paper_plan.model_dump() if paper_plan else {},
+                evidence_dag=evidence_dag.to_serializable() if evidence_dag else None,
+                research_context=research_context,
+                code_context=code_context,
+                code_summary_markdown=code_summary_markdown,
+                ref_pool_snapshot=ref_pool.to_dict(),
+                converted_tables=converted_tables,
+                metadata_input=metadata.model_dump(),
+                errors=errors,
+                template_path=template_path,
+                target_pages=target_pages,
+                artifacts_prefix=artifacts_prefix,
+                paper_dir=paper_dir_str,
+            )
+
+        except Exception as e:
+            print(f"[MetaDataAgent] prepare_plan error: {e}")
+            await emitter.error(message=str(e), phase="prepare_plan")
+            return PlanResult(
+                paper_plan={}, metadata_input=metadata.model_dump(),
+                errors=[str(e)], ref_pool_snapshot=ref_pool.to_dict(),
+                template_path=template_path, target_pages=target_pages,
+                artifacts_prefix=artifacts_prefix, paper_dir=paper_dir_str,
+            )
+        finally:
+            clear_llm_progress_context()
+
+    # ------------------------------------------------------------------
+    # execute_generation: Phases 1-5 from a PlanResult
+    # ------------------------------------------------------------------
+
+    async def execute_generation(
+        self,
+        plan_result: PlanResult,
+        enable_review: bool = True,
+        max_review_iterations: int = 3,
+        compile_pdf: bool = True,
+        enable_vlm_review: bool = False,
+        enable_user_feedback: bool = False,
+        progress_callback: Optional[ProgressCallback] = None,
+        feedback_queue: Optional[asyncio.Queue] = None,
+        feedback_timeout: float = 300.0,
+        save_output: bool = True,
+        output_dir: Optional[str] = None,
+        figures_source_dir: Optional[str] = None,
+    ) -> PaperGenerationResult:
+        """
+        Execute content generation from a previously computed PlanResult.
+        - **Description**:
+            - Deserializes PlanResult, reconstructs PaperPlan/EvidenceDAG/ReferencePool,
+              then runs Phases 1 through 5 (introduction, body, synthesis, review,
+              compilation, assembly).
+
+        - **Args**:
+            - `plan_result` (PlanResult): Output of ``prepare_plan()`` (possibly user-modified).
+            - `enable_review` (bool): Whether to enable the review loop.
+            - `max_review_iterations` (int): Maximum review iterations.
+            - `compile_pdf` (bool): Whether to compile to PDF.
+            - `enable_vlm_review` (bool): Whether to run VLM review.
+            - `enable_user_feedback` (bool): Pause at review for user feedback.
+            - `progress_callback` (ProgressCallback, optional): SSE callback.
+            - `feedback_queue` (asyncio.Queue, optional): User feedback queue.
+            - `feedback_timeout` (float): Seconds to wait for feedback.
+            - `save_output` (bool): Whether to save output files.
+            - `output_dir` (str, optional): Override output directory.
+            - `figures_source_dir` (str, optional): Directory with figure files.
+
+        - **Returns**:
+            - `PaperGenerationResult`: Complete generation result.
+        """
+        # Reconstruct state from PlanResult
+        metadata = PaperMetaData(**plan_result.metadata_input)
+        ref_pool = ReferencePool.from_dict(plan_result.ref_pool_snapshot)
+        template_path = plan_result.template_path
+        target_pages = plan_result.target_pages
+        artifacts_prefix = plan_result.artifacts_prefix
+        converted_tables = plan_result.converted_tables
+        research_context = plan_result.research_context
+        code_context = plan_result.code_context
+        code_summary_markdown = plan_result.code_summary_markdown
+        errors = list(plan_result.errors)
+
+        paper_plan: Optional[PaperPlan] = None
+        if plan_result.paper_plan:
+            paper_plan = PaperPlan(**plan_result.paper_plan)
+
+        evidence_dag: Optional[EvidenceDAG] = None
+        if plan_result.evidence_dag:
+            evidence_dag = EvidenceDAG.from_serializable(plan_result.evidence_dag)
+
+        # Resolve output directory
+        if output_dir:
+            paper_dir: Optional[Path] = Path(output_dir)
+        elif plan_result.paper_dir:
+            paper_dir = Path(plan_result.paper_dir)
+        else:
+            paper_dir = None
+        if paper_dir and save_output:
+            paper_dir.mkdir(parents=True, exist_ok=True)
+
+        emitter = ProgressEmitter(callback=progress_callback)
+        set_llm_progress_context(emitter, agent="MetaDataAgent")
+        await emitter.generation_started(title=metadata.title, target_pages=target_pages)
+
+        _sa = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
+
+        sections_results: List[SectionResult] = []
+        generated_sections: Dict[str, str] = {}
+        review_iterations = 0
+        target_word_count = None
+        prompt_traces: List[Dict[str, Any]] = []
+        citation_budget_usage: List[Dict[str, Any]] = []
+        pdf_path: Optional[str] = None
+        parsed_refs = ref_pool.get_all_refs()
+
+        memory = SessionMemory()
+        memory.log(
+            "metadata", "init", "session_started",
+            narrative=f"Resumed generation for '{metadata.title}' targeting {target_pages} pages.",
+            title=metadata.title, target_pages=target_pages,
+        )
+        if paper_plan:
+            memory.plan = paper_plan
+
+        def _sec_filename(section_type: str) -> str:
+            if paper_plan:
+                titles = paper_plan.get_section_titles()
+                if section_type in titles:
+                    return titles[section_type]
+            return section_type.replace("_", " ").title()
+
+        try:
+            # Phase 1: Introduction
+            print("[MetaDataAgent] Phase 1: Generating Introduction...")
             await emitter.phase_start(Phase.INTRODUCTION, "Generating introduction")
             await emitter.section_start("introduction", phase=Phase.INTRODUCTION)
             await emitter.agent_step(agent="WriterAgent", description="Generating introduction section", section="introduction", phase=Phase.INTRODUCTION)
@@ -1698,116 +1675,66 @@ class MetaDataAgent(ReActAgent):
             intro_result = await self._generate_introduction(
                 metadata, ref_pool, section_plan=intro_plan,
                 figures=metadata.figures, tables=metadata.tables,
-                code_context=code_context,
-                research_context=research_context,
-                prompt_traces=prompt_traces,
-                memory=memory,
-                evidence_dag=evidence_dag,
+                code_context=code_context, research_context=research_context,
+                prompt_traces=prompt_traces, memory=memory, evidence_dag=evidence_dag,
             )
             sections_results.append(intro_result)
             print(f"[MetaDataAgent] After introduction: {ref_pool.summary()}")
-            
+
             if intro_result.status == "ok":
                 generated_sections["introduction"] = intro_result.latex_content
                 memory.log("metadata", "phase1", "introduction_generated",
                            narrative=f"Writer completed the introduction section ({intro_result.word_count} words).",
                            word_count=intro_result.word_count)
                 await emitter.section_content(
-                    section_type="introduction",
-                    content=intro_result.latex_content,
-                    word_count=intro_result.word_count,
-                    phase=Phase.INTRODUCTION,
+                    section_type="introduction", content=intro_result.latex_content,
+                    word_count=intro_result.word_count, phase=Phase.INTRODUCTION,
                 )
                 if intro_plan:
-                    intro_valid_keys = list(
-                        dict.fromkeys(
-                            list(intro_plan.assigned_refs or [])
-                            + list(intro_plan.budget_reserve_refs or [])
-                        )
-                    )
+                    intro_valid_keys = list(dict.fromkeys(
+                        list(intro_plan.assigned_refs or []) + list(intro_plan.budget_reserve_refs or [])
+                    ))
                     intro_budget_usage = self._collect_section_citation_budget_usage(
-                        section_type="introduction",
-                        content=intro_result.latex_content,
-                        section_plan=intro_plan,
-                        writer_valid_keys=intro_valid_keys,
+                        section_type="introduction", content=intro_result.latex_content,
+                        section_plan=intro_plan, writer_valid_keys=intro_valid_keys,
                     )
                     self._upsert_section_budget_usage(citation_budget_usage, intro_budget_usage)
-                # Extract contributions for consistency
                 contributions = extract_contributions_from_intro(intro_result.latex_content)
                 if not contributions:
-                    contributions = [
-                        f"We propose {metadata.title}",
-                        f"Novel approach: {metadata.method[:100]}...",
-                    ]
+                    contributions = [f"We propose {metadata.title}", f"Novel approach: {metadata.method[:100]}..."]
             else:
                 errors.append(f"Introduction generation failed: {intro_result.error}")
-                contributions = []
-                if memory is not None:
-                    memory.log(
-                        "metadata",
-                        "phase1",
-                        "introduction_failed",
-                        narrative=f"Introduction failed and generation stopped: {intro_result.error}",
-                        status="error",
-                        error=intro_result.error,
-                    )
                 return PaperGenerationResult(
-                    status="error",
-                    paper_title=metadata.title,
-                    sections=sections_results,
-                    errors=errors,
+                    status="error", paper_title=metadata.title,
+                    sections=sections_results, errors=errors,
                 )
-            
-            # Use contributions from plan if available
+
             if paper_plan and paper_plan.contributions:
                 contributions = paper_plan.contributions
-            
-            # Store contributions in memory for cross-agent coordination
             memory.contributions = contributions
-            
-            # =================================================================
-            # Phase 2: Body Sections (can be parallel)
-            # =================================================================
-            print(f"[MetaDataAgent] Phase 2: Generating Body Sections...")
+
+            # Phase 2: Body Sections
+            print("[MetaDataAgent] Phase 2: Generating Body Sections...")
             await emitter.phase_start(Phase.BODY_SECTIONS, "Generating body sections")
-            # Dynamic: read body section types from the plan (no hardcoding)
-            if paper_plan:
-                body_section_types = paper_plan.get_body_section_types()
-            else:
-                body_section_types = ["related_work", "method", "experiment", "result"]
-            print(f"[MetaDataAgent] Body sections from plan: {body_section_types}")
-            
-            # Generate body sections sequentially (ref_pool accumulates across sections)
+            body_section_types = paper_plan.get_body_section_types() if paper_plan else ["related_work", "method", "experiment", "result"]
             for section_type in body_section_types:
                 section_plan = paper_plan.get_section(section_type) if paper_plan else None
-                # Filter figures/tables for this section
                 section_figures = [f for f in metadata.figures if f.section == section_type or not f.section]
                 section_tables = [t for t in metadata.tables if t.section == section_type or not t.section]
-                
                 try:
                     result = await self._generate_body_section(
-                        section_type=section_type,
-                        metadata=metadata,
+                        section_type=section_type, metadata=metadata,
                         intro_context=generated_sections.get("introduction", ""),
-                        contributions=contributions,
-                        ref_pool=ref_pool,
-                        section_plan=section_plan,
-                        figures=section_figures,
-                        tables=section_tables,
-                        converted_tables=converted_tables,
-                        code_context=code_context,
-                        research_context=research_context,
-                        prompt_traces=prompt_traces,
-                        memory=memory,
-                        evidence_dag=evidence_dag,
+                        contributions=contributions, ref_pool=ref_pool,
+                        section_plan=section_plan, figures=section_figures,
+                        tables=section_tables, converted_tables=converted_tables,
+                        code_context=code_context, research_context=research_context,
+                        prompt_traces=prompt_traces, memory=memory, evidence_dag=evidence_dag,
+                        emitter=emitter,
                     )
                 except Exception as e:
-                    result = SectionResult(
-                        section_type=section_type,
-                        status="error",
-                        error=str(e),
-                    )
-                
+                    result = SectionResult(section_type=section_type, status="error", error=str(e))
+
                 sections_results.append(result)
                 if result.status == "ok":
                     generated_sections[section_type] = result.latex_content
@@ -1815,596 +1742,128 @@ class MetaDataAgent(ReActAgent):
                                narrative=f"Writer completed the {section_type} section ({result.word_count} words).",
                                word_count=result.word_count)
                     await emitter.section_content(
-                        section_type=section_type,
-                        content=result.latex_content,
-                        word_count=result.word_count,
-                        phase=Phase.BODY_SECTIONS,
+                        section_type=section_type, content=result.latex_content,
+                        word_count=result.word_count, phase=Phase.BODY_SECTIONS,
                     )
                     if section_plan:
-                        section_valid_keys = list(
-                            dict.fromkeys(
-                                list(section_plan.assigned_refs or [])
-                                + list(section_plan.budget_reserve_refs or [])
-                            )
-                        )
+                        section_valid_keys = list(dict.fromkeys(
+                            list(section_plan.assigned_refs or []) + list(section_plan.budget_reserve_refs or [])
+                        ))
                         section_budget_usage = self._collect_section_citation_budget_usage(
-                            section_type=section_type,
-                            content=result.latex_content,
-                            section_plan=section_plan,
-                            writer_valid_keys=section_valid_keys,
+                            section_type=section_type, content=result.latex_content,
+                            section_plan=section_plan, writer_valid_keys=section_valid_keys,
                         )
                         self._upsert_section_budget_usage(citation_budget_usage, section_budget_usage)
-                    print(f"[MetaDataAgent] After {section_type}: {ref_pool.summary()}")
                 else:
                     errors.append(f"{section_type} generation failed: {result.error}")
-            
-            # =================================================================
-            # Phase 3: Synthesis Sections (Abstract + Conclusion)
-            # =================================================================
-            print(f"[MetaDataAgent] Phase 3: Generating Synthesis Sections...")
+
+            # Phase 3: Synthesis Sections
+            print("[MetaDataAgent] Phase 3: Generating Synthesis Sections...")
             await emitter.phase_start(Phase.SYNTHESIS, "Generating synthesis sections (abstract, conclusion)")
-            
-            # Generate Abstract
             abstract_result = await self._generate_synthesis_section(
-                section_type="abstract",
-                paper_title=metadata.title,
-                prior_sections=generated_sections,
-                contributions=contributions,
+                section_type="abstract", paper_title=metadata.title,
+                prior_sections=generated_sections, contributions=contributions,
                 style_guide=metadata.style_guide,
                 section_plan=paper_plan.get_section("abstract") if paper_plan else None,
-                prompt_traces=prompt_traces,
-                memory=memory,
+                prompt_traces=prompt_traces, memory=memory,
             )
-            sections_results.insert(0, abstract_result)  # Abstract goes first
+            sections_results.insert(0, abstract_result)
             if abstract_result.status == "ok":
                 generated_sections["abstract"] = abstract_result.latex_content
-                memory.log("metadata", "phase3", "abstract_generated",
-                           narrative=f"Writer completed the abstract ({abstract_result.word_count} words).",
-                           word_count=abstract_result.word_count)
                 await emitter.section_content(
-                    section_type="abstract",
-                    content=abstract_result.latex_content,
-                    word_count=abstract_result.word_count,
-                    phase=Phase.SYNTHESIS,
+                    section_type="abstract", content=abstract_result.latex_content,
+                    word_count=abstract_result.word_count, phase=Phase.SYNTHESIS,
                 )
             else:
                 errors.append(f"Abstract generation failed: {abstract_result.error}")
-            
-            # Generate Conclusion only when planner includes it in the final structure.
-            should_generate_conclusion = bool(
-                paper_plan and paper_plan.get_section("conclusion") is not None
-            )
+
+            should_generate_conclusion = bool(paper_plan and paper_plan.get_section("conclusion") is not None)
             if should_generate_conclusion:
                 conclusion_result = await self._generate_synthesis_section(
-                    section_type="conclusion",
-                    paper_title=metadata.title,
-                    prior_sections=generated_sections,
-                    contributions=contributions,
+                    section_type="conclusion", paper_title=metadata.title,
+                    prior_sections=generated_sections, contributions=contributions,
                     style_guide=metadata.style_guide,
                     section_plan=paper_plan.get_section("conclusion") if paper_plan else None,
-                    prompt_traces=prompt_traces,
-                    memory=memory,
+                    prompt_traces=prompt_traces, memory=memory,
                 )
                 sections_results.append(conclusion_result)
                 if conclusion_result.status == "ok":
                     generated_sections["conclusion"] = conclusion_result.latex_content
-                    memory.log("metadata", "phase3", "conclusion_generated",
-                               narrative=f"Writer completed the conclusion ({conclusion_result.word_count} words).",
-                               word_count=conclusion_result.word_count)
                     await emitter.section_content(
-                        section_type="conclusion",
-                        content=conclusion_result.latex_content,
-                        word_count=conclusion_result.word_count,
-                        phase=Phase.SYNTHESIS,
+                        section_type="conclusion", content=conclusion_result.latex_content,
+                        word_count=conclusion_result.word_count, phase=Phase.SYNTHESIS,
                     )
                 else:
                     errors.append(f"Conclusion generation failed: {conclusion_result.error}")
-            
-            # =================================================================
+
             # Reference Usage Validation
-            # =================================================================
             self._validate_ref_usage(generated_sections, ref_pool)
 
-            # =================================================================
-            # Unified Review Orchestration (Reviewer + VLM)
-            # =================================================================
+            # Review Orchestration
             if enable_review:
                 await emitter.phase_start(Phase.REVIEW_LOOP, "Starting review loop")
             (
-                generated_sections,
-                sections_results,
-                review_iterations,
-                target_word_count,
-                pdf_path,
-                orchestration_errors,
+                generated_sections, sections_results,
+                review_iterations, target_word_count, pdf_path, orchestration_errors,
             ) = await self._orchestrator._run_review_orchestration(
-                generated_sections=generated_sections,
-                sections_results=sections_results,
-                metadata=metadata,
-                parsed_refs=ref_pool.get_all_refs(),
-                paper_plan=paper_plan,
-                template_path=template_path,
-                figures_source_dir=figures_source_dir,
-                converted_tables=converted_tables,
-                max_review_iterations=max_review_iterations,
-                enable_review=enable_review,
-                compile_pdf=compile_pdf,
-                enable_vlm_review=enable_vlm_review,
-                target_pages=target_pages,
-                paper_dir=paper_dir,
-                memory=memory,
-                evidence_dag=evidence_dag,
+                generated_sections=generated_sections, sections_results=sections_results,
+                metadata=metadata, parsed_refs=ref_pool.get_all_refs(),
+                paper_plan=paper_plan, template_path=template_path,
+                figures_source_dir=figures_source_dir, converted_tables=converted_tables,
+                max_review_iterations=max_review_iterations, enable_review=enable_review,
+                compile_pdf=compile_pdf, enable_vlm_review=enable_vlm_review,
+                target_pages=target_pages, paper_dir=paper_dir,
+                memory=memory, evidence_dag=evidence_dag,
             )
             if orchestration_errors:
                 errors.extend(orchestration_errors)
             if enable_review:
                 await emitter.phase_complete(Phase.REVIEW_LOOP, f"Review completed ({review_iterations} iterations)")
 
-            # Recompute citation usage from final post-review content so exports align
-            # with the delivered manuscript instead of pre-review drafts.
             if paper_plan:
                 citation_budget_usage = self._rebuild_citation_budget_usage_from_final_sections(
-                    paper_plan=paper_plan,
-                    generated_sections=generated_sections,
+                    paper_plan=paper_plan, generated_sections=generated_sections,
                 )
-            
-            # =================================================================
+
             # Assemble Paper
-            # =================================================================
-            print(f"[MetaDataAgent] Assembling paper...")
+            print("[MetaDataAgent] Assembling paper...")
             latex_content = self._assemble_paper(
-                title=metadata.title,
-                sections=generated_sections,
+                title=metadata.title, sections=generated_sections,
                 references=ref_pool.get_all_refs(),
                 valid_citation_keys=ref_pool.valid_citation_keys,
             )
-            
-            # Calculate total word count
             total_words = sum(r.word_count for r in sections_results if r.word_count)
-            
-            # Save output if requested
+
+            # Save output
             output_path = None
             if save_output and paper_dir:
                 output_path = str(paper_dir)
-                analysis_dir = paper_dir / "analysis"
-                planning_dir = analysis_dir / "planning"
-                research_dir = analysis_dir / "research_context"
-                citation_dir = analysis_dir / "citations"
-                structure_dir = analysis_dir / "structure"
-                review_dir = analysis_dir / "review"
-                references_dir = analysis_dir / "references"
-                code_dir = analysis_dir / "code_context"
-                logs_dir = paper_dir / "logs"
-                traces_dir = logs_dir / "traces"
-                for d in (
-                    analysis_dir,
-                    planning_dir,
-                    research_dir,
-                    citation_dir,
-                    structure_dir,
-                    review_dir,
-                    references_dir,
-                    code_dir,
-                    logs_dir,
-                    traces_dir,
-                ):
-                    d.mkdir(parents=True, exist_ok=True)
-                
-                # Save main.tex
-                tex_path = paper_dir / "main.tex"
-                tex_path.write_text(latex_content, encoding="utf-8")
-                
-                # Save references.bib (uses ref_pool for all accumulated refs)
-                bib_content = ref_pool.to_bibtex()
-                bib_path = paper_dir / "references.bib"
-                bib_path.write_text(bib_content, encoding="utf-8")
-                
-                # Save metadata.json
-                meta_path = paper_dir / "metadata.json"
-                meta_path.write_text(
-                    json.dumps(metadata.model_dump(), indent=2, ensure_ascii=False),
-                    encoding="utf-8",
+                for d_name in ("analysis/planning", "analysis/research_context",
+                               "analysis/citations", "analysis/structure",
+                               "analysis/review", "analysis/references",
+                               "analysis/code_context", "logs/traces"):
+                    (paper_dir / d_name).mkdir(parents=True, exist_ok=True)
+
+                (paper_dir / "main.tex").write_text(latex_content, encoding="utf-8")
+                (paper_dir / "references.bib").write_text(ref_pool.to_bibtex(), encoding="utf-8")
+                (paper_dir / "metadata.json").write_text(
+                    json.dumps(metadata.model_dump(), indent=2, ensure_ascii=False), encoding="utf-8",
                 )
-
-                # Save research_context.json (if generated)
-                if research_context:
-                    rc_path = research_dir / "research_context.json"
-                    context_output = dict(research_context)
-                    context_output.pop("_llm_raw_outputs", None)
-                    core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
-                    core_refs_with_abstract_count = sum(
-                        1 for r in core_refs_for_context if (r.get("abstract") or "").strip()
-                    )
-                    context_output["core_refs_included_count"] = len(core_ref_ids)
-                    context_output["core_ref_ids"] = core_ref_ids
-                    context_output["core_refs_with_abstract_count"] = core_refs_with_abstract_count
-                    context_output["generated_at"] = datetime.now().isoformat()
-                    rc_path.write_text(
-                        json.dumps(context_output, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Research context saved to: {rc_path}")
-
-                if research_context_v1:
-                    rc_v1_path = research_dir / "research_context_v1.json"
-                    rc_v1_payload = dict(research_context_v1)
-                    raw_outputs_v1 = rc_v1_payload.pop("_llm_raw_outputs", None)
-                    core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
-                    core_refs_with_abstract_count = sum(
-                        1 for r in core_refs_for_context if (r.get("abstract") or "").strip()
-                    )
-                    rc_v1_payload["core_refs_included_count"] = len(core_ref_ids)
-                    rc_v1_payload["core_ref_ids"] = core_ref_ids
-                    rc_v1_payload["core_refs_with_abstract_count"] = core_refs_with_abstract_count
-                    rc_v1_payload["generated_at"] = datetime.now().isoformat()
-                    rc_v1_path.write_text(
-                        json.dumps(rc_v1_payload, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Research context v1 saved to: {rc_v1_path}")
-                    if raw_outputs_v1:
-                        raw_path = research_dir / "research_context_v1_raw.txt"
-                        raw_path.write_text(
-                            "\n\n---\n\n".join(raw_outputs_v1),
-                            encoding="utf-8",
-                        )
-                        print(f"[MetaDataAgent] Research context v1 raw LLM outputs saved to: {raw_path}")
-
-                if research_context_v2:
-                    rc_v2_path = research_dir / "research_context_v2.json"
-                    rc_v2_payload = dict(research_context_v2)
-                    raw_outputs_v2 = rc_v2_payload.pop("_llm_raw_outputs", None)
-                    core_ref_ids = [r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")]
-                    core_refs_with_abstract_count = sum(
-                        1 for r in core_refs_for_context if (r.get("abstract") or "").strip()
-                    )
-                    rc_v2_payload["core_refs_included_count"] = len(core_ref_ids)
-                    rc_v2_payload["core_ref_ids"] = core_ref_ids
-                    rc_v2_payload["core_refs_with_abstract_count"] = core_refs_with_abstract_count
-                    rc_v2_payload["generated_at"] = datetime.now().isoformat()
-                    rc_v2_path.write_text(
-                        json.dumps(rc_v2_payload, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Research context v2 saved to: {rc_v2_path}")
-                    if raw_outputs_v2:
-                        raw_path = research_dir / "research_context_v2_raw.txt"
-                        raw_path.write_text(
-                            "\n\n---\n\n".join(raw_outputs_v2),
-                            encoding="utf-8",
-                        )
-                        print(f"[MetaDataAgent] Research context v2 raw LLM outputs saved to: {raw_path}")
-
-                if research_context:
-                    cem = research_context.get("claim_evidence_matrix", [])
-                    cr = research_context.get("contribution_ranking", {"P0": [], "P1": [], "P2": []})
-                    cem_path = research_dir / "claim_evidence_matrix.json"
-                    cem_path.write_text(
-                        json.dumps(
-                            {"claim_evidence_matrix": cem, "generated_at": datetime.now().isoformat()},
-                            indent=2,
-                            ensure_ascii=False,
-                        ),
-                        encoding="utf-8",
-                    )
-                    cr_path = research_dir / "contribution_ranking.json"
-                    cr_path.write_text(
-                        json.dumps(
-                            {"contribution_ranking": cr, "generated_at": datetime.now().isoformat()},
-                            indent=2,
-                            ensure_ascii=False,
-                        ),
-                        encoding="utf-8",
-                    )
-                    rc_cfg_for_export = (
-                        self.tools_config.research_context
-                        if self.tools_config and self.tools_config.research_context
-                        else None
-                    )
-                    if (
-                        rc_cfg_for_export
-                        and rc_cfg_for_export.export_planning_decision_trace
-                        and research_context.get("planning_decision_trace")
-                    ):
-                        pdt_path = research_dir / "planning_decision_trace.json"
-                        pdt_path.write_text(
-                            json.dumps(
-                                {
-                                    "planning_decision_trace": research_context.get(
-                                        "planning_decision_trace", []
-                                    ),
-                                    "generated_at": datetime.now().isoformat(),
-                                },
-                                indent=2,
-                                ensure_ascii=False,
-                            ),
-                            encoding="utf-8",
-                        )
-                        print(f"[MetaDataAgent] Planning decision trace saved to: {pdt_path}")
-
-                ps_cfg_for_export = (
-                    self.tools_config.paper_search
-                    if self.tools_config and self.tools_config.paper_search
-                    else None
-                )
-                budget_export_enabled = bool(
-                    ps_cfg_for_export and ps_cfg_for_export.citation_budget_export
-                )
-                if budget_export_enabled and paper_plan:
-                    # Keep usage rows in plan section order for stable auditing.
-                    usage_by_section = {
-                        row.get("section_type"): row
-                        for row in citation_budget_usage
-                        if row.get("section_type")
-                    }
-                    ordered_usage: List[Dict[str, Any]] = []
-                    for sp in paper_plan.sections:
-                        section_row = usage_by_section.get(sp.section_type)
-                        if section_row:
-                            ordered_usage.append(section_row)
-
-                    budget_plan_rows: List[Dict[str, Any]] = []
-                    for sp in paper_plan.sections:
-                        if not sp.citation_budget:
-                            continue
-                        budget_plan_rows.append(
-                            {
-                                "section_type": sp.section_type,
-                                "citation_budget": sp.citation_budget,
-                                "budget_selected_refs": sp.budget_selected_refs,
-                                "budget_reserve_refs": sp.budget_reserve_refs,
-                                "budget_must_use_refs": sp.budget_must_use_refs,
-                                "assigned_refs": sp.assigned_refs,
-                            }
-                        )
-                    budget_plan_path = citation_dir / "citation_budget_plan.json"
-                    plan_export = {
-                        "citation_strategy": paper_plan.citation_strategy if paper_plan else {},
-                        "sections": budget_plan_rows,
-                        "generated_at": datetime.now().isoformat(),
-                    }
-                    budget_plan_path.write_text(
-                        json.dumps(plan_export, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Citation budget plan saved to: {budget_plan_path}")
-
-                    budget_usage_path = citation_dir / "citation_budget_usage.json"
-                    budget_usage_path.write_text(
-                        json.dumps(
-                            {
-                                "sections": ordered_usage,
-                                "generated_at": datetime.now().isoformat(),
-                            },
-                            indent=2,
-                            ensure_ascii=False,
-                        ),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Citation budget usage saved to: {budget_usage_path}")
-
-                    alignment_stats = self._build_citation_plan_alignment_stats(
-                        paper_plan=paper_plan,
-                        usage_rows=ordered_usage,
-                    )
-                    alignment_stats["generated_at"] = datetime.now().isoformat()
-                    alignment_path = citation_dir / "citation_plan_alignment.json"
-                    alignment_path.write_text(
-                        json.dumps(alignment_stats, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Citation plan alignment saved to: {alignment_path}")
-                    citation_repair_stats = self._build_citation_repair_stats(
-                        memory=memory,
-                    )
-                    citation_repair_stats["generated_at"] = datetime.now().isoformat()
-                    citation_repair_path = citation_dir / "citation_repair_stats.json"
-                    citation_repair_path.write_text(
-                        json.dumps(citation_repair_stats, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(
-                        "[MetaDataAgent] Citation repair stats saved to: "
-                        f"{citation_repair_path}"
-                    )
-
-                if paper_plan:
-                    structure_alignment = self._build_structure_alignment_stats(
-                        paper_plan=paper_plan,
-                        generated_sections=generated_sections,
-                    )
-                    structure_alignment["generated_at"] = datetime.now().isoformat()
-                    structure_alignment_path = structure_dir / "structure_alignment.json"
-                    structure_alignment_path.write_text(
-                        json.dumps(structure_alignment, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(
-                        "[MetaDataAgent] Structure alignment saved to: "
-                        f"{structure_alignment_path}"
-                    )
-                    paragraph_alignment = self._build_paragraph_feedback_alignment_report(
-                        memory=memory,
-                        generated_sections=generated_sections,
-                    )
-                    paragraph_alignment["generated_at"] = datetime.now().isoformat()
-                    paragraph_alignment_path = (
-                        structure_dir / "paragraph_feedback_alignment.json"
-                    )
-                    paragraph_alignment_path.write_text(
-                        json.dumps(paragraph_alignment, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(
-                        "[MetaDataAgent] Paragraph feedback alignment saved to: "
-                        f"{paragraph_alignment_path}"
-                    )
-                    subsection_coverage = self._build_explicit_subsection_coverage(
-                        paper_plan=paper_plan,
-                        generated_sections=generated_sections,
-                    )
-                    subsection_coverage["generated_at"] = datetime.now().isoformat()
-                    subsection_coverage_path = (
-                        structure_dir / "explicit_subsection_coverage.json"
-                    )
-                    subsection_coverage_path.write_text(
-                        json.dumps(subsection_coverage, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(
-                        "[MetaDataAgent] Explicit subsection coverage saved to: "
-                        f"{subsection_coverage_path}"
-                    )
-
-                reviewer_acceptance_stats = self._build_reviewer_acceptance_stats(
-                    memory=memory,
-                )
-                reviewer_acceptance_stats["generated_at"] = datetime.now().isoformat()
-                reviewer_acceptance_path = review_dir / "reviewer_acceptance_stats.json"
-                reviewer_acceptance_path.write_text(
-                    json.dumps(reviewer_acceptance_stats, indent=2, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                print(
-                    "[MetaDataAgent] Reviewer acceptance stats saved to: "
-                    f"{reviewer_acceptance_path}"
-                )
-
-                # Save per-paper planner analysis for auditability
-                if discovered_references_by_section:
-                    core_ref_id_set = {
-                        r.get("ref_id", "") for r in core_refs_for_context if r.get("ref_id")
-                    }
-                    analysis_rows: List[Dict[str, Any]] = []
-                    for section_type, papers in discovered_references_by_section.items():
-                        for paper in papers:
-                            ref_id = paper.get("ref_id", "")
-                            analysis_rows.append({
-                                "section_type": section_type,
-                                "ref_id": ref_id,
-                                "title": paper.get("title", ""),
-                                "year": paper.get("year"),
-                                "venue": paper.get("venue", ""),
-                                "source": paper.get("source", ""),
-                                "citation_count": paper.get("citation_count"),
-                                "abstract": paper.get("abstract", ""),
-                                "relevance_score": paper.get("relevance_score"),
-                                "relevance_reason": paper.get("relevance_reason", ""),
-                                "is_core_reference": ref_id in core_ref_id_set,
-                            })
-
-                    analysis_payload = {
-                        "total_sections": len(discovered_references_by_section),
-                        "total_papers": len(analysis_rows),
-                        "papers": analysis_rows,
-                        "generated_at": datetime.now().isoformat(),
-                    }
-                    analysis_path = references_dir / "discovered_papers_analysis.json"
-                    analysis_path.write_text(
-                        json.dumps(analysis_payload, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Discovered papers analysis saved to: {analysis_path}")
-
-                # Save code repository summary markdown (if generated)
-                if code_context:
-                    graph_path = code_dir / "code_evidence_graph.json"
-                    graph_path.write_text(
-                        json.dumps(
-                            {
-                                "code_evidence_graph": code_context.get("code_evidence_graph", []),
-                                "generated_at": datetime.now().isoformat(),
-                            },
-                            indent=2,
-                            ensure_ascii=False,
-                        ),
-                        encoding="utf-8",
-                    )
-                    assets_path = code_dir / "writing_assets.json"
-                    assets_path.write_text(
-                        json.dumps(
-                            {
-                                "writing_assets": code_context.get("writing_assets", {}),
-                                "section_asset_packs": code_context.get("section_asset_packs", {}),
-                                "claim_support_candidates": code_context.get("claim_support_candidates", []),
-                                "generated_at": datetime.now().isoformat(),
-                            },
-                            indent=2,
-                            ensure_ascii=False,
-                        ),
-                        encoding="utf-8",
-                    )
-                    if paper_plan:
-                        focus_rows: List[Dict[str, Any]] = []
-                        for sp in paper_plan.sections:
-                            if not getattr(sp, "code_focus", None):
-                                continue
-                            focus_rows.append(
-                                {
-                                    "section_type": sp.section_type,
-                                    "section_title": sp.section_title,
-                                    "code_focus": sp.code_focus,
-                                }
-                            )
-                        focus_path = code_dir / "section_code_focus_plan.json"
-                        focus_path.write_text(
-                            json.dumps(
-                                {
-                                    "sections": focus_rows,
-                                    "generated_at": datetime.now().isoformat(),
-                                },
-                                indent=2,
-                                ensure_ascii=False,
-                            ),
-                            encoding="utf-8",
-                        )
-                    print(f"[MetaDataAgent] Code analysis artifacts saved to: {code_dir}")
-
-                if code_summary_markdown:
-                    crs_path = code_dir / "code_repository_summary.md"
-                    crs_path.write_text(code_summary_markdown, encoding="utf-8")
-                    print(f"[MetaDataAgent] Code repository summary saved to: {crs_path}")
-
-                # Save prompt/evidence traces (optional)
-                if metadata.export_prompt_traces and prompt_traces:
-                    traces_path = traces_dir / "prompt_traces.json"
-                    traces_path.write_text(
-                        json.dumps(prompt_traces, indent=2, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    print(f"[MetaDataAgent] Prompt traces saved to: {traces_path}")
-
-                # Persist session memory (review history + agent logs)
                 memory.log("metadata", "final", "paper_assembled",
                            narrative=f"Paper assembled successfully with {total_words} total words.",
                            total_words=total_words, status="assembled")
                 memory.persist_all(paper_dir)
-                
-                print(f"[MetaDataAgent] Output saved to: {output_path}")
-            
-            # Determine overall status
-            if not errors:
-                status = "ok"
-            elif len(errors) < len(sections_results):
-                status = "partial"
-            else:
-                status = "error"
-            
+
+            status = "ok" if not errors else ("partial" if len(errors) < len(sections_results) else "error")
             result = PaperGenerationResult(
-                status=status,
-                paper_title=metadata.title,
-                sections=sections_results,
-                latex_content=latex_content,
-                output_path=output_path,
-                pdf_path=pdf_path,
-                total_word_count=total_words,
-                target_word_count=target_word_count,
-                review_iterations=review_iterations,
-                errors=errors,
+                status=status, paper_title=metadata.title,
+                sections=sections_results, latex_content=latex_content,
+                output_path=output_path, pdf_path=pdf_path,
+                total_word_count=total_words, target_word_count=target_word_count,
+                review_iterations=review_iterations, errors=errors,
             )
             await emitter.completed(
-                status=status,
-                total_words=total_words,
+                status=status, total_words=total_words,
                 review_iterations=review_iterations,
                 sections_count=len([s for s in sections_results if s.status == "ok"]),
                 pdf_path=pdf_path,
@@ -2413,17 +1872,79 @@ class MetaDataAgent(ReActAgent):
             return result
 
         except Exception as e:
-            print(f"[MetaDataAgent] Error: {e}")
-            await emitter.error(message=str(e), phase="generate_paper")
+            print(f"[MetaDataAgent] execute_generation error: {e}")
+            await emitter.error(message=str(e), phase="execute_generation")
             return PaperGenerationResult(
-                status="error",
-                paper_title=metadata.title,
-                sections=sections_results,
-                errors=[str(e)],
+                status="error", paper_title=metadata.title,
+                sections=sections_results, errors=[str(e)],
             )
         finally:
             clear_llm_progress_context()
-    
+
+    # ------------------------------------------------------------------
+    # generate_paper: backward-compatible wrapper
+    # ------------------------------------------------------------------
+
+    async def generate_paper(
+        self,
+        metadata: PaperMetaData,
+        output_dir: Optional[str] = None,
+        save_output: bool = True,
+        compile_pdf: bool = True,
+        template_path: Optional[str] = None,
+        figures_source_dir: Optional[str] = None,
+        target_pages: Optional[int] = None,
+        enable_review: bool = True,
+        max_review_iterations: int = 3,
+        enable_planning: bool = True,
+        enable_vlm_review: bool = False,
+        enable_user_feedback: bool = False,
+        progress_callback: Optional[ProgressCallback] = None,
+        feedback_queue: Optional[asyncio.Queue] = None,
+        feedback_timeout: float = 300.0,
+        artifacts_prefix: str = "",
+    ) -> PaperGenerationResult:
+        """
+        Generate complete paper from MetaData (backward-compatible wrapper).
+        - **Description**:
+            - Calls ``prepare_plan()`` then ``execute_generation()`` sequentially.
+            - Preserves the original single-call interface used by
+              ``/metadata/generate/stream`` and ``/metadata/generate``.
+        """
+        plan_result = await self.prepare_plan(
+            metadata=metadata,
+            template_path=template_path,
+            target_pages=target_pages,
+            enable_planning=enable_planning,
+            save_output=save_output,
+            output_dir=output_dir,
+            progress_callback=progress_callback,
+            artifacts_prefix=artifacts_prefix,
+        )
+
+        if plan_result.errors and not plan_result.paper_plan:
+            return PaperGenerationResult(
+                status="error",
+                paper_title=metadata.title,
+                errors=plan_result.errors,
+            )
+
+        return await self.execute_generation(
+            plan_result=plan_result,
+            enable_review=enable_review,
+            max_review_iterations=max_review_iterations,
+            compile_pdf=compile_pdf,
+            enable_vlm_review=enable_vlm_review,
+            enable_user_feedback=enable_user_feedback,
+            progress_callback=progress_callback,
+            feedback_queue=feedback_queue,
+            feedback_timeout=feedback_timeout,
+            save_output=save_output,
+            output_dir=output_dir,
+            figures_source_dir=figures_source_dir,
+        )
+
+
     async def generate_single_section(
         self,
         request: SectionGenerationRequest,
@@ -2611,6 +2132,7 @@ class MetaDataAgent(ReActAgent):
         prompt_traces: Optional[List[Dict[str, Any]]] = None,
         memory: Optional[SessionMemory] = None,
         evidence_dag: Optional[EvidenceDAG] = None,
+        emitter: Optional[ProgressEmitter] = None,
     ) -> SectionResult:
         """
         Generate a body section using two-phase pattern.
@@ -2747,6 +2269,7 @@ class MetaDataAgent(ReActAgent):
                     writer_valid_keys=writer_valid_keys,
                     section_title_str=section_title_str,
                     memory=memory,
+                    emitter=emitter,
                 )
             else:
                 result = await self._writer.run(
@@ -2800,6 +2323,7 @@ class MetaDataAgent(ReActAgent):
         writer_valid_keys: List[str],
         section_title_str: str = "",
         memory: Optional[SessionMemory] = None,
+        emitter: Optional[ProgressEmitter] = None,
     ) -> str:
         """
         Generate a section paragraph-by-paragraph with verify-retry-degrade.
@@ -2820,6 +2344,7 @@ class MetaDataAgent(ReActAgent):
             - ``writer_valid_keys`` (List[str]): Superset of allowed citation keys.
             - ``section_title_str`` (str): Display title for prompt context.
             - ``memory`` (SessionMemory, optional): Shared memory.
+            - ``emitter`` (ProgressEmitter, optional): Emits paragraph-level SSE events.
 
         - **Returns**:
             - ``str``: Assembled LaTeX content for the entire section.
@@ -2842,6 +2367,15 @@ class MetaDataAgent(ReActAgent):
                 paragraph_outputs.append("")
                 verify_stats["skipped"] += 1
                 continue
+
+            if emitter is not None:
+                await emitter.paragraph_start(
+                    section_type=section_type,
+                    paragraph_index=pidx,
+                    claim_id=para.claim_id,
+                    total_paragraphs=total_paras,
+                    phase=Phase.BODY_SECTIONS,
+                )
 
             # Gather evidence for this paragraph's claim
             evidence_nodes = evidence_dag.get_evidence_for_claim(para.claim_id)
@@ -2897,6 +2431,19 @@ class MetaDataAgent(ReActAgent):
                     valid_citation_keys=valid_keys_set,
                 )
 
+                if emitter is not None:
+                    fb = (vr.feedback_for_retry or "")[:500]
+                    await emitter.claim_verify_result(
+                        section_type=section_type,
+                        paragraph_index=pidx,
+                        claim_id=para.claim_id,
+                        passed=vr.passed,
+                        attempt=attempt + 1,
+                        max_attempts=MAX_CLAIM_RETRIES,
+                        feedback_summary=fb,
+                        phase=Phase.BODY_SECTIONS,
+                    )
+
                 if vr.passed:
                     verify_stats["passed"] += 1
                     break
@@ -2938,6 +2485,17 @@ class MetaDataAgent(ReActAgent):
                         print(
                             f"[MetaDataAgent] Template fallback failed for paragraph {pidx}: {tmpl_err}"
                         )
+
+            wc = len(latex.split()) if latex else 0
+            if emitter is not None:
+                await emitter.paragraph_content(
+                    section_type=section_type,
+                    paragraph_index=pidx,
+                    claim_id=para.claim_id,
+                    content=latex,
+                    word_count=wc,
+                    phase=Phase.BODY_SECTIONS,
+                )
 
             paragraph_outputs.append(latex)
             if latex:

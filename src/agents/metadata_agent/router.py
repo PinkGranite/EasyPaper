@@ -22,6 +22,7 @@ from fastapi.responses import StreamingResponse
 from .models import (
     PaperGenerationRequest,
     PaperGenerationResult,
+    PlanResult,
     SectionGenerationRequest,
     SectionResult,
 )
@@ -135,6 +136,108 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
 
         async def event_stream():
             # First event: send task_id so the client can use it for feedback
+            yield f"data: {json.dumps({'type': 'task_created', 'task_id': task_id})}\n\n"
+            try:
+                while True:
+                    event = await event_queue.get()
+                    if event is None:
+                        break
+                    yield f"data: {json.dumps(event, default=str)}\n\n"
+            except asyncio.CancelledError:
+                gen_task.cancel()
+            finally:
+                if not gen_task.done():
+                    gen_task.cancel()
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # POST /metadata/prepare-plan  (blocking, returns PlanResult JSON)
+    # ------------------------------------------------------------------
+    @router.post("/prepare-plan", response_model=PlanResult)
+    async def prepare_plan(request: PaperGenerationRequest) -> PlanResult:
+        """
+        Run planning phases only and return a serializable PlanResult.
+
+        - **Description**:
+            - Executes Phases 0 through 0.5 (planning, ref discovery, DAG,
+              code context, table conversion) without starting generation.
+            - The returned PlanResult can be reviewed/modified by the user,
+              then sent to ``/metadata/generate-from-plan/stream``.
+        """
+        try:
+            metadata = request.to_metadata()
+            result = await agent.prepare_plan(
+                metadata=metadata,
+                template_path=request.template_path,
+                target_pages=request.target_pages,
+                enable_planning=request.enable_planning,
+                save_output=request.save_output,
+                output_dir=request.output_dir,
+                artifacts_prefix=request.artifacts_prefix or "",
+            )
+            return result
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # ------------------------------------------------------------------
+    # POST /metadata/generate-from-plan/stream  (SSE, resumes from PlanResult)
+    # ------------------------------------------------------------------
+    @router.post("/generate-from-plan/stream")
+    async def generate_from_plan_stream(plan_result: PlanResult):
+        """
+        Generate paper content from a (possibly user-modified) PlanResult.
+
+        - **Description**:
+            - Accepts the output of ``/metadata/prepare-plan``, reconstructs
+              internal state, then runs Phases 1-5 with SSE streaming.
+        """
+        task_id = str(uuid.uuid4())
+        event_queue: asyncio.Queue[Optional[Dict[str, Any]]] = asyncio.Queue()
+        feedback_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+
+        _active_tasks[task_id] = {
+            "event_queue": event_queue,
+            "feedback_queue": feedback_queue,
+            "status": "running",
+        }
+
+        async def progress_callback(event: Dict[str, Any]) -> None:
+            event["task_id"] = task_id
+            await event_queue.put(event)
+
+        async def run_generation() -> None:
+            try:
+                await agent.execute_generation(
+                    plan_result=plan_result,
+                    enable_review=True,
+                    max_review_iterations=3,
+                    compile_pdf=True,
+                    progress_callback=progress_callback,
+                    feedback_queue=feedback_queue,
+                )
+            except Exception as e:
+                await event_queue.put({
+                    "type": "error",
+                    "task_id": task_id,
+                    "message": str(e),
+                })
+            finally:
+                await event_queue.put(None)
+                _active_tasks.pop(task_id, None)
+
+        gen_task = asyncio.create_task(run_generation())
+        _active_tasks[task_id]["task"] = gen_task
+
+        async def event_stream():
             yield f"data: {json.dumps({'type': 'task_created', 'task_id': task_id})}\n\n"
             try:
                 while True:

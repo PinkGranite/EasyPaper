@@ -45,6 +45,10 @@ class EventType:
     LOG = "log"
     GEN_UI = "gen_ui"
     ARTIFACT_SAVED = "artifact_saved"
+    # Paragraph-level DAG progress (decomposed body generation)
+    PARAGRAPH_START = "paragraph_start"
+    PARAGRAPH_CONTENT = "paragraph_content"
+    CLAIM_VERIFY_RESULT = "claim_verify_result"
 
 
 # Phase identifiers
@@ -151,6 +155,71 @@ class ProgressEmitter:
             "section_type": section_type,
             "content": content,
             "word_count": word_count,
+            "phase": phase,
+            **extra,
+        })
+
+    async def paragraph_start(
+        self,
+        section_type: str,
+        paragraph_index: int,
+        claim_id: str,
+        total_paragraphs: int = 0,
+        phase: str = "",
+        **extra: Any,
+    ) -> None:
+        await self._emit({
+            "type": EventType.PARAGRAPH_START,
+            "section_type": section_type,
+            "paragraph_index": paragraph_index,
+            "claim_id": claim_id,
+            "total_paragraphs": total_paragraphs,
+            "phase": phase,
+            **extra,
+        })
+
+    async def paragraph_content(
+        self,
+        section_type: str,
+        paragraph_index: int,
+        claim_id: str,
+        content: str,
+        word_count: int = 0,
+        phase: str = "",
+        **extra: Any,
+    ) -> None:
+        await self._emit({
+            "type": EventType.PARAGRAPH_CONTENT,
+            "section_type": section_type,
+            "paragraph_index": paragraph_index,
+            "claim_id": claim_id,
+            "content": content,
+            "word_count": word_count,
+            "phase": phase,
+            **extra,
+        })
+
+    async def claim_verify_result(
+        self,
+        section_type: str,
+        paragraph_index: int,
+        claim_id: str,
+        passed: bool,
+        attempt: int,
+        max_attempts: int,
+        feedback_summary: str = "",
+        phase: str = "",
+        **extra: Any,
+    ) -> None:
+        await self._emit({
+            "type": EventType.CLAIM_VERIFY_RESULT,
+            "section_type": section_type,
+            "paragraph_index": paragraph_index,
+            "claim_id": claim_id,
+            "passed": passed,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "feedback_summary": feedback_summary,
             "phase": phase,
             **extra,
         })

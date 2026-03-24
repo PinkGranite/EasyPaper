@@ -94,7 +94,7 @@ class EvidenceChecker(FeedbackChecker):
                 else:
                     drifted_claims_list.append({
                         "claim_id": claim.node_id,
-                        "claim_text": claim.claim_text[:100],
+                        "claim_text": (claim.statement or "")[:100],
                         "section_type": section_type,
                         "expected_evidence": bound_evidence_ids,
                     })
