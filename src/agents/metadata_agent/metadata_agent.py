@@ -1433,8 +1433,6 @@ class MetaDataAgent(ReActAgent):
                         except Exception as e:
                             print(f"[MetaDataAgent] Warning: Failed to generate research context: {e}")
 
-<<<<<<< HEAD
-=======
                     # Phase 0c: Assign references to sections - NOW USES research_context_v2
                     print("[MetaDataAgent] Phase 0c: Assigning references to sections...")
                     self._planner.assign_references(
