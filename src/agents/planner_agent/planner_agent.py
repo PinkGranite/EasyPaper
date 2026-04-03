@@ -14,6 +14,7 @@ from typing import List, Dict, Any, Optional
 from fastapi import APIRouter
 from ..base import BaseAgent
 from ..shared.llm_client import LLMClient
+from ..shared.reference_assignment import claim_matrix_refs_for_section
 from ...config.schema import ModelConfig
 from .models import (
     PaperPlan,
@@ -1097,6 +1098,210 @@ class PlannerAgent(BaseAgent):
         logger.info("planner.seed_reference_discovery count=%d", len(discovered))
         return discovered
 
+    async def discover_landscape_references(
+        self,
+        *,
+        core_analysis: Any,
+        title: str,
+        idea_hypothesis: str,
+        paper_search_config: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Broad literature search for research-context construction (pre-plan).
+
+        - **Description**:
+            - Queries are derived from core-ref synthesis (gaps, lineage, titles)
+              plus the manuscript title and idea — not from section key points.
+            - Returns a flat list of papers; callers decide pool membership.
+        """
+        import asyncio
+        from ..shared.tools.paper_search import PaperSearchTool
+
+        cfg = paper_search_config or {}
+        tool = PaperSearchTool(
+            serpapi_api_key=cfg.get("serpapi_api_key"),
+            semantic_scholar_api_key=cfg.get("semantic_scholar_api_key"),
+            timeout=cfg.get("timeout", 10),
+            semantic_scholar_min_results_before_fallback=cfg.get(
+                "semantic_scholar_min_results_before_fallback", 3
+            ),
+            enable_query_cache=cfg.get("enable_query_cache", True),
+            cache_ttl_hours=cfg.get("cache_ttl_hours", 24),
+        )
+
+        max_queries = max(4, min(10, int(cfg.get("planner_landscape_max_queries", 8))))
+        per_round = max(3, int(cfg.get("search_results_per_round", 5)))
+        delay_sec = max(0.5, float(cfg.get("planner_inter_round_delay_sec", 1.5)))
+
+        queries: List[str] = []
+        seen_q: set = set()
+
+        def _add(q: str) -> None:
+            qq = " ".join(str(q).split()).strip()
+            if len(qq) < 8 or qq in seen_q:
+                return
+            seen_q.add(qq)
+            queries.append(qq)
+
+        _add(title)
+        _add(f"{title} {idea_hypothesis[:220]}")
+
+        gaps = getattr(core_analysis, "shared_gaps", None) or []
+        if isinstance(gaps, list):
+            for g in gaps[:5]:
+                if isinstance(g, str):
+                    _add(f"{title} {g[:180]}")
+
+        lineage = getattr(core_analysis, "research_lineage", "") or ""
+        if isinstance(lineage, str) and lineage.strip():
+            _add(f"{title} {lineage[:200]}")
+
+        pos = getattr(core_analysis, "positioning_statement", "") or ""
+        if isinstance(pos, str) and pos.strip():
+            _add(f"{title} {pos[:200]}")
+
+        items = getattr(core_analysis, "items", None) or []
+        if items:
+            for it in items[:4]:
+                t = getattr(it, "title", "") if not isinstance(it, dict) else it.get("title", "")
+                if t:
+                    _add(f"{title} related work {t[:120]}")
+
+        queries = queries[:max_queries]
+
+        discovered: List[Dict[str, Any]] = []
+        seen_keys: set = set()
+        for i, query in enumerate(queries):
+            if i > 0:
+                await asyncio.sleep(delay_sec)
+            try:
+                result = await tool.execute(query=query, max_results=per_round)
+                if not result.success:
+                    continue
+                papers = result.data.get("papers", []) if result.data else []
+                for paper in papers:
+                    bkey = paper.get("bibtex_key", "")
+                    bibtex = paper.get("bibtex", "")
+                    if bkey and bibtex and bkey not in seen_keys:
+                        seen_keys.add(bkey)
+                        discovered.append(
+                            {
+                                "ref_id": bkey,
+                                "bibtex": bibtex,
+                                "title": paper.get("title", ""),
+                                "year": paper.get("year"),
+                                "abstract": paper.get("abstract", ""),
+                                "venue": paper.get("venue", ""),
+                                "citation_count": paper.get("citation_count"),
+                                "source": "landscape_discovery",
+                            }
+                        )
+            except Exception as e:
+                logger.warning("planner.landscape_search_error query='%s': %s", query[:80], e)
+
+        logger.info("planner.landscape_reference_discovery count=%d", len(discovered))
+        return discovered
+
+    # Known utility / infrastructure mentions -> search query suffixes
+    _UTILITY_LITERATURE_TRIGGERS: List[tuple[str, str]] = [
+        ("imagenet", "ImageNet large scale visual recognition Deng 2009"),
+        ("cifar-10", "CIFAR-10 dataset learning multiple layers"),
+        ("cifar-100", "CIFAR-100 dataset"),
+        ("pytorch", "PyTorch Paszke automatic differentiation"),
+        ("tensorflow", "TensorFlow Abadi machine learning"),
+        ("mnist", "MNIST handwritten digit database"),
+        ("bleu", "BLEU Papineni machine translation evaluation"),
+        ("rouge", "ROUGE Lin summarization evaluation"),
+        ("coco dataset", "COCO dataset Lin Microsoft common objects"),
+    ]
+
+    async def discover_utility_references(
+        self,
+        plan: "PaperPlan",
+        existing_ref_keys: List[str],
+        paper_search_config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Targeted search for dataset / metric / framework papers mentioned in the plan.
+
+        - **Description**:
+            - Scans section key points and paragraph text for known triggers.
+            - Returns section_type -> papers (same shape as ``discover_references``).
+        """
+        import asyncio
+        from ..shared.tools.paper_search import PaperSearchTool
+
+        cfg = paper_search_config or {}
+        tool = PaperSearchTool(
+            serpapi_api_key=cfg.get("serpapi_api_key"),
+            semantic_scholar_api_key=cfg.get("semantic_scholar_api_key"),
+            timeout=cfg.get("timeout", 10),
+            semantic_scholar_min_results_before_fallback=cfg.get(
+                "semantic_scholar_min_results_before_fallback", 3
+            ),
+            enable_query_cache=cfg.get("enable_query_cache", True),
+            cache_ttl_hours=cfg.get("cache_ttl_hours", 24),
+        )
+        per_round = max(2, int(cfg.get("search_results_per_round", 5)))
+        delay_sec = max(0.5, float(cfg.get("planner_inter_round_delay_sec", 1.5)))
+
+        out: Dict[str, List[Dict[str, Any]]] = {}
+        seen_keys = set(existing_ref_keys)
+        search_count = 0
+        max_utility_searches = int(cfg.get("planner_max_utility_searches", 12))
+
+        for sp in plan.sections:
+            if sp.section_type in ("abstract", "conclusion"):
+                continue
+            blobs: List[str] = []
+            try:
+                blobs.extend(sp.get_key_points())
+            except Exception:
+                pass
+            for para in getattr(sp, "paragraphs", []) or []:
+                blobs.append(getattr(para, "key_point", "") or "")
+                blobs.extend(getattr(para, "supporting_points", []) or [])
+            blob = " ".join(blobs).lower()
+
+            for needle, query in self._UTILITY_LITERATURE_TRIGGERS:
+                if search_count >= max_utility_searches:
+                    break
+                if needle not in blob:
+                    continue
+                if search_count > 0:
+                    await asyncio.sleep(delay_sec)
+                search_count += 1
+                try:
+                    result = await tool.execute(query=query, max_results=per_round)
+                    if not result.success:
+                        continue
+                    papers = result.data.get("papers", []) if result.data else []
+                    for paper in papers:
+                        bkey = paper.get("bibtex_key", "")
+                        bibtex = paper.get("bibtex", "")
+                        if not bkey or not bibtex or bkey in seen_keys:
+                            continue
+                        seen_keys.add(bkey)
+                        rec = {
+                            "ref_id": bkey,
+                            "bibtex": bibtex,
+                            "title": paper.get("title", ""),
+                            "year": paper.get("year"),
+                            "abstract": paper.get("abstract", ""),
+                            "venue": paper.get("venue", ""),
+                            "citation_count": paper.get("citation_count"),
+                            "source": "utility_discovery",
+                        }
+                        out.setdefault(sp.section_type, []).append(rec)
+                        break
+                except Exception as e:
+                    logger.warning("planner.utility_search_error query='%s': %s", query[:60], e)
+
+        total_u = sum(len(v) for v in out.values())
+        if total_u:
+            logger.info("planner.utility_reference_discovery total=%d", total_u)
+        return out
+
     # =====================================================================
     # Reference discovery
     # =====================================================================
@@ -1311,6 +1516,14 @@ class PlannerAgent(BaseAgent):
         logger.info("planner.reference_discovery_complete total=%d", total)
         return discovered
 
+    @staticmethod
+    def _claim_matrix_refs_for_section(
+        research_context: Optional[Dict[str, Any]],
+        section_type: str,
+    ) -> List[str]:
+        """Delegate to shared helper (kept for backward compatibility)."""
+        return claim_matrix_refs_for_section(research_context, section_type)
+
     def assign_references(
         self,
         plan: "PaperPlan",
@@ -1337,9 +1550,8 @@ class PlannerAgent(BaseAgent):
               discover_references().
             - `core_ref_keys` (List[str]): Citation keys of user-provided refs.
             - `paper_search_config` (Optional[Dict[str, Any]]): Search configuration.
-            - `research_context` (Optional[Dict[str, Any]]): Research context from
-              _generate_research_context(), containing claim_evidence_matrix for
-              smarter reference assignment.
+            - `research_context` (Optional[Dict[str, Any]]): Research context with
+              ``claim_evidence_matrix`` for claim-aware reference priority.
         """
         cfg = paper_search_config or {}
         budget_enabled = cfg.get("citation_budget_enabled", True)
@@ -1392,6 +1604,9 @@ class PlannerAgent(BaseAgent):
             discovered_for_section = discovered.get(sp.section_type, [])
             discovered_ranked = self._rank_references_for_section(discovered_for_section)
             planner_hint_refs = [r for r in sp.get_all_references() if r]
+            claim_refs = self._claim_matrix_refs_for_section(
+                research_context, sp.section_type,
+            )
             budget = self._infer_section_citation_budget(
                 section_type=sp.section_type,
                 paragraph_count=len(sp.paragraphs),
@@ -1400,10 +1615,17 @@ class PlannerAgent(BaseAgent):
                 core_ref_keys=core_ref_keys,
                 planner_budget=sp.citation_budget if isinstance(sp.citation_budget, dict) else {},
                 topdown_target=topdown_targets.get(sp.section_type),
+                claim_matrix_refs=claim_refs,
             )
 
             if not budget_enabled:
-                refs: List[str] = list(core_ref_keys)
+                refs: List[str] = []
+                for rid in claim_refs:
+                    if rid not in refs:
+                        refs.append(rid)
+                for rid in core_ref_keys:
+                    if rid not in refs:
+                        refs.append(rid)
                 for paper in discovered_ranked:
                     rid = paper.get("ref_id", "")
                     if rid and rid not in refs:
@@ -1558,6 +1780,7 @@ class PlannerAgent(BaseAgent):
         topdown_target: Optional[int] = None,
         evidence_dag: Optional[Any] = None,
         section_plan: Optional[Any] = None,
+        claim_matrix_refs: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Infer per-section citation budget, prioritizing planner-provided budget.
@@ -1588,6 +1811,7 @@ class PlannerAgent(BaseAgent):
             except Exception:
                 pass
         planner_hint_refs = [r for r in planner_hint_refs if r in allowed_key_set]
+        claim_refs = [r for r in (claim_matrix_refs or []) if r in allowed_key_set]
         high_quality = [
             p for p in candidate_refs
             if float(p.get("relevance_score") or 0.0) >= 8.0
@@ -1622,6 +1846,9 @@ class PlannerAgent(BaseAgent):
         must_use_refs: List[str] = []
         # DAG-derived refs get highest priority
         for rid in dag_citation_refs:
+            if rid and rid not in must_use_refs:
+                must_use_refs.append(rid)
+        for rid in claim_refs:
             if rid and rid not in must_use_refs:
                 must_use_refs.append(rid)
         for rid in planner_hint_refs:
@@ -2062,6 +2289,10 @@ class PlannerAgent(BaseAgent):
     ) -> Dict[str, Any]:
         """
         Generate a research context summary from discovered papers.
+
+        - **Note**:
+            - ``MetaDataAgent.prepare_plan`` uses ``ResearchContextBuilder`` instead.
+            - Kept for ad-hoc callers and backward compatibility.
 
         - **Description**:
             - Analyzes all discovered papers to generate a research overview.

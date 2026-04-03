@@ -65,7 +65,8 @@ class ContextPerceptionModule:
         - **Args**:
             - `metadata`: PaperMetaData (or compatible object with .figures, .tables).
             - `code_context` (Dict): Output of CodeContextBuilder.build().
-            - `research_context` (Dict): Output of PlannerAgent._generate_research_context().
+            - `research_context` (Dict): Unified research context from
+              ``ResearchContextBuilder`` / ``prepare_plan`` (includes ``core_ref_analysis``).
             - `paper_plan`: PaperPlan for claim extraction.
             - `figures` (List): FigureSpec list (overrides metadata.figures if given).
             - `tables` (List): TableSpec list (overrides metadata.tables if given).

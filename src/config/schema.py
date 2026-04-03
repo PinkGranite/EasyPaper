@@ -35,6 +35,8 @@ class PaperSearchConfig(BaseModel):
     citation_budget_soft_cap: bool = True
     citation_budget_export: bool = True
     citation_budget_reserve_size: int = 4
+    planner_landscape_max_queries: int = 8
+    planner_max_utility_searches: int = 12
 
 
 class ResearchContextConfig(BaseModel):
@@ -42,10 +44,17 @@ class ResearchContextConfig(BaseModel):
     enabled: bool = True  # Whether to generate Research Context
     detailed: bool = True  # Whether to use detailed mode
     top_k_key_papers: int = 10  # Number of key papers to include
-    research_context_first_enabled: bool = True
     claim_evidence_enabled: bool = True
     contribution_ranking_enabled: bool = True
     export_planning_decision_trace: bool = False
+
+
+class CoreRefAnalysisConfig(BaseModel):
+    """Configuration for deep analysis of user-provided core references."""
+
+    enabled: bool = True
+    max_abstract_chars: int = 2000
+    analyze_cross_paper: bool = True
 
 
 class ToolsConfig(BaseModel):
@@ -66,6 +75,7 @@ class ToolsConfig(BaseModel):
     structure_gate_min_paragraph_threshold: int = 5
     paper_search: Optional[PaperSearchConfig] = None
     research_context: Optional[ResearchContextConfig] = None
+    core_ref_analysis: Optional[CoreRefAnalysisConfig] = None
 
 
 class MetadataConfig(BaseModel):

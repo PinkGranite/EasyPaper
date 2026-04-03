@@ -351,6 +351,64 @@ class PaperGenerationResult(BaseModel):
     errors: List[str] = Field(default_factory=list)
 
 
+class CoreRefAnalysisItem(BaseModel):
+    """
+    Deep analysis of a single core reference.
+    - **Description**:
+        - Structured interpretation of one user-provided paper (not generic scoring).
+    """
+
+    ref_id: str
+    title: str
+    core_contributions: List[str] = Field(default_factory=list)
+    methodology: str = ""
+    limitations: List[str] = Field(default_factory=list)
+    relationship_to_ours: str = ""
+    key_results: List[str] = Field(default_factory=list)
+    relevance_score: float = 1.0
+
+
+class CoreRefAnalysis(BaseModel):
+    """
+    Cross-cutting analysis of all core references.
+    - **Description**:
+        - Per-paper items plus synthesis across the user's anchor literature.
+    """
+
+    items: List[CoreRefAnalysisItem] = Field(default_factory=list)
+    shared_gaps: List[str] = Field(default_factory=list)
+    research_lineage: str = ""
+    positioning_statement: str = ""
+
+
+class ResearchContextModel(BaseModel):
+    """
+    Typed research context for planning and writing.
+    - **Description**:
+        - Mirrors legacy dict keys for serialization into ``PlanResult.research_context``.
+    """
+
+    research_area: str = ""
+    summary: str = ""
+    key_papers: List[Dict[str, Any]] = Field(default_factory=list)
+    research_trends: List[str] = Field(default_factory=list)
+    gaps: List[str] = Field(default_factory=list)
+    claim_evidence_matrix: List[Dict[str, Any]] = Field(default_factory=list)
+    contribution_ranking: Dict[str, List[Dict[str, Any]]] = Field(default_factory=dict)
+    planning_decision_trace: List[str] = Field(default_factory=list)
+    paper_assignments: Dict[str, List[str]] = Field(default_factory=dict)
+    core_ref_analysis: Optional[CoreRefAnalysis] = None
+
+    def to_research_context_dict(self) -> Dict[str, Any]:
+        """
+        Serialize for ``PlanResult.research_context`` and planner consumers.
+        - **Returns**:
+            - `dict`: JSON-serializable research context.
+        """
+        d = self.model_dump(mode="json", exclude_none=True)
+        return d
+
+
 class ReviewCheckpoint(BaseModel):
     """
     Serialized generation state at a review feedback pause point.

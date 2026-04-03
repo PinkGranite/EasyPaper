@@ -272,11 +272,50 @@ class DAGBuilder:
         if not research_context:
             return
 
+        existing_paths = {n.source_path for n in dag.evidence_nodes.values()}
+        lit_counter = 0
+        for nid in dag.evidence_nodes:
+            if isinstance(nid, str) and nid.startswith("LIT") and len(nid) >= 4:
+                try:
+                    lit_counter = max(lit_counter, int(nid[3:]))
+                except ValueError:
+                    pass
+
+        # User core-ref deep analysis (privileged literature nodes)
+        cra = research_context.get("core_ref_analysis")
+        if isinstance(cra, dict):
+            for it in cra.get("items") or []:
+                if not isinstance(it, dict):
+                    continue
+                ref_id = str(it.get("ref_id", "")).strip()
+                if not ref_id or ref_id in existing_paths:
+                    continue
+                lit_counter += 1
+                node_id = f"LIT{lit_counter:03d}"
+                contribs = it.get("core_contributions") or []
+                contrib_text = "; ".join(str(c) for c in contribs)[:500]
+                dag.add_evidence(EvidenceNode(
+                    node_id=node_id,
+                    node_type=EvidenceNodeType.LITERATURE,
+                    content=contrib_text or str(it.get("title", "")),
+                    source_path=ref_id,
+                    confidence=0.95,
+                    metadata={
+                        "title": it.get("title", ""),
+                        "kind": "core_ref_analysis",
+                        "relationship_to_ours": it.get("relationship_to_ours", ""),
+                    },
+                ))
+                existing_paths.add(ref_id)
+
         # Key papers become evidence nodes
         key_papers = research_context.get("key_papers") or []
         for idx, kp in enumerate(key_papers, start=1):
             ref_id = kp.get("ref_id") or kp.get("title", f"lit_{idx}")
-            node_id = f"LIT{idx:03d}"
+            if ref_id in existing_paths:
+                continue
+            lit_counter += 1
+            node_id = f"LIT{lit_counter:03d}"
             dag.add_evidence(EvidenceNode(
                 node_id=node_id,
                 node_type=EvidenceNodeType.LITERATURE,
@@ -289,11 +328,10 @@ class DAGBuilder:
                     "year": kp.get("year", ""),
                 },
             ))
+            existing_paths.add(ref_id)
 
         # claim_evidence_matrix entries may reference refs not yet added
         matrix = research_context.get("claim_evidence_matrix") or []
-        existing_paths = {n.source_path for n in dag.evidence_nodes.values()}
-        lit_counter = len(key_papers)
         for entry in matrix:
             for ref_key in entry.get("support_refs") or []:
                 if ref_key and ref_key not in existing_paths:

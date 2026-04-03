@@ -3,7 +3,9 @@ MetaData Agent - Simple Mode Paper Generation
 - **Description**:
     - Generates complete papers from simplified MetaData input
     - Multi-phase generation with persistent ReferencePool:
-        0. Planning - creates detailed paper plan
+        0. Planning - core-ref analysis, landscape search, unified research context,
+          then paper plan, section reference discovery, utility citation discovery,
+          assignment, evidence DAG
         1. Introduction (Leader) - sets tone, extracts contributions
         2. Body Sections - Method, Experiment, Results, Related Work
         3. Synthesis Sections - Abstract and Conclusion from prior sections
@@ -42,6 +44,8 @@ from ..shared.llm_client import set_llm_progress_context, clear_llm_progress_con
 from ..react_base import ReActAgent
 from ...config.schema import ModelConfig, ToolsConfig
 from ..shared.reference_pool import ReferencePool
+from ..shared.core_ref_analyzer import CoreRefAnalyzer
+from ..shared.research_context_builder import ResearchContextBuilder
 from .models import (
     PaperMetaData,
     PaperGenerationRequest,
@@ -533,6 +537,23 @@ class MetaDataAgent(ReActAgent):
                     contribution = kp.get("contribution", "")
                     if title:
                         lines.append(f"  - {title}: {contribution}")
+
+            cra = research_context.get("core_ref_analysis")
+            if isinstance(cra, dict):
+                cra_items = cra.get("items") or []
+                if cra_items:
+                    lines.append("- Core references (user anchors):")
+                    for it in cra_items[:6]:
+                        if not isinstance(it, dict):
+                            continue
+                        rid = it.get("ref_id", "")
+                        tit = it.get("title", "")
+                        rel = str(it.get("relationship_to_ours", ""))[:220]
+                        if tit or rid:
+                            lines.append(f"  - [{rid}] {tit}: {rel}")
+                    pos = str(cra.get("positioning_statement", "")).strip()
+                    if pos:
+                        lines.append(f"- Positioning vs core refs: {pos[:400]}")
 
             claim_matrix = research_context.get("claim_evidence_matrix", []) or []
             section_claims = [
@@ -1134,32 +1155,6 @@ class MetaDataAgent(ReActAgent):
             "sections": rows,
         }
 
-    def _build_core_refs_for_research_context(
-        self,
-        ref_pool: ReferencePool,
-    ) -> List[Dict[str, Any]]:
-        """
-        Convert core references into research-context paper records.
-        """
-        rows: List[Dict[str, Any]] = []
-        for ref in ref_pool.core_refs:
-            ref_id = ref.get("ref_id", "")
-            if not ref_id:
-                continue
-            rows.append(
-                {
-                    "ref_id": ref_id,
-                    "bibtex": ref.get("bibtex", ""),
-                    "title": ref.get("title", ""),
-                    "year": ref.get("year"),
-                    "abstract": ref.get("abstract", ""),
-                    "venue": ref.get("venue", ""),
-                    "citation_count": ref.get("citation_count"),
-                    "source": ref.get("source", "core_reference"),
-                }
-            )
-        return rows
-
     # ------------------------------------------------------------------
     # prepare_plan: Phase 0 only — returns a serializable PlanResult
     # ------------------------------------------------------------------
@@ -1218,10 +1213,6 @@ class MetaDataAgent(ReActAgent):
         errors: List[str] = []
         paper_plan: Optional[PaperPlan] = None
         research_context: Optional[Dict[str, Any]] = None
-        research_context_v1: Optional[Dict[str, Any]] = None
-        research_context_v2: Optional[Dict[str, Any]] = None
-        seed_discovered_references: List[Dict[str, Any]] = []
-        core_refs_for_context: List[Dict[str, Any]] = []
         code_context: Optional[Dict[str, Any]] = None
         code_summary_markdown: Optional[str] = None
         evidence_dag: Optional[EvidenceDAG] = None
@@ -1329,6 +1320,12 @@ class MetaDataAgent(ReActAgent):
                         "citation_budget_export": ps.citation_budget_export,
                         "citation_budget_reserve_size": ps.citation_budget_reserve_size,
                         "style_guide": metadata.style_guide,
+                        "planner_landscape_max_queries": getattr(
+                            ps, "planner_landscape_max_queries", 8,
+                        ),
+                        "planner_max_utility_searches": getattr(
+                            ps, "planner_max_utility_searches", 12,
+                        ),
                     }
 
                 rc_cfg = (
@@ -1336,45 +1333,64 @@ class MetaDataAgent(ReActAgent):
                     if self.tools_config and self.tools_config.research_context
                     else None
                 )
-                rc_first_enabled = rc_cfg.research_context_first_enabled if rc_cfg else False
                 rc_enabled = rc_cfg.enabled if rc_cfg else False
-                if rc_enabled and not core_refs_for_context:
-                    core_refs_for_context = self._build_core_refs_for_research_context(ref_pool)
 
-                # Phase 0a: research context v1 (pre-plan)
-                if rc_enabled and rc_first_enabled:
-                    print("[MetaDataAgent] Phase 0a: Building research context v1 (pre-plan)...")
+                # Phase 0-core + 0-ctx: core ref analysis, landscape search, unified research context (pre-plan)
+                if rc_enabled:
+                    print("[MetaDataAgent] Phase 0-core: Analyzing core references...")
                     try:
-                        core_refs_for_context = self._build_core_refs_for_research_context(ref_pool)
-                        seed_discovered_references = await self._planner.discover_seed_references(
+                        _analyzer = CoreRefAnalyzer.from_tools_config(
+                            self.client, self.model_name, self.tools_config,
+                        )
+                        _core_analysis = await _analyzer.analyze(
+                            list(ref_pool.core_refs), metadata,
+                        )
+                    except Exception as e:
+                        print(f"[MetaDataAgent] Warning: Core ref analysis failed: {e}")
+                        from .models import CoreRefAnalysis as _CoreRefAnalysis
+                        _core_analysis = _CoreRefAnalysis()
+
+                    print("[MetaDataAgent] Phase 0-ctx: Landscape discovery + research context...")
+                    landscape_papers: List[Dict[str, Any]] = []
+                    try:
+                        landscape_papers = await self._planner.discover_landscape_references(
+                            core_analysis=_core_analysis,
                             title=metadata.title,
                             idea_hypothesis=metadata.idea_hypothesis,
-                            method=metadata.method,
-                            data=metadata.data,
-                            experiments=metadata.experiments,
-                            existing_ref_keys=list(ref_pool.valid_citation_keys),
                             paper_search_config=search_cfg,
                         )
-                        for paper in seed_discovered_references:
+                        for paper in landscape_papers:
                             ref_pool.add_discovered(
-                                paper.get("ref_id", ""), paper.get("bibtex", ""),
-                                source="planner_seed_discovery",
+                                paper.get("ref_id", ""),
+                                paper.get("bibtex", ""),
+                                source="landscape_discovery",
                             )
-                        preplan_context_pool: List[Dict[str, Any]] = []
-                        preplan_context_pool.extend(core_refs_for_context)
-                        preplan_context_pool.extend(seed_discovered_references)
-                        if preplan_context_pool:
-                            seed_plan = PaperPlan(title=metadata.title, sections=[])
-                            research_context_v1 = await self._planner._generate_research_context(
-                                plan=seed_plan, discovered={"global": preplan_context_pool},
-                            )
-                            research_context = research_context_v1
                     except Exception as e:
-                        print(f"[MetaDataAgent] Warning: Failed to build research context v1: {e}")
+                        print(f"[MetaDataAgent] Warning: Landscape discovery failed: {e}")
+
+                    try:
+                        _builder = ResearchContextBuilder(self.client, self.model_name)
+                        _landscape_top_k = 24
+                        if rc_cfg is not None and getattr(rc_cfg, "top_k_key_papers", None):
+                            _landscape_top_k = max(8, int(rc_cfg.top_k_key_papers))
+
+                        async def _score_landscape(topic: str, papers: List[Dict[str, Any]]):
+                            return await self._planner._score_papers_by_relevance(topic, papers)
+
+                        _rc_model = await _builder.build(
+                            core_analysis=_core_analysis,
+                            landscape_papers=landscape_papers,
+                            paper_metadata=metadata,
+                            score_papers_fn=_score_landscape if landscape_papers else None,
+                            top_k_landscape=_landscape_top_k,
+                        )
+                        research_context = _rc_model.to_research_context_dict()
+                    except Exception as e:
+                        print(f"[MetaDataAgent] Warning: Research context build failed: {e}")
 
                 paper_plan = await self._orchestrator._create_paper_plan(
                     metadata=metadata, target_pages=target_pages,
-                    style_guide=metadata.style_guide, research_context=research_context_v1,
+                    style_guide=metadata.style_guide, research_context=research_context,
                     code_context=code_context,
                 )
                 if paper_plan:
@@ -1416,24 +1432,36 @@ class MetaDataAgent(ReActAgent):
                     if disc_count:
                         print(f"[MetaDataAgent] Discovered {disc_count} new references")
 
-                    # Phase 0d: Generate research context (if enabled) - MOVED BEFORE Phase 0c
-                    research_context_v2 = None
-                    if rc_enabled and discovered:
-                        try:
-                            merged_discovered: Dict[str, List[Dict[str, Any]]] = dict(discovered)
-                            if seed_discovered_references:
-                                merged_discovered["global"] = seed_discovered_references
-                            if core_refs_for_context:
-                                merged_discovered["global_core"] = core_refs_for_context
-                            research_context_v2 = await self._planner._generate_research_context(
-                                plan=paper_plan, discovered=merged_discovered,
-                            )
-                            if research_context_v2:
-                                research_context = research_context_v2
-                        except Exception as e:
-                            print(f"[MetaDataAgent] Warning: Failed to generate research context: {e}")
+                    # Phase 0b-utility: dataset / metric / framework papers mentioned in plan text
+                    try:
+                        utility_refs = await self._planner.discover_utility_references(
+                            plan=paper_plan,
+                            existing_ref_keys=list(ref_pool.valid_citation_keys),
+                            paper_search_config=search_cfg,
+                        )
+                        util_added = 0
+                        for sec_type, papers in utility_refs.items():
+                            for paper in papers:
+                                if ref_pool.add_discovered(
+                                    paper.get("ref_id", ""),
+                                    paper.get("bibtex", ""),
+                                    source="utility_discovery",
+                                ):
+                                    discovered.setdefault(sec_type, []).append(paper)
+                                    util_added += 1
+                        if util_added:
+                            print(f"[MetaDataAgent] Utility discovery added {util_added} reference(s)")
+                    except Exception as e:
+                        print(f"[MetaDataAgent] Warning: Utility reference discovery failed: {e}")
 
-                    # Phase 0c: Assign references to sections - NOW USES research_context_v2
+                    # Merge section-level paper assignments into pre-plan research context
+                    if rc_enabled and research_context is not None:
+                        research_context = dict(research_context)
+                        research_context["paper_assignments"] = (
+                            self._planner._assign_papers_to_sections(paper_plan, discovered)
+                        )
+
+                    # Phase 0c: Assign references to sections
                     print("[MetaDataAgent] Phase 0c: Assigning references to sections...")
                     self._planner.assign_references(
                         plan=paper_plan,
@@ -1441,7 +1469,7 @@ class MetaDataAgent(ReActAgent):
                         core_ref_keys=list(ref_pool.valid_citation_keys
                                            - {p["ref_id"] for papers in discovered.values() for p in papers}),
                         paper_search_config=search_cfg,
-                        research_context=research_context_v2,  # NOW PASSES research_context_v2
+                        research_context=research_context,
                     )
                     for sp in paper_plan.sections:
                         if sp.assigned_refs:
