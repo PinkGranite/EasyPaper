@@ -32,6 +32,51 @@ _ROLE_TO_CLAIM_TYPE: Dict[str, ClaimNodeType] = {
     "result": ClaimNodeType.RESULT_CLAIM,
 }
 
+# Canvas node type → DAG role mapping
+# "claim": produces a ClaimNode; "evidence": produces an EvidenceNode;
+# "mixed": produces both; "skip": ignored.
+_CANVAS_NODE_ROLE: Dict[str, str] = {
+    "hypothesis": "claim",
+    "idea": "claim",
+    "question": "claim",
+    "result": "evidence",
+    "finding": "evidence",
+    "figure": "evidence",
+    "table": "evidence",
+    "data": "evidence",
+    "metric": "evidence",
+    "literature": "evidence",
+    "method": "mixed",
+    "experiment": "mixed",
+}
+
+_CANVAS_TO_CLAIM_TYPE: Dict[str, ClaimNodeType] = {
+    "hypothesis": ClaimNodeType.HYPOTHESIS,
+    "idea": ClaimNodeType.HYPOTHESIS,
+    "question": ClaimNodeType.CONTEXT,
+    "method": ClaimNodeType.METHOD_CLAIM,
+    "experiment": ClaimNodeType.METHOD_CLAIM,
+}
+
+_CANVAS_TO_EVIDENCE_TYPE: Dict[str, EvidenceNodeType] = {
+    "result": EvidenceNodeType.METRIC,
+    "finding": EvidenceNodeType.METRIC,
+    "figure": EvidenceNodeType.FIGURE,
+    "table": EvidenceNodeType.TABLE,
+    "data": EvidenceNodeType.CODE,
+    "metric": EvidenceNodeType.METRIC,
+    "literature": EvidenceNodeType.LITERATURE,
+    "method": EvidenceNodeType.CODE,
+    "experiment": EvidenceNodeType.CODE,
+}
+
+# Evidence types eligible for deduplication against existing DAG nodes
+_DEDUP_EVIDENCE_TYPES = {
+    EvidenceNodeType.LITERATURE,
+    EvidenceNodeType.FIGURE,
+    EvidenceNodeType.TABLE,
+}
+
 # Section-type to relevant dominant_role mapping for edge heuristics
 _SECTION_ROLE_AFFINITY: Dict[str, List[str]] = {
     "introduction": ["method", "experiment", "result"],
@@ -99,8 +144,9 @@ class DAGBuilder:
         self._ingest_code_evidence(code_context, dag)
         self._ingest_literature_evidence(research_context, dag)
         self._ingest_visual_evidence(figures or [], tables or [], dag)
-        self._ingest_canvas_graph_evidence(graph_structure, dag)
         self._extract_claims(paper_plan, metadata, dag)
+        self._translate_canvas_nodes(graph_structure, dag)
+        self._translate_canvas_edges(graph_structure, dag)
         self._build_edges(dag)
 
         # Optional: Use LLM-based matching to add semantic edges
@@ -298,63 +344,132 @@ class DAGBuilder:
                 metadata={"caption": caption, "section": section},
             ))
 
-    def _ingest_canvas_graph_evidence(
+    def _translate_canvas_nodes(
         self,
         graph_structure: Optional[Any],
         dag: EvidenceDAG,
     ) -> None:
         """
-        Convert user's canvas graph nodes/edges into DAG evidence nodes and reasoning edges.
+        Translate canvas graph nodes into semantically correct DAG entities.
 
-        Canvas nodes represent the user's explicit reasoning flow (hypothesis -> method -> result).
-        These are added as evidence nodes with high confidence since they represent user input.
+        - **Description**:
+            - Each canvas node type maps to a DAG role (claim / evidence / mixed / skip)
+              via _CANVAS_NODE_ROLE.
+            - "claim" nodes become ClaimNode only.
+            - "evidence" nodes become EvidenceNode only.
+            - "mixed" nodes (method, experiment) produce both.
+            - Nodes of dedup-eligible types (literature, figure, table) are checked
+              against existing DAG evidence nodes by source_path to avoid duplicates.
+
+        - **Args**:
+            - `graph_structure` (Optional): CanvasGraphStructure with nodes and edges.
+            - `dag` (EvidenceDAG): Target DAG to populate.
         """
         if not graph_structure:
             return
 
-        # Import here to avoid circular imports at module level
-        from src.models.evidence_graph import EvidenceNodeType, EdgeType
-
         nodes = getattr(graph_structure, "nodes", []) or []
-        edges = getattr(graph_structure, "edges", []) or []
-
         if not nodes:
             return
 
-        node_id_map = {}  # canvas_node_id -> dag_node_id
+        existing_paths: Dict[EvidenceNodeType, set] = {}
+        for ev in dag.evidence_nodes.values():
+            existing_paths.setdefault(ev.node_type, set()).add(ev.source_path)
 
-        # Add canvas nodes as evidence nodes
         for cn in nodes:
             node_id = getattr(cn, "node_id", "") or ""
-            node_type = getattr(cn, "node_type", "") or ""
+            node_type = (getattr(cn, "node_type", "") or "").lower()
             content = getattr(cn, "content", "") or ""
             label = getattr(cn, "label", "") or ""
 
-            ev_node = EvidenceNode(
-                node_id=f"CANVAS_{node_id}",
-                node_type=EvidenceNodeType.CANVAS,
-                content=content,
-                source_path=node_id,
-                confidence=1.0,  # User-provided content has highest confidence
-                metadata={"canvas_node_type": node_type, "label": label},
-            )
-            dag.add_evidence(ev_node)
-            node_id_map[node_id] = ev_node.node_id
+            if not content.strip():
+                continue
 
-        # Add reasoning edges between canvas-derived evidence nodes
+            role = _CANVAS_NODE_ROLE.get(node_type)
+            if role is None:
+                continue
+
+            meta = {
+                "canvas_node_type": node_type,
+                "label": label,
+                "source": "canvas",
+            }
+
+            if role in ("claim", "mixed"):
+                claim_type = _CANVAS_TO_CLAIM_TYPE.get(node_type, ClaimNodeType.CONTEXT)
+                dag.add_claim(ClaimNode(
+                    node_id=f"CANVAS_CLM_{node_id}",
+                    node_type=claim_type,
+                    statement=content,
+                    section_scope=[],
+                    metadata=dict(meta),
+                ))
+
+            if role in ("evidence", "mixed"):
+                ev_type = _CANVAS_TO_EVIDENCE_TYPE.get(node_type, EvidenceNodeType.CODE)
+                source_path = label if ev_type == EvidenceNodeType.LITERATURE else node_id
+
+                if ev_type in _DEDUP_EVIDENCE_TYPES:
+                    type_paths = existing_paths.get(ev_type, set())
+                    if source_path in type_paths:
+                        logger.debug(
+                            "Canvas node %s deduped against existing %s node",
+                            node_id, ev_type.value,
+                        )
+                        continue
+
+                dag.add_evidence(EvidenceNode(
+                    node_id=f"CANVAS_EV_{node_id}",
+                    node_type=ev_type,
+                    content=content,
+                    source_path=source_path,
+                    confidence=1.0,
+                    metadata=dict(meta),
+                ))
+                existing_paths.setdefault(ev_type, set()).add(source_path)
+
+    def _translate_canvas_edges(
+        self,
+        graph_structure: Optional[Any],
+        dag: EvidenceDAG,
+    ) -> None:
+        """
+        Translate canvas edges into SUPPORTS candidate edges.
+
+        - **Description**:
+            - Only edges where the source resolves to an evidence node and the target
+              resolves to a claim node produce a SUPPORTS edge.
+            - All other combinations (claim→claim, evidence→evidence, involving skipped
+              nodes) are dropped.
+            - Canvas edges carry high weight (0.9) reflecting user intent but
+              is_bound is always False — bipartite matching decides binding.
+
+        - **Args**:
+            - `graph_structure` (Optional): CanvasGraphStructure with edges.
+            - `dag` (EvidenceDAG): Target DAG (must already have translated nodes).
+        """
+        if not graph_structure:
+            return
+
+        edges = getattr(graph_structure, "edges", []) or []
+        if not edges:
+            return
+
         for edge in edges:
-            src = getattr(edge, "source_id", "") or ""
-            tgt = getattr(edge, "target_id", "") or ""
-            edge_type = getattr(edge, "edge_type", "reasoning") or "reasoning"
+            src_canvas = getattr(edge, "source_id", "") or ""
+            tgt_canvas = getattr(edge, "target_id", "") or ""
 
-            if src in node_id_map and tgt in node_id_map:
+            src_ev_id = f"CANVAS_EV_{src_canvas}"
+            tgt_clm_id = f"CANVAS_CLM_{tgt_canvas}"
+
+            if src_ev_id in dag.evidence_nodes and tgt_clm_id in dag.claim_nodes:
                 dag.add_edge(DAGEdge(
-                    source_id=node_id_map[src],
-                    target_id=node_id_map[tgt],
-                    edge_type=EdgeType.REASONING,
-                    weight=0.9,  # High weight - user explicitly connected these
-                    reason=f"User reasoning: {edge_type}",
-                    is_bound=True,  # Explicit user binding
+                    source_id=src_ev_id,
+                    target_id=tgt_clm_id,
+                    edge_type=EdgeType.SUPPORTS,
+                    weight=0.9,
+                    reason=f"Canvas user connection: {src_canvas} -> {tgt_canvas}",
+                    is_bound=False,
                 ))
 
     # ------------------------------------------------------------------
