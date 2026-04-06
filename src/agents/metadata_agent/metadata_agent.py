@@ -1170,6 +1170,7 @@ class MetaDataAgent(ReActAgent):
         template_path: Optional[str] = None,
         target_pages: Optional[int] = None,
         enable_planning: bool = True,
+        enable_exemplar: bool = False,
         save_output: bool = True,
         output_dir: Optional[str] = None,
         progress_callback: Optional[ProgressCallback] = None,
@@ -1335,6 +1336,75 @@ class MetaDataAgent(ReActAgent):
                 except Exception as e:
                     print(f"[MetaDataAgent] Warning: Docling enrichment failed: {e}")
                     errors.append(f"Docling enrichment failed: {e}")
+
+            # Phase 0-exemplar: Exemplar paper selection and analysis (optional)
+            exemplar_analysis_dict: Optional[Dict[str, Any]] = None
+            exemplar_cfg = (
+                self.tools_config.exemplar
+                if self.tools_config and getattr(self.tools_config, "exemplar", None)
+                else None
+            )
+            if enable_exemplar and exemplar_cfg and exemplar_cfg.enabled:
+                print("[MetaDataAgent] Phase 0-exemplar: Selecting and analyzing exemplar paper...")
+                try:
+                    from ..shared.exemplar_selector import ExemplarSelector
+                    from ..shared.exemplar_analyzer import ExemplarAnalyzer
+                    from ..shared.docling_analyzer import DoclingPaperAnalyzer
+
+                    if metadata.exemplar_paper_path:
+                        analyzer_inst = DoclingPaperAnalyzer(
+                            config=docling_cfg if docling_cfg else None,
+                        )
+                        parsed = analyzer_inst.parse(Path(metadata.exemplar_paper_path))
+                        exemplar_analyzer = ExemplarAnalyzer(
+                            self.client, self.model_name,
+                            max_chars=exemplar_cfg.max_analysis_chars,
+                        )
+                        ref_info = {
+                            "ref_id": "user_exemplar",
+                            "title": metadata.title + " (user-provided exemplar)",
+                            "venue": metadata.style_guide or "",
+                            "year": 0,
+                        }
+                        ea = await exemplar_analyzer.analyze(
+                            full_text=parsed.full_text,
+                            sections=parsed.sections,
+                            metadata=metadata,
+                            ref_info=ref_info,
+                        )
+                        exemplar_analysis_dict = ea.model_dump(mode="json")
+                        print(f"[MetaDataAgent] Exemplar analysis from user-provided PDF: {len(ea.section_blueprint)} sections")
+                    else:
+                        selector = ExemplarSelector(self.client, self.model_name)
+                        selected = await selector.select(
+                            core_refs=list(ref_pool.core_refs),
+                            metadata=metadata,
+                            config=exemplar_cfg,
+                            paper_search_config=search_cfg_for_pool,
+                        )
+                        if selected:
+                            exemplar_analyzer = ExemplarAnalyzer(
+                                self.client, self.model_name,
+                                max_chars=exemplar_cfg.max_analysis_chars,
+                            )
+                            ea = await exemplar_analyzer.analyze(
+                                full_text=selected.get("docling_full_text", ""),
+                                sections=selected.get("docling_sections", {}),
+                                metadata=metadata,
+                                ref_info={
+                                    "ref_id": selected.get("ref_id", ""),
+                                    "title": selected.get("title", ""),
+                                    "venue": selected.get("venue", ""),
+                                    "year": selected.get("year", 0),
+                                },
+                            )
+                            exemplar_analysis_dict = ea.model_dump(mode="json")
+                            print(f"[MetaDataAgent] Exemplar selected: {selected.get('ref_id', '')} ({len(ea.section_blueprint)} sections)")
+                        else:
+                            print("[MetaDataAgent] No suitable exemplar found among core refs")
+                except Exception as e:
+                    print(f"[MetaDataAgent] Warning: Exemplar analysis failed: {e}")
+                    errors.append(f"Exemplar analysis failed: {e}")
 
             # Phase 0: Planning
             if enable_planning:
@@ -1621,6 +1691,7 @@ class MetaDataAgent(ReActAgent):
                 errors=errors,
                 template_path=template_path,
                 target_pages=target_pages,
+                exemplar_analysis=exemplar_analysis_dict,
                 artifacts_prefix=artifacts_prefix,
                 paper_dir=paper_dir_str,
             )
