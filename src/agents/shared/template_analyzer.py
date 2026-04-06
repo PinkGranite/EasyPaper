@@ -96,3 +96,111 @@ class TemplateWriterGuide(BaseModel):
         )
 
         return "\n".join(parts)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Preamble parser — precise extraction layer
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class PreambleParser:
+    """Static utilities for extracting structured info from LaTeX preambles."""
+
+    @staticmethod
+    def extract_preamble(full_tex: str) -> str:
+        """
+        Extract the preamble (everything before \\begin{document}).
+        - **Args**:
+            - `full_tex` (str): Full LaTeX source.
+        - **Returns**:
+            - `str`: Preamble text, or full text if no \\begin{document}.
+        """
+        match = re.search(r"\\begin\{document\}", full_tex)
+        if match:
+            return full_tex[: match.start()]
+        return full_tex
+
+    @staticmethod
+    def extract_packages(preamble: str) -> List[str]:
+        """
+        Extract all package names from \\usepackage commands.
+        - **Description**:
+            - Handles \\usepackage[options]{pkg} and \\usepackage{p1,p2,p3}.
+        - **Returns**:
+            - `List[str]`: Deduplicated list of package names.
+        """
+        packages: list[str] = []
+        for match in re.finditer(
+            r"\\usepackage(?:\[[^\]]*\])?\{([^}]+)\}", preamble
+        ):
+            raw = match.group(1)
+            for pkg in raw.split(","):
+                pkg = pkg.strip()
+                if pkg:
+                    packages.append(pkg)
+        return list(dict.fromkeys(packages))
+
+    @staticmethod
+    def extract_document_class(preamble: str) -> Tuple[str, List[str]]:
+        """
+        Extract document class name and options.
+        - **Returns**:
+            - Tuple of (class_name, [options])
+        """
+        match = re.search(
+            r"\\documentclass(?:\[([^\]]*)\])?\{([^}]+)\}", preamble
+        )
+        if not match:
+            return "article", []
+        options_str = match.group(1) or ""
+        doc_class = match.group(2).strip()
+        options = [o.strip() for o in options_str.split(",") if o.strip()]
+        return doc_class, options
+
+    @staticmethod
+    def detect_column_format(preamble: str) -> str:
+        """
+        Detect column format from document class options or twocolumn command.
+        - **Returns**:
+            - `str`: "single" or "double"
+        """
+        _, options = PreambleParser.extract_document_class(preamble)
+        if "twocolumn" in options:
+            return "double"
+        if re.search(r"\\twocolumn", preamble):
+            return "double"
+        return "single"
+
+    @staticmethod
+    def extract_custom_environments(preamble: str) -> List[str]:
+        """Extract user-defined environments (\\newtheorem, \\newenvironment)."""
+        envs: list[str] = []
+        for match in re.finditer(r"\\newtheorem\{(\w+)\}", preamble):
+            envs.append(match.group(1))
+        for match in re.finditer(r"\\newenvironment\{(\w+)\}", preamble):
+            envs.append(match.group(1))
+        return list(dict.fromkeys(envs))
+
+    @staticmethod
+    def extract_custom_commands(preamble: str) -> List[str]:
+        """Extract user-defined commands (\\newcommand, \\renewcommand)."""
+        cmds: list[str] = []
+        for match in re.finditer(
+            r"\\(?:re)?newcommand\{?(\\[a-zA-Z]+)\}?", preamble
+        ):
+            cmds.append(match.group(1))
+        return list(dict.fromkeys(cmds))
+
+    @staticmethod
+    def detect_citation_style(preamble: str) -> str:
+        """
+        Detect citation style from loaded packages.
+        - **Returns**:
+            - `str`: "citep" (natbib), "autocite" (biblatex), or "cite"
+        """
+        packages = PreambleParser.extract_packages(preamble)
+        if "natbib" in packages:
+            return "citep"
+        if "biblatex" in packages:
+            return "autocite"
+        return "cite"
