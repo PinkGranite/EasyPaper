@@ -15,6 +15,7 @@ from ...prompts import PromptLoader as _PromptLoader
 
 if TYPE_CHECKING:
     from ...skills.models import WritingSkill
+    from .template_analyzer import TemplateWriterGuide
 
 _prompt_loader = _PromptLoader()
 
@@ -685,6 +686,7 @@ def compile_introduction_prompt(
     code_context: Optional[str] = None,
     research_context: Optional[str] = None,
     enable_structure_contract: bool = True,
+    template_guide: Optional["TemplateWriterGuide"] = None,
 ) -> str:
     """
     Compile prompt for Introduction generation (Phase 1 - Leader section).
@@ -872,6 +874,11 @@ At the end, clearly state the contributions using:
 This helps maintain consistency across the paper.
 """
 
+    if template_guide:
+        guide_block = template_guide.format_for_prompt()
+        if guide_block:
+            prompt += f"\n\n{guide_block}"
+
     return prompt
 
 
@@ -891,6 +898,7 @@ def compile_body_section_prompt(
     code_context: Optional[str] = None,
     research_context: Optional[str] = None,
     enable_structure_contract: bool = True,
+    template_guide: Optional["TemplateWriterGuide"] = None,
 ) -> str:
     """
     Compile prompt for Body section generation (Phase 2).
@@ -1099,6 +1107,11 @@ def compile_body_section_prompt(
 - Never use a subsection title identical to the parent section title.
 """
 
+    if template_guide:
+        guide_block = template_guide.format_for_prompt()
+        if guide_block:
+            prompt += f"\n\n{guide_block}"
+
     return prompt
 
 
@@ -1112,6 +1125,7 @@ def compile_synthesis_prompt(
     section_plan: Any = None,
     active_skills: Optional[List["WritingSkill"]] = None,
     memory_context: Optional[str] = None,
+    template_guide: Optional["TemplateWriterGuide"] = None,
 ) -> str:
     """
     Compile prompt for Synthesis sections (Abstract/Conclusion - Phase 3).
@@ -1249,6 +1263,11 @@ Key contributions: {key_contributions}
     if style_guide:
         prompt += f"\n- Style guide: {style_guide}"
 
+    if template_guide:
+        guide_block = template_guide.format_for_prompt()
+        if guide_block:
+            prompt += f"\n\n{guide_block}"
+
     return prompt
 
 
@@ -1297,6 +1316,7 @@ def compile_paragraph_prompt(
     section_title: str = "",
     paragraph_index: int = 0,
     total_paragraphs: int = 1,
+    template_guide: Optional["TemplateWriterGuide"] = None,
 ) -> str:
     """
     Compile a focused prompt for generating a single paragraph.
@@ -1390,6 +1410,11 @@ def compile_paragraph_prompt(
         "- Every factual claim must be supported by a \\cite{{}} to a valid key.\n"
         "- Do NOT invent citation keys; only use the valid keys listed above."
     )
+
+    if template_guide:
+        guide_block = template_guide.format_for_prompt()
+        if guide_block:
+            prompt_parts.append(f"\n{guide_block}")
 
     return "\n".join(prompt_parts)
 

@@ -66,6 +66,7 @@ from ..shared.prompt_compiler import (
     extract_contributions_from_intro,
     SECTION_PROMPTS,
 )
+from ..shared.template_analyzer import TemplateAnalyzer, TemplateWriterGuide
 from ..writer_agent.section_models import (
     ReferenceInfo,
     SimpleSectionInput,
@@ -1655,6 +1656,18 @@ class MetaDataAgent(ReActAgent):
         code_summary_markdown = plan_result.code_summary_markdown
         errors = list(plan_result.errors)
 
+        # Analyze template for Writer constraints
+        template_guide: Optional[TemplateWriterGuide] = None
+        if template_path:
+            template_guide = TemplateAnalyzer.analyze_zip(template_path)
+            if template_guide.available_packages:
+                print(
+                    f"[MetaDataAgent] Template analyzed: "
+                    f"{len(template_guide.available_packages)} packages, "
+                    f"column={template_guide.column_format}, "
+                    f"citation={template_guide.citation_style}"
+                )
+
         paper_plan: Optional[PaperPlan] = None
         if plan_result.paper_plan:
             paper_plan = PaperPlan(**plan_result.paper_plan)
@@ -2097,6 +2110,7 @@ class MetaDataAgent(ReActAgent):
                     self.tools_config is None
                     or getattr(self.tools_config, "writer_structure_contract_enabled", True)
                 ),
+                template_guide=template_guide,
             )
             if prompt_traces is not None:
                 prompt_traces.append(
@@ -2270,6 +2284,7 @@ class MetaDataAgent(ReActAgent):
                     self.tools_config is None
                     or getattr(self.tools_config, "writer_structure_contract_enabled", True)
                 ),
+                template_guide=template_guide,
             )
             if prompt_traces is not None:
                 prompt_traces.append(
@@ -2453,6 +2468,7 @@ class MetaDataAgent(ReActAgent):
                     section_title=section_title_str,
                     paragraph_index=pidx,
                     total_paragraphs=total_paras,
+                    template_guide=template_guide,
                 )
 
                 para_result = await self._writer.generate_paragraph(
@@ -2581,6 +2597,7 @@ class MetaDataAgent(ReActAgent):
                 section_plan=section_plan,
                 active_skills=self._get_active_skills(section_type, style_guide),
                 memory_context=memory_context,
+                template_guide=template_guide,
             )
             if prompt_traces is not None:
                 prompt_traces.append(
