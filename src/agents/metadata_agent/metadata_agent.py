@@ -1720,6 +1720,7 @@ class MetaDataAgent(ReActAgent):
 
             if intro_result.status == "ok":
                 generated_sections["introduction"] = intro_result.latex_content
+                memory.update_section("introduction", intro_result.latex_content)
                 memory.log("metadata", "phase1", "introduction_generated",
                            narrative=f"Writer completed the introduction section ({intro_result.word_count} words).",
                            word_count=intro_result.word_count)
@@ -1775,6 +1776,7 @@ class MetaDataAgent(ReActAgent):
                 sections_results.append(result)
                 if result.status == "ok":
                     generated_sections[section_type] = result.latex_content
+                    memory.update_section(section_type, result.latex_content)
                     memory.log("metadata", "phase2", f"{section_type}_generated",
                                narrative=f"Writer completed the {section_type} section ({result.word_count} words).",
                                word_count=result.word_count)
@@ -1807,6 +1809,7 @@ class MetaDataAgent(ReActAgent):
             sections_results.insert(0, abstract_result)
             if abstract_result.status == "ok":
                 generated_sections["abstract"] = abstract_result.latex_content
+                memory.update_section("abstract", abstract_result.latex_content)
                 await emitter.section_content(
                     section_type="abstract", content=abstract_result.latex_content,
                     word_count=abstract_result.word_count, phase=Phase.SYNTHESIS,
@@ -1826,6 +1829,7 @@ class MetaDataAgent(ReActAgent):
                 sections_results.append(conclusion_result)
                 if conclusion_result.status == "ok":
                     generated_sections["conclusion"] = conclusion_result.latex_content
+                    memory.update_section("conclusion", conclusion_result.latex_content)
                     await emitter.section_content(
                         section_type="conclusion", content=conclusion_result.latex_content,
                         word_count=conclusion_result.word_count, phase=Phase.SYNTHESIS,

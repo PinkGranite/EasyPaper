@@ -47,7 +47,8 @@ results/
 outputs/
 
 # Other
-test*
+test_output*/
+test_results/
 __*
 .cursor/
 docs/
