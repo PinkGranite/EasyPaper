@@ -67,6 +67,7 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
                 enable_review=request.enable_review,
                 max_review_iterations=request.max_review_iterations,
                 enable_planning=request.enable_planning,
+                enable_exemplar=request.enable_exemplar,
                 enable_vlm_review=request.enable_vlm_review,
             )
             return result
@@ -112,6 +113,7 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
                     enable_review=request.enable_review,
                     max_review_iterations=request.max_review_iterations,
                     enable_planning=request.enable_planning,
+                    enable_exemplar=request.enable_exemplar,
                     enable_vlm_review=request.enable_vlm_review,
                     enable_user_feedback=request.enable_user_feedback,
                     progress_callback=progress_callback,
@@ -180,6 +182,7 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
                 template_path=request.template_path,
                 target_pages=request.target_pages,
                 enable_planning=request.enable_planning,
+                enable_exemplar=request.enable_exemplar,
                 save_output=request.save_output,
                 output_dir=request.output_dir,
                 artifacts_prefix=request.artifacts_prefix or "",
@@ -501,5 +504,99 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
                 "compile_pdf": True,
             },
         }
+
+    # ------------------------------------------------------------------
+    # Docling — standalone PDF parsing endpoints
+    # ------------------------------------------------------------------
+
+    @router.post("/docling/parse")
+    async def docling_parse(pdf_path: str):
+        """
+        Parse a local PDF file into structured academic sections.
+        - **Args**:
+            - `pdf_path` (str): Absolute path to a PDF on the server.
+        - **Returns**:
+            - ``DoclingPaperResult`` as JSON.
+        """
+        from pathlib import Path as _Path
+        from ..shared.docling_service import DoclingService
+
+        p = _Path(pdf_path)
+        if not p.exists():
+            raise HTTPException(status_code=404, detail=f"PDF not found: {pdf_path}")
+
+        docling_cfg = None
+        if agent.tools_config and getattr(agent.tools_config, "docling", None):
+            docling_cfg = agent.tools_config.docling
+
+        svc = DoclingService(config=docling_cfg)
+        try:
+            result = svc.parse_pdf(p)
+        except ImportError as exc:
+            raise HTTPException(status_code=501, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Parse failed: {exc}")
+
+        return DoclingService.result_to_dict(result)
+
+    @router.post("/docling/download-and-parse")
+    async def docling_download_and_parse(
+        url: str,
+        dest_dir: Optional[str] = None,
+    ):
+        """
+        Download a PDF from URL and parse it into structured sections.
+        - **Args**:
+            - `url` (str): Direct PDF URL (e.g. arXiv PDF link).
+            - `dest_dir` (str, optional): Save PDF to this directory.
+        - **Returns**:
+            - ``DoclingPaperResult`` as JSON.
+        """
+        from ..shared.docling_service import DoclingService
+
+        docling_cfg = None
+        if agent.tools_config and getattr(agent.tools_config, "docling", None):
+            docling_cfg = agent.tools_config.docling
+
+        svc = DoclingService(config=docling_cfg)
+        try:
+            result = await svc.download_and_parse(
+                url, dest_dir=dest_dir, cleanup=(dest_dir is None),
+            )
+        except ImportError as exc:
+            raise HTTPException(status_code=501, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Download/parse failed: {exc}")
+
+        if not result.full_text:
+            raise HTTPException(status_code=422, detail="PDF downloaded but parsing yielded no content")
+
+        return DoclingService.result_to_dict(result)
+
+    @router.post("/docling/enrich-refs")
+    async def docling_enrich_refs(refs: list):
+        """
+        Batch-enrich reference dicts with Docling full-text analysis.
+        - **Args**:
+            - `refs` (list): Reference dicts with optional
+              ``open_access_pdf`` / ``arxiv_id`` fields.
+        - **Returns**:
+            - Enriched refs list with ``docling_sections`` and ``docling_full_text``.
+        """
+        from ..shared.docling_service import DoclingService
+
+        docling_cfg = None
+        if agent.tools_config and getattr(agent.tools_config, "docling", None):
+            docling_cfg = agent.tools_config.docling
+
+        svc = DoclingService(config=docling_cfg)
+        try:
+            enriched = await svc.enrich_refs(refs)
+        except ImportError as exc:
+            raise HTTPException(status_code=501, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Enrichment failed: {exc}")
+
+        return enriched
 
     return router

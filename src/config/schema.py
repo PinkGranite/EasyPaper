@@ -82,6 +82,24 @@ class DoclingConfig(BaseModel):
     move_to_output: bool = False
 
 
+class ExemplarConfig(BaseModel):
+    """
+    Configuration for exemplar (benchmark) paper analysis.
+    - **Description**:
+        - When enabled, selects a published paper matching the target venue
+          and decomposes its writing patterns to guide generation.
+        - Prefers selecting from user-provided core references first;
+          falls back to external search when no core ref qualifies.
+        - Disabled by default; zero impact on users who do not need it.
+    """
+    enabled: bool = False
+    prefer_core_refs: bool = True
+    max_external_candidates: int = 10
+    max_analysis_chars: int = 8000
+    venue_match_required: bool = True
+    recency_years: int = 5
+
+
 class ToolsConfig(BaseModel):
     """Configuration for ReAct tool usage."""
     enabled: bool = True
@@ -102,6 +120,7 @@ class ToolsConfig(BaseModel):
     research_context: Optional[ResearchContextConfig] = None
     core_ref_analysis: Optional[CoreRefAnalysisConfig] = None
     docling: Optional[DoclingConfig] = None
+    exemplar: Optional[ExemplarConfig] = None
 
 
 class MetadataConfig(BaseModel):

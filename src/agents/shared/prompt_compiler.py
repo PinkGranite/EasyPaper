@@ -30,6 +30,7 @@ PROMPT_BUDGETS: Dict[str, int] = {
     "refs_list_limit": 16,
     "evidence_keys_limit": 10,
     "table_latex_chars": 2200,
+    "exemplar_guidance_chars": 2500,
 }
 
 
@@ -687,6 +688,7 @@ def compile_introduction_prompt(
     research_context: Optional[str] = None,
     enable_structure_contract: bool = True,
     template_guide: Optional["TemplateWriterGuide"] = None,
+    exemplar_guidance: Optional[str] = None,
 ) -> str:
     """
     Compile prompt for Introduction generation (Phase 1 - Leader section).
@@ -879,6 +881,9 @@ This helps maintain consistency across the paper.
         if guide_block:
             prompt += f"\n\n{guide_block}"
 
+    if exemplar_guidance:
+        prompt += f"\n\n{_truncate_text(exemplar_guidance, PROMPT_BUDGETS['exemplar_guidance_chars'])}"
+
     return prompt
 
 
@@ -899,6 +904,7 @@ def compile_body_section_prompt(
     research_context: Optional[str] = None,
     enable_structure_contract: bool = True,
     template_guide: Optional["TemplateWriterGuide"] = None,
+    exemplar_guidance: Optional[str] = None,
 ) -> str:
     """
     Compile prompt for Body section generation (Phase 2).
@@ -1112,6 +1118,9 @@ def compile_body_section_prompt(
         if guide_block:
             prompt += f"\n\n{guide_block}"
 
+    if exemplar_guidance:
+        prompt += f"\n\n{_truncate_text(exemplar_guidance, PROMPT_BUDGETS['exemplar_guidance_chars'])}"
+
     return prompt
 
 
@@ -1126,6 +1135,7 @@ def compile_synthesis_prompt(
     active_skills: Optional[List["WritingSkill"]] = None,
     memory_context: Optional[str] = None,
     template_guide: Optional["TemplateWriterGuide"] = None,
+    exemplar_guidance: Optional[str] = None,
 ) -> str:
     """
     Compile prompt for Synthesis sections (Abstract/Conclusion - Phase 3).
@@ -1268,6 +1278,9 @@ Key contributions: {key_contributions}
         if guide_block:
             prompt += f"\n\n{guide_block}"
 
+    if exemplar_guidance:
+        prompt += f"\n\n{_truncate_text(exemplar_guidance, PROMPT_BUDGETS['exemplar_guidance_chars'])}"
+
     return prompt
 
 
@@ -1317,6 +1330,7 @@ def compile_paragraph_prompt(
     paragraph_index: int = 0,
     total_paragraphs: int = 1,
     template_guide: Optional["TemplateWriterGuide"] = None,
+    exemplar_guidance: Optional[str] = None,
 ) -> str:
     """
     Compile a focused prompt for generating a single paragraph.
@@ -1415,6 +1429,9 @@ def compile_paragraph_prompt(
         guide_block = template_guide.format_for_prompt()
         if guide_block:
             prompt_parts.append(f"\n{guide_block}")
+
+    if exemplar_guidance:
+        prompt_parts.append(f"\n{_truncate_text(exemplar_guidance, PROMPT_BUDGETS['exemplar_guidance_chars'])}")
 
     return "\n".join(prompt_parts)
 

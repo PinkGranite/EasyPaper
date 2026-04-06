@@ -188,6 +188,9 @@ class PaperMetaData(BaseModel):
     # Canvas graph structure for DAG construction (optional)
     graph_structure: Optional[Any] = None  # CanvasGraphStructure from commander
 
+    # Exemplar paper (optional, user-provided path to PDF)
+    exemplar_paper_path: Optional[str] = None
+
     def to_document_input(self) -> "DocumentInput":
         """
         Convert paper-specific metadata to the generic DocumentInput interface.
@@ -281,7 +284,10 @@ class PaperGenerationRequest(BaseModel):
     
     # VLM Review options
     enable_vlm_review: bool = False          # Enable VLM-based PDF review (page overflow detection)
-    
+
+    # Exemplar paper options
+    enable_exemplar: bool = False            # Enable exemplar (benchmark) paper strategy
+
     # User feedback options
     enable_user_feedback: bool = False       # Pause at review for user feedback (checkpoint-resume)
     
@@ -476,8 +482,64 @@ class PlanResult(BaseModel):
     errors: List[str] = Field(default_factory=list)
     template_path: Optional[str] = None
     target_pages: Optional[int] = None
+    exemplar_analysis: Optional[Dict[str, Any]] = None
     artifacts_prefix: str = ""
     paper_dir: Optional[str] = None
+
+
+class SectionBlueprint(BaseModel):
+    """
+    Per-section structure extracted from an exemplar paper.
+    - **Description**:
+        - Captures the structural pattern of a single section in the exemplar.
+    """
+    section_type: str
+    title: str = ""
+    approx_word_count: int = 0
+    paragraph_count: int = 0
+    subsection_titles: List[str] = Field(default_factory=list)
+    role: str = ""
+
+
+class StyleProfile(BaseModel):
+    """
+    Writing style features extracted from an exemplar paper.
+    - **Description**:
+        - Quantifies stylistic characteristics for prompt injection.
+    """
+    tone: str = "formal"
+    citation_density: float = 0.0
+    avg_sentence_length: float = 0.0
+    hedging_level: str = "moderate"
+    transition_patterns: List[str] = Field(default_factory=list)
+
+
+class ArgumentationPatterns(BaseModel):
+    """
+    Argumentation and rhetorical patterns from an exemplar paper.
+    - **Description**:
+        - Describes how the exemplar constructs its narrative arc.
+    """
+    intro_hook_type: str = ""
+    claim_evidence_structure: str = ""
+    discussion_closing_strategy: str = ""
+
+
+class ExemplarAnalysis(BaseModel):
+    """
+    Structured decomposition of an exemplar (benchmark) paper.
+    - **Description**:
+        - Top-level container holding all patterns extracted from the exemplar.
+        - Used to inject writing guidance into prompt compilation.
+    """
+    ref_id: str
+    title: str
+    venue: str
+    year: int = 0
+    section_blueprint: List[SectionBlueprint] = Field(default_factory=list)
+    style_profile: StyleProfile = Field(default_factory=StyleProfile)
+    argumentation_patterns: ArgumentationPatterns = Field(default_factory=ArgumentationPatterns)
+    paragraph_archetypes: Dict[str, List[str]] = Field(default_factory=dict)
 
 
 class SectionGenerationRequest(BaseModel):

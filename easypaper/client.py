@@ -30,6 +30,8 @@ from typing import Any, AsyncGenerator, Dict, Optional
 from src.config.loader import load_config
 from src.config.schema import AppConfig, SkillsConfig
 from src.agents import initialize_agents
+from src.agents.shared.docling_service import DoclingService
+from src.agents.shared.docling_analyzer import DoclingPaperResult
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +65,10 @@ class EasyPaper:
 
         self._agents = self._build_agents(self._config)
         self._metadata_agent = self._agents["metadata"]
+        self._docling: Optional[DoclingService] = None
 
     # ------------------------------------------------------------------
-    # Public API
+    # Public API — Paper generation
     # ------------------------------------------------------------------
 
     async def generate(
@@ -138,6 +141,99 @@ class EasyPaper:
                     await task
                 except asyncio.CancelledError:
                     pass
+
+    # ------------------------------------------------------------------
+    # Public API — Docling (standalone PDF parsing)
+    # ------------------------------------------------------------------
+
+    @property
+    def docling(self) -> DoclingService:
+        """
+        Lazy-initialized DoclingService backed by the app config.
+        - **Returns**:
+            - `DoclingService`: Singleton service instance.
+        """
+        if self._docling is None:
+            docling_cfg = None
+            if self._config.tools and getattr(self._config.tools, "docling", None):
+                docling_cfg = self._config.tools.docling
+            self._docling = DoclingService(config=docling_cfg)
+        return self._docling
+
+    def parse_pdf(self, pdf_path: str | Path) -> DoclingPaperResult:
+        """
+        Parse a local PDF into structured academic sections.
+        - **Args**:
+            - `pdf_path` (str | Path): Path to a PDF file.
+        - **Returns**:
+            - `DoclingPaperResult`: Full text, sections, tables, figures.
+        """
+        return self.docling.parse_pdf(pdf_path)
+
+    async def download_and_parse(
+        self,
+        url: str,
+        *,
+        dest_dir: Optional[str | Path] = None,
+        cleanup: bool = True,
+    ) -> DoclingPaperResult:
+        """
+        Download a PDF from *url* and parse it into structured sections.
+        - **Args**:
+            - `url` (str): Direct PDF URL (e.g. arXiv link).
+            - `dest_dir` (str | Path, optional): Save PDF here instead of temp.
+            - `cleanup` (bool): Remove temp dir after parsing (default True).
+        - **Returns**:
+            - `DoclingPaperResult`: Parsed content.
+        """
+        return await self.docling.download_and_parse(
+            url, dest_dir=dest_dir, cleanup=cleanup,
+        )
+
+    async def download_and_parse_arxiv(
+        self,
+        arxiv_id: str,
+        *,
+        dest_dir: Optional[str | Path] = None,
+        cleanup: bool = True,
+    ) -> DoclingPaperResult:
+        """
+        Download an arXiv paper by ID and parse it.
+        - **Args**:
+            - `arxiv_id` (str): e.g. ``"2301.12345"``.
+            - `dest_dir` (str | Path, optional): Save PDF here instead of temp.
+            - `cleanup` (bool): Remove temp dir after parsing (default True).
+        - **Returns**:
+            - `DoclingPaperResult`: Parsed content.
+        """
+        return await self.docling.download_and_parse_arxiv(
+            arxiv_id, dest_dir=dest_dir, cleanup=cleanup,
+        )
+
+    async def enrich_refs(
+        self,
+        refs: list[dict],
+        *,
+        dest_dir: Optional[str | Path] = None,
+        cleanup: bool = True,
+    ) -> list[dict]:
+        """
+        Batch-enrich reference dicts with Docling full-text analysis.
+        - **Description**:
+            - For each ref with ``open_access_pdf`` or ``arxiv_id``,
+              downloads + parses the PDF and attaches ``docling_full_text``
+              and ``docling_sections``.
+
+        - **Args**:
+            - `refs` (list[dict]): Reference dicts with optional URL fields.
+            - `dest_dir` (str | Path, optional): PDF storage directory.
+            - `cleanup` (bool): Remove temp dir after enrichment (default True).
+        - **Returns**:
+            - `list[dict]`: The enriched reference list.
+        """
+        return await self.docling.enrich_refs(
+            refs, dest_dir=dest_dir, cleanup=cleanup,
+        )
 
     # ------------------------------------------------------------------
     # Internal wiring
