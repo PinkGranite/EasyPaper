@@ -125,3 +125,109 @@ async def test_from_tools_config_reads_nested_config(analyzer_mod):
     ar = CoreRefAnalyzer.from_tools_config(MagicMock(), "m", mock_tools)
     assert ar._enabled is False
     assert ar._max_abstract_chars == 500
+
+
+# ---------------------------------------------------------------------------
+# Docling integration: CoreRefAnalyzer uses docling_sections when present
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_analyze_uses_docling_sections_when_present(analyzer_mod, models):
+    CoreRefAnalyzer = analyzer_mod.CoreRefAnalyzer
+    PaperMetaData = models.PaperMetaData
+
+    refs_with_docling = [
+        {
+            "ref_id": "smith2020",
+            "title": "Deep Learning for Vision",
+            "abstract": "Short abstract.",
+            "docling_sections": {
+                "method": "We use a novel transformer architecture with attention.",
+                "results": "Achieved 95% accuracy on ImageNet.",
+                "conclusion": "Transformers outperform CNNs.",
+            },
+            "bibtex": '@article{smith2020, title={DL}, author={Smith}, year={2020}}',
+        },
+    ]
+
+    items_json = {
+        "items": [
+            {
+                "ref_id": "smith2020",
+                "title": "Deep Learning for Vision",
+                "core_contributions": ["Transformer architecture"],
+                "methodology": "Transformer with attention",
+                "limitations": [],
+                "relationship_to_ours": "We extend their encoder.",
+                "key_results": ["95% accuracy"],
+            },
+        ]
+    }
+
+    mock_client = MagicMock()
+    resp = MagicMock()
+    resp.choices = [MagicMock(message=MagicMock(content=json.dumps(items_json)))]
+    mock_client.chat.completions.create = AsyncMock(return_value=resp)
+
+    ar = CoreRefAnalyzer(mock_client, "gpt-4", enabled=True, analyze_cross_paper=False)
+    md = PaperMetaData(
+        title="T", idea_hypothesis="i", method="m", data="d", experiments="e",
+    )
+    out = await ar.analyze(refs_with_docling, md)
+
+    assert len(out.items) == 1
+    assert out.items[0].ref_id == "smith2020"
+
+    # Verify the LLM was called with docling section content
+    call_args = mock_client.chat.completions.create.call_args
+    user_msg = call_args.kwargs.get("messages", call_args[1].get("messages", []))[-1]["content"]
+    assert "method_excerpt" in user_msg or "Transformer" in user_msg
+
+
+@pytest.mark.asyncio
+async def test_analyze_falls_back_to_abstract_without_docling(analyzer_mod, models, sample_core_refs):
+    CoreRefAnalyzer = analyzer_mod.CoreRefAnalyzer
+    PaperMetaData = models.PaperMetaData
+
+    items_json = {
+        "items": [
+            {
+                "ref_id": "smith2020",
+                "title": "Deep Learning for Vision",
+                "core_contributions": ["Architecture"],
+                "methodology": "CNN",
+                "limitations": [],
+                "relationship_to_ours": "Related.",
+                "key_results": [],
+            },
+            {
+                "ref_id": "jones2021",
+                "title": "Robustness",
+                "core_contributions": ["Robust training"],
+                "methodology": "Adversarial",
+                "limitations": [],
+                "relationship_to_ours": "Baseline.",
+                "key_results": [],
+            },
+        ]
+    }
+
+    mock_client = MagicMock()
+    resp = MagicMock()
+    resp.choices = [MagicMock(message=MagicMock(content=json.dumps(items_json)))]
+    mock_client.chat.completions.create = AsyncMock(return_value=resp)
+
+    ar = CoreRefAnalyzer(mock_client, "gpt-4", enabled=True, analyze_cross_paper=False)
+    md = PaperMetaData(
+        title="T", idea_hypothesis="i", method="m", data="d", experiments="e",
+    )
+    out = await ar.analyze(sample_core_refs, md)
+
+    # Should still work with abstract-only refs
+    assert len(out.items) == 2
+
+    # Verify the LLM was called with abstract content (not docling sections)
+    call_args = mock_client.chat.completions.create.call_args
+    user_msg = call_args.kwargs.get("messages", call_args[1].get("messages", []))[-1]["content"]
+    assert "abstract" in user_msg.lower() or "image classification" in user_msg.lower()

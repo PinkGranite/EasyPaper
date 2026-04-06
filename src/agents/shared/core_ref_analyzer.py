@@ -57,12 +57,14 @@ class CoreRefAnalyzer:
         enabled: bool = True,
         max_abstract_chars: int = 2000,
         analyze_cross_paper: bool = True,
+        max_section_chars: int = 3000,
     ) -> None:
         self._client = client
         self._model_name = model_name
         self._enabled = enabled
         self._max_abstract_chars = max_abstract_chars
         self._analyze_cross_paper = analyze_cross_paper
+        self._max_section_chars = max_section_chars
 
     @classmethod
     def from_tools_config(cls, client: Any, model_name: str, tools_config: Any) -> CoreRefAnalyzer:
@@ -129,30 +131,56 @@ class CoreRefAnalyzer:
             return self._heuristic_fallback(core_refs, paper_metadata)
 
         per_paper_payload = []
+        has_docling_data = False
         for ref in core_refs:
             rid = ref.get("ref_id", "")
             abstract = str(ref.get("abstract", ""))[: self._max_abstract_chars]
-            per_paper_payload.append(
-                {
-                    "ref_id": rid,
-                    "title": ref.get("title", ""),
-                    "year": ref.get("year"),
-                    "venue": ref.get("venue", ""),
-                    "abstract": abstract,
-                    "bibtex_excerpt": str(ref.get("bibtex", ""))[:800],
-                }
-            )
+            entry: Dict[str, Any] = {
+                "ref_id": rid,
+                "title": ref.get("title", ""),
+                "year": ref.get("year"),
+                "venue": ref.get("venue", ""),
+                "abstract": abstract,
+                "bibtex_excerpt": str(ref.get("bibtex", ""))[:800],
+            }
+
+            docling_sections = ref.get("docling_sections")
+            if isinstance(docling_sections, dict) and docling_sections:
+                has_docling_data = True
+                sc = self._max_section_chars
+                if docling_sections.get("method"):
+                    entry["method_excerpt"] = str(docling_sections["method"])[:sc]
+                if docling_sections.get("results"):
+                    entry["results_excerpt"] = str(docling_sections["results"])[:sc]
+                if docling_sections.get("conclusion"):
+                    entry["conclusion_excerpt"] = str(docling_sections["conclusion"])[:sc]
+                if docling_sections.get("introduction"):
+                    entry["introduction_excerpt"] = str(docling_sections["introduction"])[:sc]
+                if docling_sections.get("experiment"):
+                    entry["experiment_excerpt"] = str(docling_sections["experiment"])[:sc]
+
+            per_paper_payload.append(entry)
 
         sys1 = (
             "You are an academic analyst. The following papers are USER-PROVIDED CORE REFERENCES. "
             "They are authoritative anchors for the manuscript — do not dismiss them as irrelevant. "
             "Respond with JSON only."
         )
+
+        docling_hint = ""
+        if has_docling_data:
+            docling_hint = (
+                "\nSome references include full-text excerpts (method_excerpt, results_excerpt, "
+                "conclusion_excerpt, etc.) from their original papers. Use these for deeper analysis "
+                "of contributions, methodology, limitations, and relationship to the target manuscript.\n"
+            )
+
         user1 = (
             f"Target manuscript title: {paper_metadata.title}\n"
             f"Idea/hypothesis: {paper_metadata.idea_hypothesis[:1500]}\n"
             f"Method (draft): {paper_metadata.method[:1200]}\n\n"
-            f"Core references (JSON):\n{json.dumps(per_paper_payload, ensure_ascii=False)}\n\n"
+            f"Core references (JSON):\n{json.dumps(per_paper_payload, ensure_ascii=False)}\n"
+            f"{docling_hint}\n"
             "Return a JSON object with key \"items\": array of objects, one per ref_id above, each with:\n"
             '{"ref_id": str, "title": str, "core_contributions": [str], "methodology": str, '
             '"limitations": [str], "relationship_to_ours": str, "key_results": [str]}\n'

@@ -128,3 +128,26 @@ def mock_llm_client(mock_llm_response):
         return_value=mock_llm_response("Generated LaTeX content.")
     )
     return client
+
+
+@pytest.fixture
+def sample_core_refs():
+    """Two sample core reference dicts for CoreRefAnalyzer tests."""
+    return [
+        {
+            "ref_id": "smith2020",
+            "title": "Deep Learning for Vision",
+            "authors": "Smith, A and Doe, B",
+            "year": 2020,
+            "abstract": "We propose a deep architecture for image classification.",
+            "bibtex": '@article{smith2020, title={Deep Learning for Vision}, author={Smith, A and Doe, B}, year={2020}}',
+        },
+        {
+            "ref_id": "jones2021",
+            "title": "Robustness in Neural Networks",
+            "authors": "Jones, C",
+            "year": 2021,
+            "abstract": "Adversarial training improves robustness.",
+            "bibtex": '@article{jones2021, title={Robustness in Neural Networks}, author={Jones, C}, year={2021}}',
+        },
+    ]

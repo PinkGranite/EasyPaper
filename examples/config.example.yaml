@@ -43,3 +43,13 @@ tools:
     - count_words
     - check_key_points
   max_react_iterations: 3
+
+  # Docling deep-analysis (optional, requires `pip install easypaper[docling]`)
+  # When enabled, auto-downloads open-access PDFs of core references
+  # and parses full text for richer LLM analysis.
+  # docling:
+  #   enabled: true
+  #   device: "auto"          # auto / cpu / cuda / mps
+  #   do_ocr: false
+  #   do_table_structure: true
+  #   cleanup_after_analysis: true

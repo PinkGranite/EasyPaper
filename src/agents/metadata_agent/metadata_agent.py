@@ -29,6 +29,8 @@ import json
 import mimetypes
 import re
 import os
+import shutil
+import tempfile
 import uuid
 from datetime import datetime
 from functools import partial
@@ -1219,6 +1221,12 @@ class MetaDataAgent(ReActAgent):
         code_context: Optional[Dict[str, Any]] = None
         code_summary_markdown: Optional[str] = None
         evidence_dag: Optional[EvidenceDAG] = None
+        docling_temp_dir: Optional[Path] = None
+        docling_cfg = (
+            self.tools_config.docling
+            if self.tools_config and getattr(self.tools_config, "docling", None)
+            else None
+        )
 
         search_cfg_for_pool = {}
         if self.tools_config and self.tools_config.paper_search:
@@ -1299,6 +1307,34 @@ class MetaDataAgent(ReActAgent):
                     errors.append(msg)
                     code_context = None
                     code_summary_markdown = None
+
+            # Phase 0-docling: Deep reference analysis via Docling (optional)
+            if docling_cfg and docling_cfg.enabled:
+                print("[MetaDataAgent] Phase 0-docling: Deep reference analysis with Docling...")
+                try:
+                    from ..shared.docling_enricher import DoclingEnricher
+
+                    docling_temp_dir = (paper_dir or Path(tempfile.mkdtemp())) / "_docling_tmp"
+                    enricher = DoclingEnricher(docling_cfg)
+                    ref_pool._core_refs = await enricher.enrich_core_refs(
+                        ref_pool._core_refs, docling_temp_dir,
+                    )
+                    docling_count = sum(
+                        1 for r in ref_pool._core_refs if r.get("docling_sections")
+                    )
+                    print(
+                        f"[MetaDataAgent] Docling enriched {docling_count} / "
+                        f"{len(ref_pool._core_refs)} core references"
+                    )
+                except ImportError:
+                    print(
+                        "[MetaDataAgent] Warning: Docling not installed. "
+                        "Install with: pip install easypaper[docling]"
+                    )
+                    errors.append("Docling enabled but not installed")
+                except Exception as e:
+                    print(f"[MetaDataAgent] Warning: Docling enrichment failed: {e}")
+                    errors.append(f"Docling enrichment failed: {e}")
 
             # Phase 0: Planning
             if enable_planning:
@@ -1599,6 +1635,14 @@ class MetaDataAgent(ReActAgent):
                 artifacts_prefix=artifacts_prefix, paper_dir=paper_dir_str,
             )
         finally:
+            # Docling temp file cleanup
+            if docling_temp_dir and docling_temp_dir.exists():
+                if docling_cfg and docling_cfg.move_to_output and paper_dir:
+                    dest = paper_dir / "reference_pdfs"
+                    if not dest.exists():
+                        shutil.move(str(docling_temp_dir), str(dest))
+                elif docling_cfg and docling_cfg.cleanup_after_analysis:
+                    shutil.rmtree(docling_temp_dir, ignore_errors=True)
             clear_llm_progress_context()
 
     # ------------------------------------------------------------------

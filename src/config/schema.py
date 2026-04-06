@@ -57,6 +57,31 @@ class CoreRefAnalysisConfig(BaseModel):
     analyze_cross_paper: bool = True
 
 
+class DoclingConfig(BaseModel):
+    """
+    Configuration for Docling-based deep document analysis.
+    - **Description**:
+        - When enabled, downloads open-access PDFs of core references and
+          parses them with Docling to extract full-text sections, tables,
+          and figures for richer LLM analysis.
+        - Requires the ``docling`` optional dependency
+          (``pip install easypaper[docling]``).
+        - Disabled by default; zero impact on users who do not need it.
+    """
+
+    enabled: bool = False
+    device: str = "auto"
+    do_ocr: bool = False
+    do_table_structure: bool = True
+    do_formula_enrichment: bool = False
+    images_scale: float = 2.0
+    document_timeout: float = 120.0
+    max_pages: int = 30
+    download_timeout: float = 30.0
+    cleanup_after_analysis: bool = True
+    move_to_output: bool = False
+
+
 class ToolsConfig(BaseModel):
     """Configuration for ReAct tool usage."""
     enabled: bool = True
@@ -76,6 +101,7 @@ class ToolsConfig(BaseModel):
     paper_search: Optional[PaperSearchConfig] = None
     research_context: Optional[ResearchContextConfig] = None
     core_ref_analysis: Optional[CoreRefAnalysisConfig] = None
+    docling: Optional[DoclingConfig] = None
 
 
 class MetadataConfig(BaseModel):

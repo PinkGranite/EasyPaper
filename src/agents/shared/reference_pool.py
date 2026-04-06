@@ -217,6 +217,10 @@ class ReferencePool:
             target["abstract"] = paper.get("abstract", target.get("abstract", ""))
             target["venue"] = paper.get("venue", target.get("venue", ""))
             target["citation_count"] = paper.get("citation_count", target.get("citation_count"))
+            if paper.get("open_access_pdf") and not target.get("open_access_pdf"):
+                target["open_access_pdf"] = paper["open_access_pdf"]
+            if paper.get("arxiv_id") and not target.get("arxiv_id"):
+                target["arxiv_id"] = paper["arxiv_id"]
             target["source"] = target.get("source", "core_search_enriched")
 
     # ------------------------------------------------------------------
