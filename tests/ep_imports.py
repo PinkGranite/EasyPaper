@@ -90,6 +90,45 @@ def load_reference_assignment():
     return mod
 
 
+def _ensure_config_stubs() -> None:
+    """Ensure src.config package stub exists."""
+    if "src.config" not in sys.modules:
+        m = types.ModuleType("src.config")
+        m.__path__ = [str(_SRC / "config")]  # type: ignore[attr-defined]
+        sys.modules["src.config"] = m
+
+
+def load_exemplar_selector():
+    load_metadata_models()
+    ensure_src_stubs()
+    _ensure_config_stubs()
+    path = _SRC / "agents" / "shared" / "exemplar_selector.py"
+    name = "src.agents.shared.exemplar_selector"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def load_exemplar_analyzer():
+    load_metadata_models()
+    ensure_src_stubs()
+    path = _SRC / "agents" / "shared" / "exemplar_analyzer.py"
+    name = "src.agents.shared.exemplar_analyzer"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def load_planner_models():
     ensure_src_stubs()
     path = _SRC / "agents" / "planner_agent" / "models.py"
