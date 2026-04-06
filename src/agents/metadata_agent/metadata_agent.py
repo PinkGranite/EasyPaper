@@ -1773,6 +1773,7 @@ class MetaDataAgent(ReActAgent):
                 figures=metadata.figures, tables=metadata.tables,
                 code_context=code_context, research_context=research_context,
                 prompt_traces=prompt_traces, memory=memory, evidence_dag=evidence_dag,
+                template_guide=template_guide,
             )
             sections_results.append(intro_result)
             print(f"[MetaDataAgent] After introduction: {ref_pool.summary()}")
@@ -1827,7 +1828,7 @@ class MetaDataAgent(ReActAgent):
                         tables=section_tables, converted_tables=converted_tables,
                         code_context=code_context, research_context=research_context,
                         prompt_traces=prompt_traces, memory=memory, evidence_dag=evidence_dag,
-                        emitter=emitter,
+                        emitter=emitter, template_guide=template_guide,
                     )
                 except Exception as e:
                     result = SectionResult(section_type=section_type, status="error", error=str(e))
@@ -1864,6 +1865,7 @@ class MetaDataAgent(ReActAgent):
                 style_guide=metadata.style_guide,
                 section_plan=paper_plan.get_section("abstract") if paper_plan else None,
                 prompt_traces=prompt_traces, memory=memory,
+                template_guide=template_guide,
             )
             sections_results.insert(0, abstract_result)
             if abstract_result.status == "ok":
@@ -1884,6 +1886,7 @@ class MetaDataAgent(ReActAgent):
                     style_guide=metadata.style_guide,
                     section_plan=paper_plan.get_section("conclusion") if paper_plan else None,
                     prompt_traces=prompt_traces, memory=memory,
+                    template_guide=template_guide,
                 )
                 sections_results.append(conclusion_result)
                 if conclusion_result.status == "ok":
@@ -2093,6 +2096,7 @@ class MetaDataAgent(ReActAgent):
         prompt_traces: Optional[List[Dict[str, Any]]] = None,
         memory: Optional[SessionMemory] = None,
         evidence_dag: Optional[EvidenceDAG] = None,
+        template_guide: Optional[TemplateWriterGuide] = None,
     ) -> SectionResult:
         """
         Generate Introduction section — delegates to WriterAgent.
@@ -2233,6 +2237,7 @@ class MetaDataAgent(ReActAgent):
         prompt_traces: Optional[List[Dict[str, Any]]] = None,
         memory: Optional[SessionMemory] = None,
         evidence_dag: Optional[EvidenceDAG] = None,
+        template_guide: Optional[TemplateWriterGuide] = None,
         emitter: Optional[ProgressEmitter] = None,
     ) -> SectionResult:
         """
@@ -2372,6 +2377,7 @@ class MetaDataAgent(ReActAgent):
                     section_title_str=section_title_str,
                     memory=memory,
                     emitter=emitter,
+                    template_guide=template_guide,
                 )
             else:
                 result = await self._writer.run(
@@ -2426,6 +2432,7 @@ class MetaDataAgent(ReActAgent):
         section_title_str: str = "",
         memory: Optional[SessionMemory] = None,
         emitter: Optional[ProgressEmitter] = None,
+        template_guide: Optional[TemplateWriterGuide] = None,
     ) -> str:
         """
         Generate a section paragraph-by-paragraph with verify-retry-degrade.
@@ -2627,6 +2634,7 @@ class MetaDataAgent(ReActAgent):
         section_plan: Optional[SectionPlan] = None,
         prompt_traces: Optional[List[Dict[str, Any]]] = None,
         memory: Optional[SessionMemory] = None,
+        template_guide: Optional[TemplateWriterGuide] = None,
     ) -> SectionResult:
         """Generate synthesis section (Abstract or Conclusion) via WriterAgent."""
         try:
