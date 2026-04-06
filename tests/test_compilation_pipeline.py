@@ -85,11 +85,13 @@ class TestStripLeadingSectionCommand:
         result = self._strip(content)
         assert content.strip() == result
 
-    def test_non_leading_section_preserved(self):
-        """\\section{} in the middle of content should stay."""
+    def test_non_leading_section_also_stripped(self):
+        """\\section{} in the middle of content should also be stripped now."""
         content = "First paragraph.\n\n" + r"\section{Next}" + "\nNext section."
         result = self._strip(content)
-        assert r"\section{Next}" in result
+        assert r"\section{Next}" not in result
+        assert "First paragraph." in result
+        assert "Next section." in result
 
     def test_empty_content(self):
         """Edge case: empty string."""

@@ -153,3 +153,32 @@ class TemplateConfig(BaseModel):
             has_abstract=template_info.get("has_abstract", True),
             has_acknowledgment=template_info.get("has_acknowledgment", False),
         )
+
+
+class TemplateStructureProfile(BaseModel):
+    """
+    Runtime-analyzed structural profile of a LaTeX template.
+    - **Description**:
+        - Captures how a template organizes title, author, abstract,
+          and body regions so that content injection can adapt dynamically
+          rather than relying on hardcoded regex patterns.
+        - Populated by TypesetterAgent._analyze_template_structure()
+          from the raw template .tex source.
+
+    - **Args**:
+        - `title_command` (str): Primary title command in the template.
+        - `author_system` (str): Author block style.
+        - `abstract_format` (str): How the abstract is declared.
+        - `abstract_inside_twocolumn` (bool): Abstract lives inside
+          the \\twocolumn[...] bracket region.
+        - `needs_maketitle` (bool): Whether \\maketitle is required.
+        - `needs_date` (bool): Whether \\date{} should be injected.
+        - `has_twocolumn_bracket` (bool): Template uses \\twocolumn[...].
+    """
+    title_command: str = "\\title"
+    author_system: str = "standard"  # standard / icml / acm / ieee / nature
+    abstract_format: str = "environment"  # environment / command / none
+    abstract_inside_twocolumn: bool = False
+    needs_maketitle: bool = True
+    needs_date: bool = False
+    has_twocolumn_bracket: bool = False

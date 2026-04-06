@@ -3477,6 +3477,67 @@ class MetaDataAgent(ReActAgent):
         return generated_sections
 
     @staticmethod
+    def _enforce_table_placement(
+        sections: Dict[str, str],
+        table_assignments: Dict[str, str],
+    ) -> Dict[str, str]:
+        """
+        Remove table environments from sections they are not assigned to.
+        - **Description**:
+            - For each \\begin{table}...\\end{table} block, checks its \\label{}.
+            - If the label has an assignment in table_assignments and the
+              current section is NOT the assigned section, the block is removed.
+            - Tables with no assignment or no label are left in place.
+
+        - **Args**:
+            - `sections` (Dict[str, str]): section_type -> LaTeX content
+            - `table_assignments` (Dict[str, str]): label -> assigned section_type
+
+        - **Returns**:
+            - `Dict[str, str]`: Sections with misplaced tables removed.
+        """
+        import re
+
+        if not table_assignments:
+            return sections
+
+        result = dict(sections)
+        total_removed = 0
+
+        for section_type, content in sections.items():
+            if not content:
+                continue
+
+            env_pattern = re.compile(
+                r'\\begin\{(table\*?)\}.*?\\end\{\1\}',
+                re.DOTALL,
+            )
+
+            new_content = content
+            offset = 0
+
+            for m in env_pattern.finditer(content):
+                block = m.group(0)
+                labels = re.findall(r'\\label\{([^}]+)\}', block)
+                label = labels[0] if labels else None
+
+                if label and label in table_assignments:
+                    assigned_section = table_assignments[label]
+                    if section_type != assigned_section:
+                        start = m.start() + offset
+                        end = m.end() + offset
+                        new_content = new_content[:start] + new_content[end:]
+                        offset -= (m.end() - m.start())
+                        total_removed += 1
+
+            result[section_type] = new_content.strip()
+
+        if total_removed > 0:
+            print(f"[EnforceTablePlacement] Removed {total_removed} misplaced table(s)")
+
+        return result
+
+    @staticmethod
     def _strip_code_path_references(
         generated_sections: Dict[str, str],
     ) -> Dict[str, str]:
@@ -3920,6 +3981,14 @@ class MetaDataAgent(ReActAgent):
                     print(f"[CompilePDF] Removed {len(invalid)} invalid citations from {section_type}: {invalid[:3]}{'...' if len(invalid) > 3 else ''}")
                     total_invalid_removed += len(invalid)
                 generated_sections[section_type] = fixed_content
+
+            # Cross-section label validation: remove \ref{} to undefined labels
+            from ..shared.label_registry import collect_all_labels, validate_and_fix_refs
+            valid_labels = collect_all_labels(generated_sections)
+            for section_type in list(generated_sections.keys()):
+                generated_sections[section_type] = validate_and_fix_refs(
+                    generated_sections[section_type], valid_labels
+                )
             
             if total_invalid_removed > 0:
                 print(f"[CompilePDF] Total invalid citations removed: {total_invalid_removed}")
@@ -3940,6 +4009,20 @@ class MetaDataAgent(ReActAgent):
                 generated_sections,
                 section_order=section_order,
             )
+
+            # Enforce table placement according to planner assignments
+            if paper_plan:
+                table_assignments: Dict[str, str] = {}
+                for sec in paper_plan.sections:
+                    if sec.table_definitions:
+                        for tdef in sec.table_definitions:
+                            label = getattr(tdef, "label", None) or getattr(tdef, "table_id", None)
+                            if label:
+                                table_assignments[label] = sec.section_type
+                if table_assignments:
+                    generated_sections = self._enforce_table_placement(
+                        generated_sections, table_assignments,
+                    )
 
             # Ensure all assigned tables have their environments created
             if paper_plan and metadata_tables:
@@ -3969,6 +4052,14 @@ class MetaDataAgent(ReActAgent):
                 paper_title=paper_title,
                 paper_authors="EasyPaper",
             )
+
+            # Promote wide tables to table* in double-column templates
+            if ts_template_config.column_format == "double":
+                from ..typesetter_agent.typesetter_agent import TypesetterAgent as _TA
+                for sec_type in list(generated_sections.keys()):
+                    generated_sections[sec_type] = _TA._promote_wide_tables(
+                        generated_sections[sec_type]
+                    )
 
             # Prefer in-process peer TypesetterAgent (SDK mode); fall back to HTTP.
             if self._typesetter is not None:
