@@ -24,7 +24,7 @@ from jinja2 import Template
 from ...config.schema import ModelConfig
 from ..base import BaseAgent
 from .router import create_typesetter_router
-from .models import ResourceInfo, BibEntry, CompilationResult, TemplateConfig
+from .models import ResourceInfo, BibEntry, CompilationResult, TemplateConfig, TemplateStructureProfile
 
 
 # Backend API URL for fetching resources
@@ -742,26 +742,71 @@ class TypesetterAgent(BaseAgent):
         """
         Strip all leading \\section{} and \\section*{} commands from content.
         - **Description**:
-            - WriterAgent output may already contain \\section{Title} commands
-            - Since _write_section_files always prepends its own canonical
-              \\section{Title}, any existing ones must be removed to avoid duplicates
-            - Also strips multiple consecutive section commands (e.g. \\section{Results}
-              followed by \\section*{Result})
+            - Legacy method kept for backward compatibility.
+            - Delegates to _strip_all_section_commands which handles
+              all positions, not just leading.
 
         - **Args**:
             - `content` (str): Raw LaTeX section content
 
         - **Returns**:
-            - `str`: Content with leading section commands removed
+            - `str`: Content with section commands removed
         """
-        # Repeatedly strip leading \section{...} or \section*{...} commands
-        # Also handle optional \label{...} right after the section command
-        pattern = r'^\s*\\section\*?\{[^}]*\}\s*(?:\\label\{[^}]*\}\s*)?'
-        prev = None
-        while prev != content:
-            prev = content
-            content = re.sub(pattern, '', content, count=1)
-        return content.strip()
+        return TypesetterAgent._strip_all_section_commands(content)
+
+    @staticmethod
+    def _strip_all_section_commands(content: str) -> str:
+        """
+        Strip ALL \\section{} and \\section*{} commands from content.
+        - **Description**:
+            - Removes \\section{...} and \\section*{...} commands from
+              any position in the content (not just leading ones).
+            - Also strips optional \\label{...} immediately following.
+            - Handles nested braces in titles.
+            - Preserves \\subsection{}, \\subsubsection{}, etc.
+
+        - **Args**:
+            - `content` (str): Raw LaTeX section content
+
+        - **Returns**:
+            - `str`: Content with all \\section commands removed
+        """
+        result = []
+        i = 0
+        while i < len(content):
+            m = re.search(r'\\section\*?\s*\{', content[i:])
+            if not m:
+                result.append(content[i:])
+                break
+
+            match_abs_start = i + m.start()
+
+            # Verify this is \section, not \subsection or \subsubsection
+            prefix_start = max(0, match_abs_start - 3)
+            prefix = content[prefix_start:match_abs_start]
+            if prefix.endswith("sub"):
+                result.append(content[i:match_abs_start + m.end() - m.start()])
+                i = match_abs_start + m.end() - m.start()
+                continue
+
+            result.append(content[i:match_abs_start])
+
+            brace_start = match_abs_start + m.end() - m.start() - 1
+            brace_end = TypesetterAgent._find_brace_end(content, brace_start)
+            remainder_pos = brace_end
+
+            rest = content[remainder_pos:]
+            label_m = re.match(r'\s*\\label\{', rest)
+            if label_m:
+                label_brace = remainder_pos + label_m.end() - 1
+                label_end = TypesetterAgent._find_brace_end(content, label_brace)
+                remainder_pos = label_end
+
+            i = remainder_pos
+
+        cleaned = ''.join(result)
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        return cleaned.strip()
 
     def _write_section_files(
         self,
@@ -954,24 +999,29 @@ class TypesetterAgent(BaseAgent):
         return result
 
     def _smart_inject_content(self, template_content: str, sections: Dict[str, str], 
-                              template_config: TemplateConfig, bib_entries: List[BibEntry]) -> str:
+                              template_config: TemplateConfig, bib_entries: List[BibEntry],
+                              profile: Optional[TemplateStructureProfile] = None) -> str:
         """
         Smart inject content into template
         - **Description**:
             - Replaces title/author if config provides them
             - Injects abstract in the correct location
             - Injects main content sections
-            - Handles different template formats (standard, ICML, etc.)
+            - Uses TemplateStructureProfile for template-aware injection
 
         - **Args**:
             - `template_content` (str): Original template content
             - `sections` (dict): Parsed sections with 'abstract' and 'body'
             - `template_config` (TemplateConfig): Configuration with title/author
             - `bib_entries` (list): Bibliography entries
+            - `profile` (TemplateStructureProfile, optional): Runtime template profile
 
         - **Returns**:
             - `str`: Template with injected content
         """
+        if profile is None:
+            profile = self._analyze_template_structure(template_content)
+
         result = template_content
         
         # Step 1: Replace title if provided
@@ -1017,27 +1067,37 @@ class TypesetterAgent(BaseAgent):
                 result
             )
         
-        # Step 2: Replace author
+        # Step 2: Replace author — dispatch by profile.author_system
         authors = template_config.paper_authors or "EasyPaper"
-        # Remove all \author variants: \author{...}, \author*[...]{...}, etc.
-        # Handle nested braces from \fnm{}, \sur{} inside author args
-        result = self._replace_all_authors(result, authors)
-        
-        # Step 2b: Clear affiliation/institute/email/equalcont if present
-        result = re.sub(r'\\affil\*?\[[^\]]*\]\{[^}]*\}', '', result)
-        result = re.sub(r'\\affiliation\{[^}]*\}', '', result)
-        result = re.sub(r'\\institute\{[^}]*\}', '', result)
-        result = re.sub(r'\\equalcont\{[^}]*\}', '', result)
-        result = re.sub(r'\\email\{[^}]*\}', '', result)
-        # Remove orphaned \orgname/\orgaddress lines (Nature/Springer affiliation blocks)
-        result = re.sub(r'^[,\s]*\\org(?:name|address|div)\{[^}]*(?:\{[^}]*\}[^}]*)*\}[^\n]*$',
-                        '', result, flags=re.MULTILINE)
-        # Clean up blank lines left behind
+
+        if profile.author_system in ("icml", "ieee"):
+            # ICML and IEEE use their own author block systems
+            # (icmlauthorlist, IEEEauthorblockN, etc.) — preserve them intact.
+            pass
+        elif profile.author_system == "nature":
+            # Nature/Springer uses \author[aff]{\fnm{}\sur{}} — replace with
+            # standard \author{} and clear affiliation commands.
+            result = self._replace_all_authors(result, authors)
+            result = re.sub(r'\\affil\*?\[[^\]]*\]\{[^}]*\}', '', result)
+            result = re.sub(r'\\affiliation\{[^}]*\}', '', result)
+            result = re.sub(r'\\institute\{[^}]*\}', '', result)
+            result = re.sub(r'\\equalcont\{[^}]*\}', '', result)
+            result = re.sub(r'\\email\{[^}]*\}', '', result)
+            result = re.sub(
+                r'^[,\s]*\\org(?:name|address|div)\{[^}]*(?:\{[^}]*\}[^}]*)*\}[^\n]*$',
+                '', result, flags=re.MULTILINE,
+            )
+        else:
+            # Standard \author{} replacement
+            result = self._replace_all_authors(result, authors)
+
+        # Clean up blank lines left behind by author/affiliation removal
         result = re.sub(r'\n{3,}', '\n\n', result)
         
         # Step 3: Find and replace abstract
         abstract_content = sections.get("abstract", "")
         if abstract_content:
+            abstract_content = self._normalize_abstract(abstract_content)
             # Escape unescaped % characters (they start LaTeX comments)
             abstract_content = re.sub(r'(?<!\\)%', r'\\%', abstract_content)
             
@@ -1128,7 +1188,7 @@ class TypesetterAgent(BaseAgent):
 
         # Some templates rely on \maketitle to render title/abstract metadata.
         # Ensure it exists even if earlier body replacement paths removed it.
-        result = self._ensure_maketitle_present(result)
+        result = self._ensure_maketitle_present(result, profile=profile)
         
         return result
 
@@ -1169,19 +1229,26 @@ class TypesetterAgent(BaseAgent):
         return errors
 
     @staticmethod
-    def _ensure_maketitle_present(text: str) -> str:
+    def _ensure_maketitle_present(
+        text: str,
+        profile: Optional[TemplateStructureProfile] = None,
+    ) -> str:
         """
         Ensure \\maketitle exists in the document body.
         - **Description**:
-            - Inserts \\maketitle if missing.
+            - Inserts \\maketitle if missing and profile says it is needed.
             - Prefers insertion after abstract content when available.
 
         - **Args**:
             - `text` (str): LaTeX source text.
+            - `profile` (TemplateStructureProfile, optional): Template profile.
 
         - **Returns**:
-            - `str`: LaTeX text guaranteed to contain \\maketitle.
+            - `str`: LaTeX text, with \\maketitle inserted if needed.
         """
+        if profile is not None and not profile.needs_maketitle:
+            return text
+
         if '\\maketitle' in text or '\\begin{document}' not in text:
             return text
 
@@ -1375,6 +1442,150 @@ class TypesetterAgent(BaseAgent):
             i += 1
         return open_brace_pos + 1
 
+    @staticmethod
+    def _analyze_template_structure(template_tex: str) -> TemplateStructureProfile:
+        """
+        Analyze raw template .tex source and produce a TemplateStructureProfile.
+        - **Description**:
+            - Detects title command, author system, abstract format, and
+              structural features like \\twocolumn[...] brackets.
+            - Pure rule-based analysis (no LLM call).
+
+        - **Args**:
+            - `template_tex` (str): Full .tex source of the template.
+
+        - **Returns**:
+            - `TemplateStructureProfile`: Detected structural profile.
+        """
+        title_command = "\\title"
+        if re.search(r'\\icmltitle\b', template_tex):
+            title_command = "\\icmltitle"
+
+        author_system = "standard"
+        if re.search(r'\\begin\{icmlauthorlist\}', template_tex):
+            author_system = "icml"
+        elif re.search(r'\\IEEEauthorblockN\b', template_tex):
+            author_system = "ieee"
+        elif re.search(r'\\author\[.*?\]\{.*?\\fnm\{', template_tex, re.DOTALL):
+            author_system = "nature"
+        elif re.search(r'\\documentclass.*\{acmart\}', template_tex):
+            author_system = "acm"
+
+        abstract_format = "none"
+        if re.search(r'\\begin\{abstract\}', template_tex):
+            abstract_format = "environment"
+        elif re.search(r'(?<!\\begin\{)\\abstract\{', template_tex):
+            abstract_format = "command"
+
+        has_twocolumn_bracket = bool(re.search(r'\\twocolumn\s*\[', template_tex))
+
+        abstract_inside_twocolumn = False
+        if has_twocolumn_bracket:
+            tc_match = re.search(r'\\twocolumn\s*\[', template_tex)
+            if tc_match:
+                bracket_start = tc_match.end() - 1
+                bracket_end = TypesetterAgent._find_bracket_end(
+                    template_tex, bracket_start
+                )
+                bracket_region = template_tex[bracket_start:bracket_end]
+                if '\\begin{abstract}' in bracket_region or '\\abstract{' in bracket_region:
+                    abstract_inside_twocolumn = True
+
+        needs_maketitle = True
+        if has_twocolumn_bracket:
+            needs_maketitle = False
+        if author_system == "icml":
+            needs_maketitle = False
+
+        needs_date = bool(re.search(r'\\date\{', template_tex))
+
+        return TemplateStructureProfile(
+            title_command=title_command,
+            author_system=author_system,
+            abstract_format=abstract_format,
+            abstract_inside_twocolumn=abstract_inside_twocolumn,
+            needs_maketitle=needs_maketitle,
+            needs_date=needs_date,
+            has_twocolumn_bracket=has_twocolumn_bracket,
+        )
+
+    @staticmethod
+    def _find_bracket_end(text: str, open_bracket_pos: int) -> int:
+        """
+        Find the position just after the closing ] matching the [ at open_bracket_pos.
+        - **Args**:
+            - `text` (str): Source text.
+            - `open_bracket_pos` (int): Index of the opening '['.
+        - **Returns**:
+            - `int`: Index just past the matching ']'. Falls back to open_bracket_pos+1.
+        """
+        depth = 0
+        i = open_bracket_pos
+        while i < len(text):
+            if text[i] == '[':
+                depth += 1
+            elif text[i] == ']':
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+            i += 1
+        return open_bracket_pos + 1
+
+    @staticmethod
+    def _normalize_abstract(text: str) -> str:
+        """
+        Collapse multi-paragraph abstract into a single paragraph.
+        - **Description**:
+            - Academic abstracts should be a single paragraph.
+            - Replaces blank-line paragraph breaks with a single space.
+
+        - **Args**:
+            - `text` (str): Raw abstract text.
+
+        - **Returns**:
+            - `str`: Single-paragraph abstract.
+        """
+        text = text.strip()
+        text = re.sub(r'\n\s*\n', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text.strip()
+
+    @staticmethod
+    def _promote_wide_tables(content: str, column_threshold: int = 5) -> str:
+        """
+        Promote wide \\begin{table} to \\begin{table*} for double-column layouts.
+        - **Description**:
+            - A table is considered "wide" if its tabular has more than
+              `column_threshold` columns (counted by & separators + 1 in
+              the first data row).
+            - Only promotes table -> table*, not table* -> table**.
+
+        - **Args**:
+            - `content` (str): LaTeX content
+            - `column_threshold` (int): Min columns to trigger promotion
+
+        - **Returns**:
+            - `str`: Content with wide tables promoted to table*
+        """
+        env_pattern = re.compile(
+            r'(\\begin\{table\})(.*?)(\\end\{table\})',
+            re.DOTALL,
+        )
+
+        def _check_and_promote(m: re.Match) -> str:
+            body = m.group(2)
+            tabular_match = re.search(
+                r'\\begin\{tabular\}\{([^}]*)\}', body,
+            )
+            if tabular_match:
+                col_spec = tabular_match.group(1)
+                col_count = len(re.findall(r'[lcrpXm]', col_spec, re.IGNORECASE))
+                if col_count >= column_threshold:
+                    return f'\\begin{{table*}}{body}\\end{{table*}}'
+            return m.group(0)
+
+        return env_pattern.sub(_check_and_promote, content)
+
     async def inject_template(self, state: TypesetterAgentState) -> Dict[str, Any]:
         """
         Inject content into LaTeX template
@@ -1484,7 +1695,7 @@ class TypesetterAgent(BaseAgent):
             # Abstract is inlined into main.tex (do not use sections/abstract.tex)
             abstract_inline = ""
             if sections_dict.get("abstract", "").strip():
-                abstract_inline = sections_dict["abstract"].strip()
+                abstract_inline = self._normalize_abstract(sections_dict["abstract"])
                 abstract_inline = re.sub(r'^\\begin\{abstract\}\s*', '', abstract_inline)
                 abstract_inline = re.sub(r'\s*\\end\{abstract\}$', '', abstract_inline)
                 abstract_inline = self._apply_citation_style(abstract_inline, template_config.citation_style)
