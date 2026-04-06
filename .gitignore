@@ -38,7 +38,9 @@ configs/*.yml
 !configs/*.example.yml
 
 # Examples and demos
-examples/
+examples/*
+!examples/sdk_demo.py
+!examples/config.example.yaml
 example_jsons/
 case1/
 
@@ -49,8 +51,10 @@ outputs/
 # Other
 test_output*/
 test_results/
-__*
+__Dockerfile
+__understanding.md
 .cursor/
 docs/
 evaluation/
 progress_report/
+.worktrees/

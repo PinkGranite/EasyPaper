@@ -1200,7 +1200,9 @@ class ReviewOrchestrator:
             cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip())
             cleaned = re.sub(r"\n?```\s*$", "", cleaned)
             parsed = json.loads(cleaned) if cleaned else {}
-            plan = parsed.get("revision_plan", [])
+            if isinstance(parsed, list):
+                return parsed
+            plan = parsed.get("revision_plan", []) if isinstance(parsed, dict) else []
             if isinstance(plan, list):
                 return plan
         except Exception as e:

@@ -1,0 +1,20 @@
+{
+  "name": "easypaper",
+  "version": "0.1.0",
+  "description": "AI-powered academic paper generation plugin for Claude Code. Generate LaTeX papers from metadata interactively.",
+  "author": {
+    "name": "PinkGranite",
+    "url": "https://github.com/pinkgranite"
+  },
+  "homepage": "https://github.com/pinkgranite/easypaper",
+  "repository": "https://github.com/pinkgranite/easypaper",
+  "license": "Apache",
+  "keywords": [
+    "claude-code",
+    "latex",
+    "academic",
+    "paper",
+    "generation",
+    "plugin"
+  ]
+}

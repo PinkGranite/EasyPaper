@@ -207,6 +207,7 @@ class MetaDataAgent(ReActAgent):
         self._reviewer = None
         self._planner = None
         self._vlm_reviewer = None
+        self._typesetter = None
         # Sub-modules — initialised here; they access peers lazily via self (host)
         self._orchestrator = ReviewOrchestrator(self)
         self._executor = RevisionExecutor(self)
@@ -227,6 +228,7 @@ class MetaDataAgent(ReActAgent):
         self._reviewer = agents.get("reviewer")
         self._planner = agents.get("planner")
         self._vlm_reviewer = agents.get("vlm_review")
+        self._typesetter = agents.get("typesetter")
 
     @staticmethod
     async def _save_artifact(
@@ -2456,14 +2458,12 @@ class MetaDataAgent(ReActAgent):
                 para_result = await self._writer.generate_paragraph(
                     paragraph_prompt=para_prompt,
                     section_type=section_type,
-                    valid_citation_keys=para_valid_refs,
-                    memory=memory,
-                    peers={"planner": self._planner, "reviewer": self._reviewer},
+                    valid_refs=para_valid_refs,
                     paragraph_index=pidx,
                     claim_id=para.claim_id,
                 )
 
-                latex = para_result.get("latex_content", "")
+                latex = para_result.latex_content if hasattr(para_result, "latex_content") else para_result.get("latex_content", "")
 
                 vr = await verifier.verify(
                     generated_text=latex,
@@ -2507,17 +2507,19 @@ class MetaDataAgent(ReActAgent):
                         else:
                             tmpl = tmpl_data
 
-                        tmpl_result = await self._writer.generate_from_template(
+                        from ...generation.template_slots import build_template_fill_prompt
+                        tmpl_prompt = build_template_fill_prompt(
                             template=tmpl,
-                            section_type=section_type,
                             evidence_snippets=evidence_snippet_map,
-                            valid_citation_keys=para_valid_refs,
-                            memory=memory,
-                            peers={"planner": self._planner, "reviewer": self._reviewer},
-                            paragraph_index=pidx,
-                            claim_id=para.claim_id,
+                            valid_refs=para_valid_refs,
                         )
-                        latex = tmpl_result.get("latex_content", latex)
+                        tmpl_result = await self._writer.generate_from_template(
+                            template_prompt=tmpl_prompt,
+                            section_type=section_type,
+                            valid_refs=para_valid_refs,
+                            paragraph_index=pidx,
+                        )
+                        latex = tmpl_result.latex_content if hasattr(tmpl_result, "latex_content") else tmpl_result.get("latex_content", latex)
                         verify_stats["degraded"] += 1
                         print(
                             f"[MetaDataAgent] Paragraph {pidx} degraded to template-slot filling"
@@ -3737,7 +3739,31 @@ class MetaDataAgent(ReActAgent):
                 figure_paths=figure_paths,
             )
             
-            # Call Typesetter Agent API with multi-file sections dict
+            from ..typesetter_agent.models import TemplateConfig
+            ts_template_config = TemplateConfig(
+                paper_title=paper_title,
+                paper_authors="EasyPaper",
+            )
+
+            # Prefer in-process peer TypesetterAgent (SDK mode); fall back to HTTP.
+            if self._typesetter is not None:
+                print("[MetaDataAgent] Using in-process Typesetter Agent")
+                ts_state = await self._typesetter.run(
+                    sections=generated_sections,
+                    section_order=section_order,
+                    section_titles=section_titles,
+                    template_path=template_path,
+                    template_config=ts_template_config,
+                    references=typesetter_refs,
+                    figure_ids=figure_ids,
+                    output_dir=str(output_dir),
+                    figures_source_dir=figures_source_dir,
+                    figure_paths=figure_paths or {},
+                    converted_tables=converted_tables or {},
+                )
+                return self._parse_typesetter_result(ts_state, output_dir)
+
+            # HTTP fallback (server mode — TypesetterAgent running as a separate service)
             async with httpx.AsyncClient(timeout=600.0) as client:
                 response = await client.post(
                     f"{os.getenv('AGENTSYS_SELF_URL', 'http://127.0.0.1:8000')}/agent/typesetter/compile",
@@ -3794,7 +3820,6 @@ class MetaDataAgent(ReActAgent):
 
                     return pdf_path, latex_path, [], section_errors
                 else:
-                    # Compilation failed - extract errors from result
                     compile_errors: List[str] = []
                     section_errors: Dict[str, List[str]] = {}
                     error_msg = result.get("error", "Unknown error")
@@ -3815,6 +3840,49 @@ class MetaDataAgent(ReActAgent):
         except Exception as e:
             print(f"[MetaDataAgent] PDF compilation error: {e}")
             return None, None, [str(e)], {}
+
+    def _parse_typesetter_result(
+        self,
+        ts_state: Dict[str, Any],
+        output_dir: Path,
+    ) -> Tuple[Optional[str], Optional[str], List[str], Dict[str, List[str]]]:
+        """
+        Extract (pdf_path, latex_path, errors, section_errors) from a
+        TypesetterAgent in-process LangGraph state dict.
+        """
+        cr = ts_state.get("compilation_result")
+        if cr is None:
+            print("[MetaDataAgent] Typesetter returned no compilation_result")
+            return None, None, ["Typesetter returned no compilation_result"], {}
+
+        pdf_path = cr.pdf_path if hasattr(cr, "pdf_path") else cr.get("pdf_path")
+        latex_path = cr.source_path if hasattr(cr, "source_path") else cr.get("source_path")
+        errors = (cr.errors if hasattr(cr, "errors") else cr.get("errors", [])) or []
+        section_errors = (
+            cr.section_errors if hasattr(cr, "section_errors")
+            else cr.get("section_errors", {})
+        ) or {}
+        warnings = (cr.warnings if hasattr(cr, "warnings") else cr.get("warnings", [])) or []
+        success = cr.success if hasattr(cr, "success") else cr.get("success", False)
+
+        if success and pdf_path:
+            print(f"[MetaDataAgent] PDF compiled successfully: {pdf_path}")
+            if warnings:
+                print(f"[MetaDataAgent] Compile warnings: {warnings[:5]}")
+            if section_errors:
+                print(f"[MetaDataAgent] Section errors (on success): {section_errors}")
+            if latex_path:
+                main_tex_path = Path(latex_path) / "main.tex"
+                structure_errors = self._validate_main_tex_structure(main_tex_path)
+                if structure_errors:
+                    print(f"[MetaDataAgent] main.tex structure validation failed: {structure_errors}")
+                    return None, None, structure_errors, section_errors
+            return pdf_path, latex_path, [], section_errors
+
+        print(f"[MetaDataAgent] PDF compilation failed: {errors}")
+        if section_errors:
+            print(f"[Typesetter] Section errors: {section_errors}")
+        return None, None, errors or ["Typesetter compilation failed"], section_errors
 
     @staticmethod
     def _validate_main_tex_structure(main_tex_path: Path) -> List[str]:

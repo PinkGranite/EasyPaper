@@ -417,7 +417,9 @@ class WriterAgent(ReActAgent):
         invalid_citations = []
         fixed_content = content
         
-        # 1. Citation validation
+        # 1. Citation validation — auto-fix removes invalid keys from content,
+        #    so we treat it as a warning (not a blocking issue) to avoid
+        #    triggering a revision loop where the LLM reintroduces them.
         valid_keys = set(state.get("valid_citation_keys", []))
         if valid_keys:
             validator = CitationValidatorTool(valid_keys)
@@ -426,8 +428,8 @@ class WriterAgent(ReActAgent):
             if result.data:
                 invalid_citations = result.data.get("invalid_citations", [])
                 if invalid_citations:
-                    issues.append(f"Invalid citations: {invalid_citations}")
                     fixed_content = result.data.get("fixed_content", content)
+                    warnings.append(f"Auto-removed {len(invalid_citations)} invalid citations: {invalid_citations}")
         
         # 2. Word count (informational only — not a pass/fail criterion)
         word_counter = WordCountTool()
