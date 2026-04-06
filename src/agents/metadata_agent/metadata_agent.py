@@ -1855,6 +1855,7 @@ class MetaDataAgent(ReActAgent):
         try:
             # Phase 1: Introduction
             print("[MetaDataAgent] Phase 1: Generating Introduction...")
+            update_usage_tracker_context(agent="WriterAgent", phase="introduction")
             await emitter.phase_start(Phase.INTRODUCTION, "Generating introduction")
             await emitter.section_start("introduction", phase=Phase.INTRODUCTION)
             await emitter.agent_step(agent="WriterAgent", description="Generating introduction section", section="introduction", phase=Phase.INTRODUCTION)
@@ -1906,12 +1907,16 @@ class MetaDataAgent(ReActAgent):
 
             # Phase 2: Body Sections
             print("[MetaDataAgent] Phase 2: Generating Body Sections...")
+            update_usage_tracker_context(agent="WriterAgent", phase="body_sections")
             await emitter.phase_start(Phase.BODY_SECTIONS, "Generating body sections")
             body_section_types = paper_plan.get_body_section_types() if paper_plan else ["related_work", "method", "experiment", "result"]
+            # Skip introduction — already generated in Phase 1 via _generate_introduction
+            body_section_types = [s for s in body_section_types if s != "introduction"]
             for section_type in body_section_types:
                 section_plan = paper_plan.get_section(section_type) if paper_plan else None
                 section_figures = [f for f in metadata.figures if f.section == section_type or not f.section]
                 section_tables = [t for t in metadata.tables if t.section == section_type or not t.section]
+                update_usage_tracker_context(section=section_type)
                 try:
                     result = await self._generate_body_section(
                         section_type=section_type, metadata=metadata,
@@ -1952,6 +1957,7 @@ class MetaDataAgent(ReActAgent):
 
             # Phase 3: Synthesis Sections
             print("[MetaDataAgent] Phase 3: Generating Synthesis Sections...")
+            update_usage_tracker_context(agent="WriterAgent", phase="synthesis")
             await emitter.phase_start(Phase.SYNTHESIS, "Generating synthesis sections (abstract, conclusion)")
             abstract_result = await self._generate_synthesis_section(
                 section_type="abstract", paper_title=metadata.title,
@@ -1999,6 +2005,7 @@ class MetaDataAgent(ReActAgent):
             self._validate_ref_usage(generated_sections, ref_pool)
 
             # Review Orchestration
+            update_usage_tracker_context(agent="ReviewerAgent", phase="review")
             if enable_review:
                 await emitter.phase_start(Phase.REVIEW_LOOP, "Starting review loop")
             (
@@ -2025,6 +2032,7 @@ class MetaDataAgent(ReActAgent):
                 )
 
             # Assemble Paper
+            update_usage_tracker_context(agent="MetaDataAgent", phase="assembly")
             print("[MetaDataAgent] Assembling paper...")
             latex_content = self._assemble_paper(
                 title=metadata.title, sections=generated_sections,
@@ -2114,6 +2122,12 @@ class MetaDataAgent(ReActAgent):
             - Preserves the original single-call interface used by
               ``/metadata/generate/stream`` and ``/metadata/generate``.
         """
+        import time as _time
+        _t0 = _time.monotonic()
+
+        _gp_tracker = UsageTracker()
+        set_usage_tracker_context(_gp_tracker, agent="PlannerAgent", phase="planning")
+
         plan_result = await self.prepare_plan(
             metadata=metadata,
             template_path=template_path,
@@ -2127,13 +2141,18 @@ class MetaDataAgent(ReActAgent):
         )
 
         if plan_result.errors and not plan_result.paper_plan:
+            clear_usage_tracker_context()
+            _gp_tracker.set_elapsed_time(round(_time.monotonic() - _t0, 2))
             return PaperGenerationResult(
                 status="error",
                 paper_title=metadata.title,
                 errors=plan_result.errors,
+                usage=_gp_tracker.to_dict(),
             )
 
-        return await self.execute_generation(
+        clear_usage_tracker_context()
+
+        result = await self.execute_generation(
             plan_result=plan_result,
             enable_review=enable_review,
             max_review_iterations=max_review_iterations,
@@ -2148,6 +2167,28 @@ class MetaDataAgent(ReActAgent):
             figures_source_dir=figures_source_dir,
         )
 
+        elapsed = round(_time.monotonic() - _t0, 2)
+        merged_usage = self._merge_usage_reports(_gp_tracker.to_dict(), result.usage or {})
+        merged_usage.setdefault("summary", {})["elapsed_seconds"] = elapsed
+        result.usage = merged_usage
+        return result
+
+    @staticmethod
+    def _merge_usage_reports(plan_report: dict, gen_report: dict) -> dict:
+        """
+        Merge usage reports from prepare_plan and execute_generation phases.
+        - **Description**:
+            - Combines calls lists and recalculates all aggregate fields.
+        """
+        plan_calls = plan_report.get("calls", [])
+        gen_calls = gen_report.get("calls", [])
+        all_calls = plan_calls + gen_calls
+
+        from ..shared.usage_tracker import UsageTracker, LLMCallRecord
+        merged = UsageTracker()
+        for c in all_calls:
+            merged.record(LLMCallRecord(**c))
+        return merged.to_dict()
 
     async def generate_single_section(
         self,
@@ -2483,6 +2524,7 @@ class MetaDataAgent(ReActAgent):
                     memory=memory,
                     emitter=emitter,
                     template_guide=template_guide,
+                    exemplar_guidance=exemplar_guidance,
                 )
             else:
                 result = await self._writer.run(
@@ -2538,6 +2580,7 @@ class MetaDataAgent(ReActAgent):
         memory: Optional[SessionMemory] = None,
         emitter: Optional[ProgressEmitter] = None,
         template_guide: Optional[TemplateWriterGuide] = None,
+        exemplar_guidance: Optional[str] = None,
     ) -> str:
         """
         Generate a section paragraph-by-paragraph with verify-retry-degrade.
@@ -3079,10 +3122,16 @@ class MetaDataAgent(ReActAgent):
 \maketitle
 
 """
-        # Add abstract
+        # Add abstract — strip any LLM-generated abstract boilerplate
         if "abstract" in sections:
+            abstract_text = sections["abstract"].strip()
+            abstract_text = re.sub(r'\\title\{[^}]*\}\s*', '', abstract_text)
+            abstract_text = re.sub(r'\\maketitle\s*', '', abstract_text)
+            abstract_text = re.sub(r'\\begin\{abstract\}\s*', '', abstract_text)
+            abstract_text = re.sub(r'\s*\\end\{abstract\}', '', abstract_text)
+            abstract_text = abstract_text.strip()
             latex += r"\begin{abstract}" + "\n"
-            latex += sections["abstract"] + "\n"
+            latex += abstract_text + "\n"
             latex += r"\end{abstract}" + "\n\n"
         
         # Add sections in order (handle dynamic sections)
@@ -3101,14 +3150,13 @@ class MetaDataAgent(ReActAgent):
         for s in sections:
             if s != "abstract" and s not in section_order:
                 section_order.append(s)
-        
+
         for section_type in section_order:
             if section_type in sections and sections[section_type]:
                 title = _default_titles.get(section_type, section_type.replace("_", " ").title())
                 latex += f"\\section{{{title}}}\n"
-                # Fix common LaTeX reference syntax errors
-                content = self._fix_latex_references(sections[section_type])
-                # Global citation validation - remove any remaining invalid citations
+                content = re.sub(r'\\section\*?\s*\{[^}]*\}\s*(?:\\label\{[^}]*\}\s*)?', '', sections[section_type])
+                content = self._fix_latex_references(content)
                 content, invalid, valid = self._validate_and_fix_citations(
                     content, valid_citation_keys, remove_invalid=True
                 )
@@ -4013,10 +4061,32 @@ class MetaDataAgent(ReActAgent):
                 
         except httpx.ConnectError:
             print("[MetaDataAgent] Error: Could not connect to Typesetter Agent")
+            self._save_compile_error_log(output_dir, ["Could not connect to Typesetter Agent"])
             return None, None, ["Could not connect to Typesetter Agent"], {}
         except Exception as e:
             print(f"[MetaDataAgent] PDF compilation error: {e}")
+            self._save_compile_error_log(output_dir, [str(e)])
             return None, None, [str(e)], {}
+
+    @staticmethod
+    def _save_compile_error_log(
+        output_dir: Path,
+        errors: List[str],
+    ) -> None:
+        """
+        Write a compile_errors.json to the iteration directory so failures
+        are diagnosable even when the TypesetterAgent crashes before
+        producing any output files.
+        """
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            error_path = output_dir / "compile_errors.json"
+            error_path.write_text(
+                json.dumps({"errors": errors}, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     def _parse_typesetter_result(
         self,

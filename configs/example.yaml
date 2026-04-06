@@ -43,18 +43,31 @@ tools:
     enabled: true
     max_abstract_chars: 2000
     analyze_cross_paper: true
+  # Docling-based deep document analysis (optional)
+  # Downloads open-access PDFs of core references and parses them with
+  # Docling to extract full-text sections, tables, and figures for
+  # richer LLM analysis. Requires: pip install easypaper[docling]
+  docling:
+    enabled: true
+    device: auto
+    do_ocr: false
+    do_table_structure: true
+    do_formula_enrichment: false
+    max_pages: 30
+    download_timeout: 30.0
+    cleanup_after_analysis: true
   # Exemplar (benchmark) paper analysis (optional)
-  # When enabled, selects a published paper matching the target venue,
-  # decomposes its writing patterns, and injects structural/stylistic
-  # guidance into every stage of paper generation.
+  # Selects a published paper matching the target venue, decomposes its
+  # writing patterns, and injects structural/stylistic guidance into
+  # every stage of paper generation.
   # Requires Docling for full-text parsing of candidate papers.
-  # exemplar:
-  #   enabled: true
-  #   prefer_core_refs: true        # check core refs before external search
-  #   venue_match_required: true    # exemplar must match target venue
-  #   recency_years: 5             # max age of exemplar paper
-  #   max_external_candidates: 10  # candidates from external search
-  #   max_analysis_chars: 8000     # max chars sent to LLM for analysis
+  exemplar:
+    enabled: true
+    prefer_core_refs: true        # check core refs before external search
+    venue_match_required: true    # exemplar must match target venue
+    recency_years: 5             # max age of exemplar paper
+    max_external_candidates: 10  # candidates from external search
+    max_analysis_chars: 8000     # max chars sent to LLM for analysis
 
 agents:
   - name: paper_parser

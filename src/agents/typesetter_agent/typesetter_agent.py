@@ -747,6 +747,7 @@ class TypesetterAgent(BaseAgent):
               \\section{Title}, any existing ones must be removed to avoid duplicates
             - Also strips multiple consecutive section commands (e.g. \\section{Results}
               followed by \\section*{Result})
+            - Handles nested braces in titles (e.g. \\section{Some \\textbf{Bold} Title})
 
         - **Args**:
             - `content` (str): Raw LaTeX section content
@@ -754,13 +755,23 @@ class TypesetterAgent(BaseAgent):
         - **Returns**:
             - `str`: Content with leading section commands removed
         """
-        # Repeatedly strip leading \section{...} or \section*{...} commands
-        # Also handle optional \label{...} right after the section command
-        pattern = r'^\s*\\section\*?\{[^}]*\}\s*(?:\\label\{[^}]*\}\s*)?'
-        prev = None
-        while prev != content:
-            prev = content
-            content = re.sub(pattern, '', content, count=1)
+        changed = True
+        while changed:
+            changed = False
+            stripped = content.lstrip()
+            m = re.match(r'\\section\*?\s*\{', stripped)
+            if not m:
+                break
+            brace_start = m.end() - 1
+            brace_end = TypesetterAgent._find_brace_end(stripped, brace_start)
+            remainder = stripped[brace_end:]
+            label_m = re.match(r'\s*\\label\{', remainder)
+            if label_m:
+                label_brace = label_m.end() - 1
+                label_end = TypesetterAgent._find_brace_end(remainder, label_brace)
+                remainder = remainder[label_end:]
+            content = remainder
+            changed = True
         return content.strip()
 
     def _write_section_files(
@@ -1148,7 +1159,11 @@ class TypesetterAgent(BaseAgent):
         """
         errors: List[str] = []
 
-        title_match = re.search(r'\\title(?:\[[^\]]*\])?\{([^}]*)\}', compiled_tex, flags=re.DOTALL)
+        title_match = re.search(
+            r'\\(?:icml)?title(?:\[[^\]]*\])?\{([^}]*)\}',
+            compiled_tex,
+            flags=re.DOTALL,
+        )
         if not title_match or not title_match.group(1).strip():
             errors.append("missing_or_empty_title")
 
@@ -1257,7 +1272,7 @@ class TypesetterAgent(BaseAgent):
             i = pos if pos > start else start + 1
 
         if not regions_to_remove:
-            title_match = re.search(r'\\title(?:\[[^\]]*\])?\{[^}]*\}', text, flags=re.DOTALL)
+            title_match = re.search(r'\\(?:icml)?title(?:\[[^\]]*\])?\{[^}]*\}', text, flags=re.DOTALL)
             insertion = f'\n\\author{{{new_author}}}\n'
             if title_match:
                 insert_pos = title_match.end()
@@ -1485,8 +1500,11 @@ class TypesetterAgent(BaseAgent):
             abstract_inline = ""
             if sections_dict.get("abstract", "").strip():
                 abstract_inline = sections_dict["abstract"].strip()
-                abstract_inline = re.sub(r'^\\begin\{abstract\}\s*', '', abstract_inline)
-                abstract_inline = re.sub(r'\s*\\end\{abstract\}$', '', abstract_inline)
+                # Strip LaTeX boilerplate the LLM may have generated
+                abstract_inline = re.sub(r'\\title\{[^}]*\}\s*', '', abstract_inline)
+                abstract_inline = re.sub(r'\\maketitle\s*', '', abstract_inline)
+                abstract_inline = re.sub(r'\\begin\{abstract\}\s*', '', abstract_inline)
+                abstract_inline = re.sub(r'\s*\\end\{abstract\}', '', abstract_inline)
                 abstract_inline = self._apply_citation_style(abstract_inline, template_config.citation_style)
                 abstract_inline = re.sub(r'(?<!\\)%', r'\\%', abstract_inline).strip()
             if not abstract_inline:
@@ -1634,6 +1652,38 @@ class TypesetterAgent(BaseAgent):
         logger.info("typesetter.written_main_tex chars=%d mode=legacy", len(compiled_tex))
         
         return {"compiled_tex": compiled_tex}
+
+    def _save_diagnostics_on_failure(self, work_dir: str, output_dir: str) -> None:
+        """
+        Save diagnostic files to output_dir when compilation fails.
+        - **Description**:
+            - Copies main.tex, main.log, and sections/ to the iteration
+              directory even when no PDF was produced, so failures can be
+              debugged post-mortem instead of leaving empty directories.
+
+        - **Args**:
+            - `work_dir` (str): Temporary compilation working directory.
+            - `output_dir` (str): Target iteration output directory.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        diag_exts = ('.tex', '.log', '.bib', '.bbl', '.aux')
+        for item in os.listdir(work_dir):
+            src = os.path.join(work_dir, item)
+            if os.path.isfile(src) and item.endswith(diag_exts):
+                try:
+                    shutil.copy2(src, os.path.join(output_dir, item))
+                except Exception as e:
+                    logger.warning("typesetter.diag_copy_failed file=%s error=%s", item, e)
+            elif os.path.isdir(src) and item == 'sections':
+                dst_sec = os.path.join(output_dir, 'sections')
+                os.makedirs(dst_sec, exist_ok=True)
+                for sf in os.listdir(src):
+                    sf_src = os.path.join(src, sf)
+                    if os.path.isfile(sf_src):
+                        try:
+                            shutil.copy2(sf_src, os.path.join(dst_sec, sf))
+                        except Exception as e:
+                            logger.warning("typesetter.diag_copy_failed file=sections/%s error=%s", sf, e)
 
     def _copy_to_output_dir(self, work_dir: str, output_dir: str) -> Dict[str, str]:
         """
@@ -1899,7 +1949,11 @@ class TypesetterAgent(BaseAgent):
                 result.errors.append(f"Compilation error: {str(e)}")
                 logger.error("typesetter.compile_error error=%s", str(e))
                 break
-        
+
+        if not result.success and output_dir:
+            logger.info("typesetter.saving_diagnostics output_dir=%s", output_dir)
+            self._save_diagnostics_on_failure(work_dir, output_dir)
+
         return {"compilation_result": result}
 
     def _extract_errors(self, log_content: str) -> List[str]:

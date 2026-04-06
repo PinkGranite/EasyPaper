@@ -75,8 +75,8 @@ class TestUsageTracker:
         tracker.record(self._record(agent="planner", total_tokens=200))
 
         breakdown = tracker.by_agent()
-        assert breakdown["writer"] == 150
-        assert breakdown["planner"] == 200
+        assert breakdown["writer"]["total_tokens"] == 150
+        assert breakdown["planner"]["total_tokens"] == 200
 
     def test_by_phase(self):
         tracker = self._tracker()
@@ -85,8 +85,8 @@ class TestUsageTracker:
         tracker.record(self._record(phase="generation", total_tokens=150))
 
         breakdown = tracker.by_phase()
-        assert breakdown["planning"] == 300
-        assert breakdown["generation"] == 250
+        assert breakdown["planning"]["total_tokens"] == 300
+        assert breakdown["generation"]["total_tokens"] == 250
 
     def test_call_count(self):
         tracker = self._tracker()
@@ -101,8 +101,8 @@ class TestUsageTracker:
         tracker.record(self._record(agent="writer", total_tokens=100))
 
         d = tracker.to_dict()
-        assert d["total_tokens"] == 100
-        assert d["call_count"] == 1
+        assert d["summary"]["total_tokens"] == 100
+        assert d["summary"]["total_calls"] == 1
         assert "by_agent" in d
         assert "by_phase" in d
         assert "calls" in d
