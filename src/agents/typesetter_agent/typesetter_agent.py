@@ -1737,6 +1737,30 @@ class TypesetterAgent(BaseAgent):
                 for sec_type, rel_path in section_file_map.items()
             }
         
+        # Auto-inject missing packages before compilation
+        try:
+            from ..shared.template_analyzer import (
+                detect_missing_packages as _detect_missing,
+                inject_missing_packages as _inject_missing,
+                PreambleParser as _PreambleParser,
+            )
+            if os.path.exists(main_tex):
+                tex_src = open(main_tex, "r", encoding="utf-8").read()
+                preamble = _PreambleParser.extract_preamble(tex_src)
+                body_start = tex_src.find(r"\begin{document}")
+                body = tex_src[body_start:] if body_start >= 0 else ""
+                auto_pkgs = _detect_missing(preamble, body)
+                if auto_pkgs:
+                    logger.info(
+                        "typesetter.auto_inject_packages packages=%s",
+                        auto_pkgs,
+                    )
+                    patched = _inject_missing(tex_src, auto_pkgs)
+                    with open(main_tex, "w", encoding="utf-8") as f:
+                        f.write(patched)
+        except Exception as e:
+            logger.warning("typesetter.auto_inject_packages_failed: %s", e)
+
         for attempt in range(MAX_COMPILE_ATTEMPTS):
             result.attempts = attempt + 1
             logger.info("typesetter.compile attempt=%d/%d", attempt + 1, MAX_COMPILE_ATTEMPTS)

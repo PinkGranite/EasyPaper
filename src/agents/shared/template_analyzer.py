@@ -386,3 +386,102 @@ class TemplateAnalyzer:
                 "template_analyzer.zip_error path=%s error=%s", zip_path, e
             )
             return TemplateWriterGuide()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Auto-package detection & injection (defense-in-depth for Typesetter)
+# ═══════════════════════════════════════════════════════════════════════════
+
+COMMAND_TO_PACKAGE: Dict[str, str] = {
+    # booktabs
+    "\\toprule": "booktabs",
+    "\\midrule": "booktabs",
+    "\\bottomrule": "booktabs",
+    "\\cmidrule": "booktabs",
+    "\\addlinespace": "booktabs",
+    # algorithm2e
+    "\\SetAlgoLined": "algorithm2e",
+    "\\KwIn": "algorithm2e",
+    "\\KwOut": "algorithm2e",
+    "\\KwResult": "algorithm2e",
+    # algorithmicx / algorithmic
+    "\\State": "algorithmicx",
+    "\\Require": "algorithmicx",
+    "\\Ensure": "algorithmicx",
+    # subfig / subcaption
+    "\\subfloat": "subfig",
+    "\\subcaptionbox": "subcaption",
+    # url / hyperref
+    "\\url": "url",
+    "\\href": "hyperref",
+    # xcolor
+    "\\textcolor": "xcolor",
+    "\\colorbox": "xcolor",
+    # multirow
+    "\\multirow": "multirow",
+    # natbib
+    "\\citep": "natbib",
+    "\\citet": "natbib",
+}
+
+# hyperref provides \url, so if hyperref is loaded, \url is available
+_PACKAGE_PROVIDES: Dict[str, List[str]] = {
+    "hyperref": ["url"],
+}
+
+
+def detect_missing_packages(
+    preamble: str, body: str
+) -> List[str]:
+    """
+    Detect LaTeX packages needed by commands in body but absent from preamble.
+    - **Args**:
+        - `preamble` (str): The LaTeX preamble text.
+        - `body` (str): The generated LaTeX body content.
+    - **Returns**:
+        - `List[str]`: Deduplicated list of missing package names.
+    """
+    loaded = set(PreambleParser.extract_packages(preamble))
+    for pkg, provides in _PACKAGE_PROVIDES.items():
+        if pkg in loaded:
+            loaded.update(provides)
+
+    missing: list[str] = []
+    for cmd, pkg in COMMAND_TO_PACKAGE.items():
+        if cmd in body and pkg not in loaded:
+            if pkg not in missing:
+                missing.append(pkg)
+    return missing
+
+
+def inject_missing_packages(
+    full_tex: str, packages: List[str]
+) -> List[str]:
+    """
+    Inject missing \\usepackage lines before \\begin{document}.
+    - **Args**:
+        - `full_tex` (str): Full LaTeX source.
+        - `packages` (List[str]): Package names to inject.
+    - **Returns**:
+        - `str`: Modified LaTeX source with packages injected.
+    """
+    if not packages:
+        return full_tex
+
+    already = set(PreambleParser.extract_packages(full_tex))
+    to_add = [p for p in packages if p not in already]
+    if not to_add:
+        return full_tex
+
+    injection = "\n".join(f"\\usepackage{{{p}}}" for p in to_add)
+    match = re.search(r"\\begin\{document\}", full_tex)
+    if match:
+        insert_pos = match.start()
+        return (
+            full_tex[:insert_pos].rstrip()
+            + "\n"
+            + injection
+            + "\n"
+            + full_tex[insert_pos:]
+        )
+    return full_tex + "\n" + injection
