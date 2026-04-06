@@ -3,6 +3,7 @@ import pytest
 
 from src.agents.shared.template_analyzer import (
     PreambleParser,
+    TemplateAnalyzer,
     TemplateWriterGuide,
 )
 
@@ -174,3 +175,70 @@ Hello world
         preamble = PreambleParser.extract_preamble(full_doc)
         assert r"\usepackage{booktabs}" in preamble
         assert r"\begin{document}" not in preamble
+
+
+# ── Task 3: TemplateAnalyzer — semantic guidance ─────────────────────────
+
+
+class TestTemplateAnalyzer:
+    def test_analyze_preamble_icml(self):
+        guide = TemplateAnalyzer.analyze_preamble(SAMPLE_PREAMBLE_ICML)
+        assert isinstance(guide, TemplateWriterGuide)
+        assert "booktabs" in guide.available_packages
+        assert "algorithm2e" in guide.available_packages
+        assert guide.citation_style == "citep"
+        assert "theorem" in guide.custom_environments
+        assert "\\toprule" in guide.table_guidance
+        assert "algorithm2e" in guide.algorithm_guidance.lower()
+
+    def test_analyze_preamble_no_booktabs_uses_hline(self):
+        guide = TemplateAnalyzer.analyze_preamble(SAMPLE_PREAMBLE_NATURE)
+        assert "booktabs" not in guide.available_packages
+        assert "\\hline" in guide.table_guidance
+
+    def test_analyze_preamble_double_column_figure_guidance(self):
+        guide = TemplateAnalyzer.analyze_preamble(SAMPLE_PREAMBLE_TWOCOL)
+        assert guide.column_format == "double"
+        assert "figure*" in guide.figure_guidance
+        assert "columnwidth" in guide.figure_guidance.lower()
+
+    def test_analyze_preamble_single_column_figure_guidance(self):
+        guide = TemplateAnalyzer.analyze_preamble(SAMPLE_PREAMBLE_NATURE)
+        assert guide.column_format == "single"
+        assert "linewidth" in guide.figure_guidance.lower()
+
+    def test_analyze_preamble_algorithm_none(self):
+        guide = TemplateAnalyzer.analyze_preamble(SAMPLE_PREAMBLE_NATURE)
+        assert guide.algorithm_guidance == ""
+
+    def test_analyze_preamble_custom_envs_in_math_guidance(self):
+        guide = TemplateAnalyzer.analyze_preamble(SAMPLE_PREAMBLE_ICML)
+        assert "theorem" in guide.math_guidance.lower()
+
+    def test_analyze_full_document(self):
+        full_doc = SAMPLE_PREAMBLE_ICML + r"""
+\begin{document}
+\maketitle
+Content here
+\end{document}
+"""
+        guide = TemplateAnalyzer.analyze_preamble(full_doc)
+        assert "booktabs" in guide.available_packages
+
+    def test_analyze_preamble_empty(self):
+        guide = TemplateAnalyzer.analyze_preamble("")
+        assert guide.available_packages == []
+        # Even empty preamble produces default guidance (negative constraints)
+        assert guide.figure_guidance != ""
+        assert guide.table_guidance != ""
+
+    def test_analyze_preamble_hyperref_constraint(self):
+        guide = TemplateAnalyzer.analyze_preamble(SAMPLE_PREAMBLE_NATURE)
+        assert "hyperref" not in guide.available_packages
+        assert "\\url" in guide.general_constraints or \
+               "\\href" in guide.general_constraints
+
+    def test_analyze_preamble_subfig_constraint(self):
+        guide = TemplateAnalyzer.analyze_preamble(SAMPLE_PREAMBLE_NATURE)
+        assert "subfigure" in guide.general_constraints.lower() or \
+               "subfloat" in guide.general_constraints.lower()

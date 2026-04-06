@@ -204,3 +204,185 @@ class PreambleParser:
         if "biblatex" in packages:
             return "autocite"
         return "cite"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Semantic guidance — rule-based mapping
+# ═══════════════════════════════════════════════════════════════════════════
+
+_TABLE_GUIDANCE_WITH_BOOKTABS = (
+    "Use \\toprule, \\midrule, and \\bottomrule for horizontal rules "
+    "(booktabs is available). Do NOT use \\hline."
+)
+_TABLE_GUIDANCE_WITHOUT_BOOKTABS = (
+    "Use \\hline for horizontal rules. Do NOT use \\toprule, \\midrule, "
+    "or \\bottomrule (booktabs is not available)."
+)
+
+_FIGURE_GUIDANCE_DOUBLE = (
+    "Single-column figures: use \\begin{figure}[htbp] with "
+    "width=\\columnwidth. "
+    "Full-width figures: use \\begin{figure*}[htbp] with "
+    "width=\\textwidth."
+)
+_FIGURE_GUIDANCE_SINGLE = (
+    "Use \\begin{figure}[htbp] with width=\\linewidth. "
+    "Do NOT use figure* (single-column layout)."
+)
+
+_ALGORITHM_GUIDANCE: Dict[str, str] = {
+    "algorithm2e": (
+        "Use algorithm2e syntax: \\begin{algorithm}, \\SetAlgoLined, "
+        "\\KwIn{}, \\KwOut{}, \\KwResult{}, \\If{}, \\While{}, \\For{}."
+    ),
+    "algorithmic": (
+        "Use algorithmic syntax: \\begin{algorithmic}, \\STATE, "
+        "\\IF, \\WHILE, \\FOR, \\RETURN."
+    ),
+    "algorithmicx": (
+        "Use algorithmicx syntax: \\begin{algorithmic}[1], \\State, "
+        "\\If, \\While, \\For, \\Return."
+    ),
+    "algorithm": (
+        "The algorithm package is loaded. Use \\begin{algorithm}[htbp] "
+        "as a float wrapper with algorithmic/algorithmicx inside."
+    ),
+}
+
+
+class TemplateAnalyzer:
+    """Analyze LaTeX template preambles and produce TemplateWriterGuide."""
+
+    @staticmethod
+    def analyze_preamble(preamble_or_full_tex: str) -> TemplateWriterGuide:
+        """
+        Analyze a LaTeX preamble (or full document) and produce a guide.
+        - **Args**:
+            - `preamble_or_full_tex` (str): Preamble text or full .tex source.
+        - **Returns**:
+            - `TemplateWriterGuide`: Structured guidance for Writer prompts.
+        """
+        preamble = PreambleParser.extract_preamble(preamble_or_full_tex)
+
+        packages = PreambleParser.extract_packages(preamble)
+        doc_class, _ = PreambleParser.extract_document_class(preamble)
+        column_format = PreambleParser.detect_column_format(preamble)
+        citation_style = PreambleParser.detect_citation_style(preamble)
+        custom_envs = PreambleParser.extract_custom_environments(preamble)
+        custom_cmds = PreambleParser.extract_custom_commands(preamble)
+
+        figure_guidance = (
+            _FIGURE_GUIDANCE_DOUBLE
+            if column_format == "double"
+            else _FIGURE_GUIDANCE_SINGLE
+        )
+
+        table_guidance = (
+            _TABLE_GUIDANCE_WITH_BOOKTABS
+            if "booktabs" in packages
+            else _TABLE_GUIDANCE_WITHOUT_BOOKTABS
+        )
+
+        algorithm_guidance = ""
+        for algo_pkg, guidance in _ALGORITHM_GUIDANCE.items():
+            if algo_pkg in packages:
+                algorithm_guidance = guidance
+                break
+
+        math_guidance = ""
+        if custom_envs:
+            math_guidance = (
+                f"Available theorem-like environments: "
+                f"{', '.join(custom_envs)}. "
+                f"You may use \\begin{{{custom_envs[0]}}}...\\end{{{custom_envs[0]}}} etc."
+            )
+
+        constraint_parts: list[str] = []
+        if citation_style == "citep":
+            constraint_parts.append(
+                "Use \\citep{} for parenthetical citations and "
+                "\\citet{} for textual citations (natbib loaded)."
+            )
+        elif citation_style == "autocite":
+            constraint_parts.append(
+                "Use \\autocite{} for citations (biblatex loaded)."
+            )
+        if "hyperref" not in packages:
+            constraint_parts.append(
+                "Do NOT use \\url{} or \\href{} (hyperref not loaded)."
+            )
+        if "subcaption" not in packages and "subfig" not in packages:
+            constraint_parts.append(
+                "Do NOT use \\begin{subfigure} or \\subfloat "
+                "(subcaption/subfig not loaded)."
+            )
+
+        return TemplateWriterGuide(
+            available_packages=packages,
+            document_class=doc_class,
+            column_format=column_format,
+            citation_style=citation_style,
+            custom_environments=custom_envs,
+            custom_commands=custom_cmds,
+            figure_guidance=figure_guidance,
+            table_guidance=table_guidance,
+            algorithm_guidance=algorithm_guidance,
+            math_guidance=math_guidance,
+            general_constraints="\n".join(constraint_parts),
+        )
+
+    @staticmethod
+    def analyze_zip(zip_path: str) -> TemplateWriterGuide:
+        """
+        Analyze a .zip template file and produce a TemplateWriterGuide.
+        - **Description**:
+            - Extracts the zip in-memory
+            - Finds main.tex (file containing \\documentclass and \\begin{document})
+            - Parses the preamble
+        - **Args**:
+            - `zip_path` (str): Path to .zip template file.
+        - **Returns**:
+            - `TemplateWriterGuide`: Guidance, or empty guide on failure.
+        """
+        if not zip_path or not os.path.exists(zip_path):
+            logger.warning("template_analyzer.zip_not_found path=%s", zip_path)
+            return TemplateWriterGuide()
+
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                tex_files = [
+                    n
+                    for n in zf.namelist()
+                    if n.endswith(".tex") and not n.startswith("__MACOSX")
+                ]
+                main_tex_content = None
+                for name in sorted(
+                    tex_files,
+                    key=lambda n: (
+                        0 if "main" in os.path.basename(n).lower() else
+                        1 if "paper" in os.path.basename(n).lower() else 2,
+                        n,
+                    ),
+                ):
+                    content = zf.read(name).decode("utf-8", errors="ignore")
+                    if (
+                        "\\documentclass" in content
+                        and "\\begin{document}" in content
+                    ):
+                        main_tex_content = content
+                        logger.info(
+                            "template_analyzer.found_main_tex file=%s", name
+                        )
+                        break
+
+                if not main_tex_content:
+                    logger.warning("template_analyzer.no_main_tex_in_zip")
+                    return TemplateWriterGuide()
+
+                return TemplateAnalyzer.analyze_preamble(main_tex_content)
+
+        except Exception as e:
+            logger.error(
+                "template_analyzer.zip_error path=%s error=%s", zip_path, e
+            )
+            return TemplateWriterGuide()
