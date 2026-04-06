@@ -344,6 +344,7 @@ class PaperGenerationResult(BaseModel):
         - `target_word_count` (int, optional): Target word count
         - `review_iterations` (int): Number of review iterations performed
         - `errors` (List[str]): List of errors
+        - `usage` (Dict, optional): Token consumption breakdown from UsageTracker
     """
     status: str  # 'ok', 'partial', 'error'
     paper_title: str = ""
@@ -355,6 +356,7 @@ class PaperGenerationResult(BaseModel):
     target_word_count: Optional[int] = None
     review_iterations: int = 0
     errors: List[str] = Field(default_factory=list)
+    usage: Optional[Dict[str, Any]] = None
 
 
 class CoreRefAnalysisItem(BaseModel):

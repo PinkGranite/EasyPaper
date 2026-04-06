@@ -155,6 +155,72 @@ def clear_llm_progress_context() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Contextvars-based usage tracking
+# ---------------------------------------------------------------------------
+
+_usage_ctx: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "llm_usage_tracker", default=None
+)
+
+
+def set_usage_tracker_context(
+    tracker: Any,
+    agent: str = "",
+    phase: str = "",
+    section: str = "",
+) -> None:
+    """
+    Activate automatic token-usage recording for every LLM call.
+
+    - **Description**:
+        - Stores a ``UsageTracker`` instance plus agent/phase/section metadata
+          in a contextvar.  ``_CompletionsProxy.create()`` reads this after
+          each call to append an ``LLMCallRecord``.
+
+    - **Args**:
+        - `tracker` (UsageTracker): Accumulator for the current session.
+        - `agent` (str): Default agent name for recorded calls.
+        - `phase` (str): Default pipeline phase.
+        - `section` (str): Default section type.
+    """
+    _usage_ctx.set({
+        "tracker": tracker,
+        "agent": agent,
+        "phase": phase,
+        "section": section,
+    })
+
+
+def update_usage_tracker_context(
+    *,
+    agent: Optional[str] = None,
+    phase: Optional[str] = None,
+    section: Optional[str] = None,
+) -> None:
+    """
+    Update metadata fields on the active usage-tracker context.
+
+    - **Description**:
+        - Allows callers to change agent/phase/section without replacing
+          the tracker itself (e.g. when switching from planning to generation).
+    """
+    ctx = _usage_ctx.get(None)
+    if ctx is None:
+        return
+    if agent is not None:
+        ctx["agent"] = agent
+    if phase is not None:
+        ctx["phase"] = phase
+    if section is not None:
+        ctx["section"] = section
+
+
+def clear_usage_tracker_context() -> None:
+    """Clear the usage-tracker context."""
+    _usage_ctx.set(None)
+
+
+# ---------------------------------------------------------------------------
 # Transparent AsyncOpenAI wrapper
 # ---------------------------------------------------------------------------
 
@@ -184,6 +250,31 @@ class _CompletionsProxy:
                 except (AttributeError, TypeError):
                     pass
 
+        # --- Usage tracking ---
+        usage_ctx = _usage_ctx.get(None)
+        if usage_ctx and usage_ctx.get("tracker"):
+            try:
+                from .usage_tracker import LLMCallRecord
+
+                usage = getattr(response, "usage", None)
+                prompt_tok = getattr(usage, "prompt_tokens", 0) or 0 if usage else 0
+                comp_tok = getattr(usage, "completion_tokens", 0) or 0 if usage else 0
+                total_tok = getattr(usage, "total_tokens", 0) or 0 if usage else 0
+
+                usage_ctx["tracker"].record(LLMCallRecord(
+                    agent=usage_ctx.get("agent", ""),
+                    phase=usage_ctx.get("phase", ""),
+                    section_type=usage_ctx.get("section", ""),
+                    model=kwargs.get("model", ""),
+                    prompt_tokens=prompt_tok,
+                    completion_tokens=comp_tok,
+                    total_tokens=total_tok,
+                    latency_ms=round(latency * 1000, 1),
+                ))
+            except Exception:
+                pass
+
+        # --- Progress event emission ---
         ctx = _progress_ctx.get(None)
         if ctx and ctx.get("callback"):
             try:

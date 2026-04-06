@@ -42,7 +42,14 @@ from pydantic import BaseModel
 from fastapi import APIRouter
 
 from .progress import ProgressEmitter, ProgressCallback, EventType, Phase
-from ..shared.llm_client import set_llm_progress_context, clear_llm_progress_context
+from ..shared.llm_client import (
+    set_llm_progress_context,
+    clear_llm_progress_context,
+    set_usage_tracker_context,
+    update_usage_tracker_context,
+    clear_usage_tracker_context,
+)
+from ..shared.usage_tracker import UsageTracker
 from ..react_base import ReActAgent
 from ...config.schema import ModelConfig, ToolsConfig
 from ..shared.reference_pool import ReferencePool
@@ -1815,6 +1822,9 @@ class MetaDataAgent(ReActAgent):
         set_llm_progress_context(emitter, agent="MetaDataAgent")
         await emitter.generation_started(title=metadata.title, target_pages=target_pages)
 
+        usage_tracker = UsageTracker()
+        set_usage_tracker_context(usage_tracker, agent="MetaDataAgent", phase="generation")
+
         _sa = partial(self._save_artifact, artifacts_prefix=artifacts_prefix)
 
         sections_results: List[SectionResult] = []
@@ -1887,6 +1897,7 @@ class MetaDataAgent(ReActAgent):
                 return PaperGenerationResult(
                     status="error", paper_title=metadata.title,
                     sections=sections_results, errors=errors,
+                    usage=usage_tracker.to_dict(),
                 )
 
             if paper_plan and paper_plan.contributions:
@@ -2049,6 +2060,7 @@ class MetaDataAgent(ReActAgent):
                 output_path=output_path, pdf_path=pdf_path,
                 total_word_count=total_words, target_word_count=target_word_count,
                 review_iterations=review_iterations, errors=errors,
+                usage=usage_tracker.to_dict(),
             )
             await emitter.completed(
                 status=status, total_words=total_words,
@@ -2065,8 +2077,10 @@ class MetaDataAgent(ReActAgent):
             return PaperGenerationResult(
                 status="error", paper_title=metadata.title,
                 sections=sections_results, errors=[str(e)],
+                usage=usage_tracker.to_dict(),
             )
         finally:
+            clear_usage_tracker_context()
             clear_llm_progress_context()
 
     # ------------------------------------------------------------------
