@@ -1791,6 +1791,16 @@ class MetaDataAgent(ReActAgent):
         if plan_result.evidence_dag:
             evidence_dag = EvidenceDAG.from_serializable(plan_result.evidence_dag)
 
+        # Reconstruct ExemplarAnalysis for prompt guidance
+        from .models import ExemplarAnalysis as _ExemplarAnalysis
+        from ..shared.exemplar_analyzer import ExemplarAnalyzer as _ExemplarAnalyzerCls
+        _exemplar_analysis: Optional[_ExemplarAnalysis] = None
+        if plan_result.exemplar_analysis:
+            try:
+                _exemplar_analysis = _ExemplarAnalysis(**plan_result.exemplar_analysis)
+            except Exception:
+                _exemplar_analysis = None
+
         # Resolve output directory
         if output_dir:
             paper_dir: Optional[Path] = Path(output_dir)
@@ -1844,6 +1854,7 @@ class MetaDataAgent(ReActAgent):
                 figures=metadata.figures, tables=metadata.tables,
                 code_context=code_context, research_context=research_context,
                 prompt_traces=prompt_traces, memory=memory, evidence_dag=evidence_dag,
+                exemplar_guidance=_ExemplarAnalyzerCls.format_for_prompt(_exemplar_analysis, "introduction"),
             )
             sections_results.append(intro_result)
             print(f"[MetaDataAgent] After introduction: {ref_pool.summary()}")
@@ -1899,6 +1910,7 @@ class MetaDataAgent(ReActAgent):
                         code_context=code_context, research_context=research_context,
                         prompt_traces=prompt_traces, memory=memory, evidence_dag=evidence_dag,
                         emitter=emitter,
+                        exemplar_guidance=_ExemplarAnalyzerCls.format_for_prompt(_exemplar_analysis, section_type),
                     )
                 except Exception as e:
                     result = SectionResult(section_type=section_type, status="error", error=str(e))
@@ -1935,6 +1947,7 @@ class MetaDataAgent(ReActAgent):
                 style_guide=metadata.style_guide,
                 section_plan=paper_plan.get_section("abstract") if paper_plan else None,
                 prompt_traces=prompt_traces, memory=memory,
+                exemplar_guidance=_ExemplarAnalyzerCls.format_for_prompt(_exemplar_analysis, "abstract"),
             )
             sections_results.insert(0, abstract_result)
             if abstract_result.status == "ok":
@@ -1955,6 +1968,7 @@ class MetaDataAgent(ReActAgent):
                     style_guide=metadata.style_guide,
                     section_plan=paper_plan.get_section("conclusion") if paper_plan else None,
                     prompt_traces=prompt_traces, memory=memory,
+                    exemplar_guidance=_ExemplarAnalyzerCls.format_for_prompt(_exemplar_analysis, "conclusion"),
                 )
                 sections_results.append(conclusion_result)
                 if conclusion_result.status == "ok":
@@ -2068,6 +2082,7 @@ class MetaDataAgent(ReActAgent):
         enable_review: bool = True,
         max_review_iterations: int = 3,
         enable_planning: bool = True,
+        enable_exemplar: bool = False,
         enable_vlm_review: bool = False,
         enable_user_feedback: bool = False,
         progress_callback: Optional[ProgressCallback] = None,
@@ -2087,6 +2102,7 @@ class MetaDataAgent(ReActAgent):
             template_path=template_path,
             target_pages=target_pages,
             enable_planning=enable_planning,
+            enable_exemplar=enable_exemplar,
             save_output=save_output,
             output_dir=output_dir,
             progress_callback=progress_callback,
@@ -2164,6 +2180,7 @@ class MetaDataAgent(ReActAgent):
         prompt_traces: Optional[List[Dict[str, Any]]] = None,
         memory: Optional[SessionMemory] = None,
         evidence_dag: Optional[EvidenceDAG] = None,
+        exemplar_guidance: Optional[str] = None,
     ) -> SectionResult:
         """
         Generate Introduction section — delegates to WriterAgent.
@@ -2226,6 +2243,7 @@ class MetaDataAgent(ReActAgent):
                     or getattr(self.tools_config, "writer_structure_contract_enabled", True)
                 ),
                 template_guide=template_guide,
+                exemplar_guidance=exemplar_guidance or None,
             )
             if prompt_traces is not None:
                 prompt_traces.append(
@@ -2305,6 +2323,7 @@ class MetaDataAgent(ReActAgent):
         memory: Optional[SessionMemory] = None,
         evidence_dag: Optional[EvidenceDAG] = None,
         emitter: Optional[ProgressEmitter] = None,
+        exemplar_guidance: Optional[str] = None,
     ) -> SectionResult:
         """
         Generate a body section using two-phase pattern.
@@ -2400,6 +2419,7 @@ class MetaDataAgent(ReActAgent):
                     or getattr(self.tools_config, "writer_structure_contract_enabled", True)
                 ),
                 template_guide=template_guide,
+                exemplar_guidance=exemplar_guidance or None,
             )
             if prompt_traces is not None:
                 prompt_traces.append(
@@ -2584,6 +2604,7 @@ class MetaDataAgent(ReActAgent):
                     paragraph_index=pidx,
                     total_paragraphs=total_paras,
                     template_guide=template_guide,
+                    exemplar_guidance=exemplar_guidance or None,
                 )
 
                 para_result = await self._writer.generate_paragraph(
@@ -2698,6 +2719,7 @@ class MetaDataAgent(ReActAgent):
         section_plan: Optional[SectionPlan] = None,
         prompt_traces: Optional[List[Dict[str, Any]]] = None,
         memory: Optional[SessionMemory] = None,
+        exemplar_guidance: Optional[str] = None,
     ) -> SectionResult:
         """Generate synthesis section (Abstract or Conclusion) via WriterAgent."""
         try:
@@ -2713,6 +2735,7 @@ class MetaDataAgent(ReActAgent):
                 active_skills=self._get_active_skills(section_type, style_guide),
                 memory_context=memory_context,
                 template_guide=template_guide,
+                exemplar_guidance=exemplar_guidance or None,
             )
             if prompt_traces is not None:
                 prompt_traces.append(

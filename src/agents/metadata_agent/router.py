@@ -67,6 +67,7 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
                 enable_review=request.enable_review,
                 max_review_iterations=request.max_review_iterations,
                 enable_planning=request.enable_planning,
+                enable_exemplar=request.enable_exemplar,
                 enable_vlm_review=request.enable_vlm_review,
             )
             return result
@@ -112,6 +113,7 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
                     enable_review=request.enable_review,
                     max_review_iterations=request.max_review_iterations,
                     enable_planning=request.enable_planning,
+                    enable_exemplar=request.enable_exemplar,
                     enable_vlm_review=request.enable_vlm_review,
                     enable_user_feedback=request.enable_user_feedback,
                     progress_callback=progress_callback,
@@ -180,6 +182,7 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
                 template_path=request.template_path,
                 target_pages=request.target_pages,
                 enable_planning=request.enable_planning,
+                enable_exemplar=request.enable_exemplar,
                 save_output=request.save_output,
                 output_dir=request.output_dir,
                 artifacts_prefix=request.artifacts_prefix or "",
