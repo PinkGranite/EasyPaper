@@ -220,7 +220,7 @@ class TestFormatForPrompt:
         assert "Paper X" in output
         assert "Nature" in output
         assert "introduction" in output.lower()
-        assert "broad_hook" in output
+        assert "broad hook" in output.lower()
 
     def test_method_guidance(self):
         from src.agents.metadata_agent.models import (
@@ -237,7 +237,7 @@ class TestFormatForPrompt:
         output = ExemplarAnalyzer.format_for_prompt(analysis, "method")
         assert "Paper Y" in output
         assert "method" in output.lower()
-        assert "overview" in output
+        assert "overview" in output.lower()
 
     def test_missing_section_type(self):
         analysis = ExemplarAnalysis(

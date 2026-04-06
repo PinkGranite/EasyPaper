@@ -1313,12 +1313,14 @@ class MetaDataAgent(ReActAgent):
             if docling_cfg and docling_cfg.enabled:
                 print("[MetaDataAgent] Phase 0-docling: Deep reference analysis with Docling...")
                 try:
-                    from ..shared.docling_enricher import DoclingEnricher
+                    from ..shared.docling_service import DoclingService
 
                     docling_temp_dir = (paper_dir or Path(tempfile.mkdtemp())) / "_docling_tmp"
-                    enricher = DoclingEnricher(docling_cfg)
-                    ref_pool._core_refs = await enricher.enrich_core_refs(
-                        ref_pool._core_refs, docling_temp_dir,
+                    docling_svc = DoclingService(config=docling_cfg)
+                    ref_pool._core_refs = await docling_svc.enrich_refs(
+                        ref_pool._core_refs,
+                        dest_dir=docling_temp_dir,
+                        cleanup=False,
                     )
                     docling_count = sum(
                         1 for r in ref_pool._core_refs if r.get("docling_sections")
@@ -1349,13 +1351,11 @@ class MetaDataAgent(ReActAgent):
                 try:
                     from ..shared.exemplar_selector import ExemplarSelector
                     from ..shared.exemplar_analyzer import ExemplarAnalyzer
-                    from ..shared.docling_analyzer import DoclingPaperAnalyzer
+                    from ..shared.docling_service import DoclingService as _DocSvc
 
                     if metadata.exemplar_paper_path:
-                        analyzer_inst = DoclingPaperAnalyzer(
-                            config=docling_cfg if docling_cfg else None,
-                        )
-                        parsed = analyzer_inst.parse(Path(metadata.exemplar_paper_path))
+                        _dsvc = _DocSvc(config=docling_cfg if docling_cfg else None)
+                        parsed = _dsvc.parse_pdf(metadata.exemplar_paper_path)
                         exemplar_analyzer = ExemplarAnalyzer(
                             self.client, self.model_name,
                             max_chars=exemplar_cfg.max_analysis_chars,
