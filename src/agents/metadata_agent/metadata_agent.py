@@ -3623,6 +3623,9 @@ class MetaDataAgent(ReActAgent):
         _converted = converted_tables or {}
         known_ids = set(_converted.keys())
 
+        print(f"[DirectInject] Starting: {len(_converted)} converted tables, "
+              f"sections={list(generated_sections.keys())}")
+
         for section in paper_plan.sections:
             section_type = section.section_type
             if section_type not in generated_sections:
@@ -3631,6 +3634,8 @@ class MetaDataAgent(ReActAgent):
             tables_to_define = section.get_table_ids_to_define()
             if not tables_to_define:
                 continue
+
+            print(f"[DirectInject] Section '{section_type}' has tables_to_define={tables_to_define}")
 
             content = generated_sections[section_type]
 
@@ -3641,6 +3646,9 @@ class MetaDataAgent(ReActAgent):
                     print(f"[DirectInject] Stripped Writer tables {stripped_ids} in '{section_type}'")
 
             result = inject_tables(stripped, section, tables, _converted)
+            if result != stripped:
+                print(f"[DirectInject] Injected tables in '{section_type}' "
+                      f"(content grew {len(stripped)}->{len(result)} chars)")
             generated_sections[section_type] = result
 
         return generated_sections
