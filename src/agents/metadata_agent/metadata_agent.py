@@ -4055,9 +4055,9 @@ class MetaDataAgent(ReActAgent):
 
             # Promote wide tables to table* in double-column templates
             if ts_template_config.column_format == "double":
-                from ..typesetter_agent.typesetter_agent import TypesetterAgent as _TA
+                from ..shared.table_converter import smart_promote_wide_tables
                 for sec_type in list(generated_sections.keys()):
-                    generated_sections[sec_type] = _TA._promote_wide_tables(
+                    generated_sections[sec_type] = smart_promote_wide_tables(
                         generated_sections[sec_type]
                     )
 
