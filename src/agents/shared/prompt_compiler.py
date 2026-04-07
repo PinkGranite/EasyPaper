@@ -478,12 +478,31 @@ def _format_figure_placement_guidance(section_plan: Any, figures: List[Any]) -> 
     return "\n".join(parts)
 
 
+_TABLE_DATA_CHARS = 1500
+
+
 def _format_table_placement_guidance(
     section_plan: Any,
     tables: List[Any],
     converted_tables: Optional[Dict[str, str]] = None,
 ) -> str:
-    """Format table placement guidance using TablePlacement semantics."""
+    """
+    Format table guidance for the Writer under direct-injection mode.
+    - **Description**:
+        - Tables are auto-injected into sections post-generation, so the Writer
+          must NOT create \\begin{table} environments.
+        - Instead the Writer sees raw data (CSV/Markdown) for writing accurate
+          discussion prose and uses Table~\\ref{tab:id} to reference them.
+
+    - **Args**:
+        - `section_plan`: Section plan with table placements.
+        - `tables` (List): Table specifications.
+        - `converted_tables` (Dict[str, str], optional): Ignored for prompt
+          content; tables are injected post-generation.
+
+    - **Returns**:
+        - `str`: Formatted guidance string.
+    """
     placements = getattr(section_plan, "tables", None)
     if not placements:
         return ""
@@ -494,10 +513,14 @@ def _format_table_placement_guidance(
         if tbl_id:
             table_map[tbl_id] = tbl
 
-    _converted = converted_tables or {}
     tables_to_reference = set(getattr(section_plan, "tables_to_reference", []) or [])
-    parts = ["\n## Tables to DEFINE in this section"]
-    parts.append("**Include the complete table environment for each table below.**\n")
+
+    parts = [
+        "\n## Tables in this section (auto-injected — DO NOT create \\begin{table})",
+        "The following tables will be **automatically placed** near their first `Table~\\ref{}`.",
+        "Your job: write discussion prose referencing them with `Table~\\ref{tab:id}`.",
+        "**DO NOT** create `\\begin{table}` or `\\begin{table*}` environments — they are auto-injected.\n",
+    ]
     overlaps = []
 
     for tp in placements:
@@ -512,31 +535,27 @@ def _format_table_placement_guidance(
         caption = tbl.caption if hasattr(tbl, "caption") else tbl.get("caption", "")
         desc = tbl.description if hasattr(tbl, "description") else tbl.get("description", "")
         wide = tp.is_wide
-        env_name = "table*" if wide else "table"
 
         parts.append(f"- **{tbl_id}**: {caption}")
+        parts.append(f"  Reference with: `Table~\\ref{{{tbl_id}}}`")
         if desc:
             parts.append(f"  Description: {desc}")
         if tp.message:
             parts.append(f"  Message: {tp.message}")
         if wide:
-            parts.append(f"  **Note: WIDE table - use {env_name} to span both columns.**")
+            parts.append(f"  Note: WIDE table (spans both columns).")
         parts.append(f"  Position: {tp.position_hint} in the section")
 
-        if tbl_id in _converted:
-            parts.append(f"  **Required LaTeX (include this exact table):**")
-            parts.append(f"  ```latex")
-            rendered = _converted[tbl_id]
-            if len(rendered) > PROMPT_BUDGETS["table_latex_chars"]:
-                rendered = _truncate_text(rendered, PROMPT_BUDGETS["table_latex_chars"])
-                parts.append("  % Table LaTeX truncated for prompt budget; preserve label/caption semantics.")
-            parts.append(f"  {rendered}")
-            parts.append(f"  ```\n")
-        else:
-            content = tbl.content if hasattr(tbl, "content") else tbl.get("content", "")
-            if content:
-                parts.append(f"  Data:\n  {content[:500]}")
-            parts.append(f"  **Required: Create \\\\begin{{{env_name}}}...\\\\end{{{env_name}}} with \\\\label{{{tbl_id}}}**\n")
+        content = tbl.content if hasattr(tbl, "content") else tbl.get("content", "")
+        if content:
+            truncated = content[:_TABLE_DATA_CHARS]
+            parts.append(f"  Data for your reference (use these values in your discussion):")
+            parts.append(f"  ```")
+            parts.append(f"  {truncated}")
+            if len(content) > _TABLE_DATA_CHARS:
+                parts.append(f"  ... (truncated, full table auto-injected)")
+            parts.append(f"  ```")
+        parts.append("")
 
     if overlaps:
         parts.append(

@@ -3596,106 +3596,52 @@ class MetaDataAgent(ReActAgent):
         converted_tables: Optional[Dict[str, str]] = None,
     ) -> Dict[str, str]:
         """
-        Ensure all tables assigned for definition have their environments created.
+        Direct-injection pipeline: strip Writer-generated tables, then inject
+        pre-converted tables at the first \\ref location.
         - **Description**:
-            - Mirrors _ensure_figures_defined for tables.
-            - If a table is in section_plan.tables_to_define but no \\begin{table}
-              exists with matching label, inject the table environment using
-              pre-converted LaTeX from converted_tables when available.
+            - Step 1: Strip any table environments the Writer created for tables
+              that have pre-converted LaTeX (defensive).
+            - Step 2: Inject the authoritative pre-converted table at the first
+              ``Table~\\ref{tab:id}`` in each assigned section.
+            - This replaces the old "safety-net" approach; tables are now
+              always injected from the converted pool, never left to the Writer.
 
         - **Args**:
-            - `generated_sections` (Dict[str, str]): Section contents keyed by type
-            - `paper_plan` (Optional[PaperPlan]): Paper plan with table assignments
-            - `tables` (Optional[List[TableSpec]]): Table specifications
-            - `converted_tables` (Optional[Dict[str, str]]): table_id -> LaTeX code
+            - `generated_sections` (Dict[str, str]): Section contents keyed by type.
+            - `paper_plan` (Optional[PaperPlan]): Paper plan with table assignments.
+            - `tables` (Optional[List[TableSpec]]): Table specifications.
+            - `converted_tables` (Optional[Dict[str, str]]): table_id -> LaTeX code.
 
         - **Returns**:
-            - `generated_sections` (Dict[str, str]): Updated sections dict
+            - `generated_sections` (Dict[str, str]): Updated sections dict.
         """
-        import re
+        from ..shared.table_converter import strip_writer_tables, inject_tables
 
         if not paper_plan or not tables:
             return generated_sections
 
         _converted = converted_tables or {}
-
-        # Build table lookup
-        table_map = {tbl.id: tbl for tbl in tables}
-
-        # Pre-scan ALL sections to find which tables are already defined
-        # (prevents re-injecting tables moved to appendix)
-        globally_defined_tables: set = set()
-        all_content = "\n".join(generated_sections.values())
-        for tbl in tables:
-            tbl_pattern = rf'\\begin{{table\*?}}.*?\\label{{{re.escape(tbl.id)}}}.*?\\end{{table\*?}}'
-            if re.search(tbl_pattern, all_content, re.DOTALL):
-                globally_defined_tables.add(tbl.id)
+        known_ids = set(_converted.keys())
 
         for section in paper_plan.sections:
             section_type = section.section_type
-            tables_to_define = section.get_table_ids_to_define()
+            if section_type not in generated_sections:
+                continue
 
-            if not tables_to_define or section_type not in generated_sections:
+            tables_to_define = section.get_table_ids_to_define()
+            if not tables_to_define:
                 continue
 
             content = generated_sections[section_type]
 
-            for tbl_id in tables_to_define:
-                tbl = table_map.get(tbl_id)
-                if not tbl:
-                    continue
+            stripped = strip_writer_tables(content, known_ids)
+            if stripped != content:
+                stripped_ids = known_ids & set(tables_to_define)
+                if stripped_ids:
+                    print(f"[DirectInject] Stripped Writer tables {stripped_ids} in '{section_type}'")
 
-                # Skip if already defined anywhere in the paper
-                if tbl_id in globally_defined_tables:
-                    continue
-
-                # Table not defined — inject it
-                print(f"[EnsureTables] Injecting missing table '{tbl_id}' in '{section_type}'")
-
-                env_name = "table*" if tbl.wide else "table"
-
-                if tbl_id in _converted:
-                    # Use pre-converted LaTeX (best quality)
-                    table_latex = _converted[tbl_id]
-                    # Ensure it has a \label
-                    if f"\\label{{{tbl_id}}}" not in table_latex:
-                        # Insert label before \end{table...}
-                        label_str = f"\\label{{{tbl_id}}}"
-                        table_latex = re.sub(
-                            rf'(\\end{{{env_name}}})',
-                            lambda m: f"{label_str}\n{m.group(1)}",
-                            table_latex,
-                        )
-                else:
-                    # Generate a placeholder table
-                    caption = tbl.caption or tbl_id
-                    table_latex = (
-                        f"\\begin{{{env_name}}}[htbp]\n"
-                        f"\\centering\n"
-                        f"\\caption{{{caption}}}\\label{{{tbl_id}}}\n"
-                        f"\\begin{{tabular}}{{lcc}}\n"
-                        f"\\hline\n"
-                        f"Column 1 & Column 2 & Column 3 \\\\\n"
-                        f"\\hline\n"
-                        f"-- & -- & -- \\\\\n"
-                        f"\\hline\n"
-                        f"\\end{{tabular}}\n"
-                        f"\\end{{{env_name}}}"
-                    )
-
-                # Find a good insertion point:
-                # 1. After a sentence referencing this table
-                # 2. Or at the end of the section
-                ref_pattern = rf'(Table~?\\ref{{{re.escape(tbl_id)}}}[^.]*\.)'
-                match = re.search(ref_pattern, content)
-                if match:
-                    insert_pos = match.end()
-                    content = content[:insert_pos] + "\n" + table_latex + "\n" + content[insert_pos:]
-                else:
-                    # Append at the end of the section
-                    content = content + "\n" + table_latex + "\n"
-
-                generated_sections[section_type] = content
+            result = inject_tables(stripped, section, tables, _converted)
+            generated_sections[section_type] = result
 
         return generated_sections
 

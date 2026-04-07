@@ -974,3 +974,130 @@ async def convert_tables(
     )
 
     return converted
+
+
+# =========================================================================
+# Direct-injection helpers (post-Writer processing)
+# =========================================================================
+
+def strip_writer_tables(content: str, known_table_ids: set) -> str:
+    """
+    Remove \\begin{table}...\\end{table} blocks whose \\label matches a known ID.
+    - **Description**:
+        - Under the direct-injection model the Writer is told NOT to create table
+          environments, but may still do so.  This function defensively strips
+          any Writer-generated table environments for tables that will be
+          injected from the pre-converted pool.
+        - Tables whose label is NOT in *known_table_ids* are preserved (the Writer
+          may legitimately create ad-hoc tables not in the metadata).
+
+    - **Args**:
+        - `content` (str): Section LaTeX content from the Writer.
+        - `known_table_ids` (set): Table IDs that will be injected later.
+
+    - **Returns**:
+        - `str`: Content with matching table environments removed.
+    """
+    if not known_table_ids:
+        return content
+
+    for tbl_id in known_table_ids:
+        escaped_id = re.escape(tbl_id)
+        for env in ("table*", "table"):
+            esc_env = re.escape(env)
+            pattern = re.compile(
+                rf'\\begin{{{esc_env}}}.*?\\label{{{escaped_id}}}.*?\\end{{{esc_env}}}\s*',
+                re.DOTALL,
+            )
+            content = pattern.sub('', content)
+
+    return content.strip() if content.strip() else content
+
+
+def inject_tables(
+    content: str,
+    section_plan,
+    tables,
+    converted_tables: dict,
+) -> str:
+    """
+    Inject pre-converted table environments at the first \\ref location.
+    - **Description**:
+        - For each table assigned to this section (via section_plan), finds the
+          first ``Table~\\ref{tab:id}`` in the content and inserts the full
+          table environment after the enclosing sentence.
+        - If no \\ref is found, appends the table at the end.
+        - Skips tables already defined in the content.
+        - Ensures every injected table has a \\label.
+
+    - **Args**:
+        - `content` (str): Section LaTeX content (post strip_writer_tables).
+        - `section_plan`: Section plan with ``get_table_ids_to_define()``.
+        - `tables` (list): Table specifications (TableSpec or SimpleNamespace).
+        - `converted_tables` (dict): table_id -> LaTeX code.
+
+    - **Returns**:
+        - `str`: Content with tables injected.
+    """
+    tables_to_define = section_plan.get_table_ids_to_define()
+    if not tables_to_define:
+        return content
+
+    table_map = {}
+    for tbl in (tables or []):
+        tbl_id = tbl.id if hasattr(tbl, "id") else tbl.get("id", "")
+        if tbl_id:
+            table_map[tbl_id] = tbl
+
+    _converted = converted_tables or {}
+
+    for tbl_id in tables_to_define:
+        tbl = table_map.get(tbl_id)
+        if not tbl:
+            continue
+
+        already_pattern = re.compile(
+            rf'\\begin{{table\*?}}.*?\\label{{{re.escape(tbl_id)}}}.*?\\end{{table\*?}}',
+            re.DOTALL,
+        )
+        if already_pattern.search(content):
+            continue
+
+        env_name = "table*" if getattr(tbl, "wide", False) else "table"
+
+        if tbl_id in _converted:
+            table_latex = _converted[tbl_id]
+            if f"\\label{{{tbl_id}}}" not in table_latex:
+                label_str = f"\\label{{{tbl_id}}}"
+                table_latex = re.sub(
+                    rf'(\\end{{{env_name}}})',
+                    lambda m, ls=label_str: f"{ls}\n{m.group(1)}",
+                    table_latex,
+                )
+        else:
+            caption = getattr(tbl, "caption", "") or tbl_id
+            table_latex = (
+                f"\\begin{{{env_name}}}[htbp]\n"
+                f"\\centering\n"
+                f"\\caption{{{caption}}}\\label{{{tbl_id}}}\n"
+                f"\\begin{{tabular}}{{lcc}}\n"
+                f"\\hline\n"
+                f"Column 1 & Column 2 & Column 3 \\\\\n"
+                f"\\hline\n"
+                f"-- & -- & -- \\\\\n"
+                f"\\hline\n"
+                f"\\end{{tabular}}\n"
+                f"\\end{{{env_name}}}"
+            )
+
+        ref_pattern = re.compile(
+            rf'(Table~?\\ref{{{re.escape(tbl_id)}}}[^.]*\.)',
+        )
+        match = ref_pattern.search(content)
+        if match:
+            insert_pos = match.end()
+            content = content[:insert_pos] + "\n" + table_latex + "\n" + content[insert_pos:]
+        else:
+            content = content + "\n" + table_latex + "\n"
+
+    return content
