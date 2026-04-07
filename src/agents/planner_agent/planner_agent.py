@@ -3146,6 +3146,158 @@ class PlannerAgent(BaseAgent):
                 ))
                 tables_defined.add(tbl_id)
 
+    @staticmethod
+    def _build_assignment_prompt(
+        plan: Any,
+        figures: Dict[str, Any],
+        tables: Dict[str, Any],
+    ) -> str:
+        """
+        Build an LLM prompt for assigning figures/tables to sections.
+        - **Args**:
+            - `plan`: PaperPlan with sections.
+            - `figures` (dict): figure_id -> element info.
+            - `tables` (dict): table_id -> element info.
+        - **Returns**:
+            - `str`: LLM prompt text.
+        """
+        lines: List[str] = [
+            "You are an academic paper layout expert.",
+            "Assign each figure and table to the BEST section for its content.",
+            "",
+            "## Available Sections",
+        ]
+        for sec in plan.sections:
+            title = getattr(sec, "section_title", "") or sec.section_type
+            key_points = []
+            for p in getattr(sec, "paragraphs", [])[:2]:
+                kp = getattr(p, "key_point", "")
+                if kp:
+                    key_points.append(kp)
+            kp_str = "; ".join(key_points) if key_points else ""
+            lines.append(f"- **{sec.section_type}** ({title}): {kp_str}")
+
+        lines.append("")
+        lines.append("## Elements to Assign")
+
+        for fid, info in figures.items():
+            cap = getattr(info, "caption", "") if hasattr(info, "caption") else ""
+            desc = getattr(info, "description", "") if hasattr(info, "description") else ""
+            lines.append(f"- {fid}: caption=\"{cap}\", description=\"{desc}\"")
+
+        for tid, info in tables.items():
+            cap = getattr(info, "caption", "") if hasattr(info, "caption") else ""
+            desc = getattr(info, "description", "") if hasattr(info, "description") else ""
+            lines.append(f"- {tid}: caption=\"{cap}\", description=\"{desc}\"")
+
+        lines.append("")
+        lines.append("## Rules")
+        lines.append("- Performance/comparison tables -> result or experiment sections")
+        lines.append("- Ablation tables -> analysis or result sections")
+        lines.append("- Architecture/method figures -> method section")
+        lines.append("- Dataset/statistics tables -> experiment section")
+        lines.append("- Spread elements evenly; max 3 per section")
+        lines.append("- Use ONLY the section_type values listed above")
+        lines.append("")
+        lines.append("## Output")
+        lines.append("Return a JSON object mapping element IDs to section_type values.")
+        lines.append("Example: {\"fig:arch\": \"method\", \"tab:results\": \"result\"}")
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _parse_element_assignment(
+        llm_response: str,
+        elements: Dict[str, Any],
+        plan: Any,
+        max_per_section: int = 3,
+    ) -> Dict[str, str]:
+        """
+        Parse LLM response into element->section_type mapping with validation.
+        - **Description**:
+            - Falls back to keyword-based heuristic when LLM response is
+              invalid or assigns elements to nonexistent sections.
+            - Enforces capacity limits per section.
+
+        - **Args**:
+            - `llm_response` (str): Raw LLM JSON response.
+            - `elements` (dict): element_id -> element info.
+            - `plan`: PaperPlan with sections.
+            - `max_per_section` (int): Maximum elements per section.
+
+        - **Returns**:
+            - `dict`: element_id -> section_type mapping.
+        """
+        valid_types = {s.section_type for s in plan.sections}
+
+        assignment: Dict[str, str] = {}
+        try:
+            parsed = json.loads(llm_response)
+            if isinstance(parsed, dict):
+                assignment = parsed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        section_counts: Dict[str, int] = {st: 0 for st in valid_types}
+        result: Dict[str, str] = {}
+
+        def _keyword_fallback(eid: str, info: Any) -> str:
+            text = (
+                (getattr(info, "id", "") if hasattr(info, "id") else "")
+                + " " + (getattr(info, "caption", "") if hasattr(info, "caption") else "")
+                + " " + (getattr(info, "description", "") if hasattr(info, "description") else "")
+            ).lower()
+
+            hint_map = {
+                "architecture": "method", "framework": "method",
+                "pipeline": "method", "model": "method",
+                "overview": "method",
+                "performance": "result", "comparison": "result",
+                "ablation": "result", "result": "result",
+                "accuracy": "result", "benchmark": "result",
+                "dataset": "experiment", "statistics": "experiment",
+                "hyperparameter": "experiment", "setup": "experiment",
+            }
+
+            for sec in plan.sections:
+                search_text = (
+                    sec.section_type + " " +
+                    getattr(sec, "section_title", "")
+                ).lower()
+                for hint, target_type in hint_map.items():
+                    if hint in text and target_type in search_text:
+                        if section_counts.get(sec.section_type, 0) < max_per_section:
+                            return sec.section_type
+
+            for hint, target_type in hint_map.items():
+                if hint in text:
+                    for sec in plan.sections:
+                        if sec.section_type == target_type and section_counts.get(target_type, 0) < max_per_section:
+                            return target_type
+                        similar = sec.section_type
+                        if target_type in similar or similar in target_type:
+                            if section_counts.get(similar, 0) < max_per_section:
+                                return similar
+
+            body = [s for s in plan.sections if s.section_type not in ("abstract", "conclusion")]
+            for sec in body:
+                if section_counts.get(sec.section_type, 0) < max_per_section:
+                    return sec.section_type
+            return plan.sections[0].section_type if plan.sections else "method"
+
+        for eid, info in elements.items():
+            assigned_type = assignment.get(eid, "")
+
+            if assigned_type in valid_types and section_counts.get(assigned_type, 0) < max_per_section:
+                result[eid] = assigned_type
+                section_counts[assigned_type] = section_counts.get(assigned_type, 0) + 1
+            else:
+                fb = _keyword_fallback(eid, info)
+                result[eid] = fb
+                section_counts[fb] = section_counts.get(fb, 0) + 1
+
+        return result
+
     def _find_best_section(
         self,
         plan: PaperPlan,
@@ -3156,7 +3308,6 @@ class PlannerAgent(BaseAgent):
         fallback: str,
     ) -> Optional[SectionPlan]:
         """Find the best section for a figure/table using VLM then keyword fallback."""
-        # Try VLM suggestion first
         if vlm_analysis:
             suggested = getattr(vlm_analysis, "suggested_section", "")
             if suggested:
@@ -3164,14 +3315,12 @@ class PlannerAgent(BaseAgent):
                     if section.section_type == suggested:
                         return section
 
-        # User-suggested section
         user_section = getattr(element_info, "section", "")
         if user_section:
             for section in plan.sections:
                 if section.section_type == user_section:
                     return section
 
-        # Keyword heuristic fallback
         text = (
             (element_info.id if hasattr(element_info, "id") else "")
             + " " + (element_info.caption if hasattr(element_info, "caption") else "")
@@ -3183,7 +3332,6 @@ class PlannerAgent(BaseAgent):
                     if section.section_type == section_type:
                         return section
 
-        # Fallback
         body = plan.get_body_sections()
         for section in body:
             if section.section_type == fallback:

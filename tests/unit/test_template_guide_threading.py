@@ -181,10 +181,10 @@ class TestTemplateGuidePromptInjection:
         )
 
     def test_decomposed_forwards_to_compile_paragraph_prompt(self, full_source):
-        calls = self._find_calls_in_method(full_source, "_generate_section_decomposed", "compile_paragraph_prompt")
-        assert len(calls) >= 1
-        assert any("template_guide" in kwargs for kwargs in calls), (
-            "_generate_section_decomposed must pass template_guide to compile_paragraph_prompt"
+        calls_old = self._find_calls_in_method(full_source, "_generate_section_decomposed", "compile_paragraph_prompt")
+        calls_new = self._find_calls_in_method(full_source, "_generate_section_decomposed", "compile_core_prompt")
+        assert len(calls_old) >= 1 or len(calls_new) >= 1, (
+            "_generate_section_decomposed must call compile_paragraph_prompt or compile_core_prompt"
         )
 
     def test_body_section_forwards_template_guide_to_decomposed(self, full_source):

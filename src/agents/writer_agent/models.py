@@ -124,6 +124,34 @@ class ParagraphResult(BaseModel):
     attempt: int = 1
 
 
+class CoreContentResult(BaseModel):
+    """
+    Result from Stage 1 core content generation (no citations).
+    """
+    raw_latex: str = ""
+    paragraph_index: int = 0
+    word_count: int = 0
+    attempt: int = 1
+
+
+class CitationAction(BaseModel):
+    """
+    Single citation edit action from Stage 2 citation injection.
+    """
+    action: str  # "replace_marker", "insert_sentence", "rewrite_sentence"
+    marker_or_location: str  # "[CITE:contrastive]" or "after_sentence:2"
+    new_text: str  # replacement text with \cite{} included
+    cite_keys: List[str] = Field(default_factory=list)
+
+
+class CitationEditResult(BaseModel):
+    """
+    Result from Stage 2 citation injection LLM call.
+    """
+    actions: List[CitationAction] = Field(default_factory=list)
+    raw_response: str = ""
+
+
 class WriterResult(BaseModel):
     """
     Result from Writer Agent

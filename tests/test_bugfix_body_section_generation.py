@@ -71,15 +71,16 @@ class TestPhase1DecomposedExemplarGuidance:
 
     def test_decomposed_uses_exemplar_guidance_in_prompt(self):
         """_generate_section_decomposed must reference exemplar_guidance
-        in compile_paragraph_prompt to inject exemplar patterns."""
+        in compile_core_prompt (3-stage pipeline) to inject exemplar patterns."""
         from src.agents.metadata_agent import metadata_agent as mod
 
         source = inspect.getsource(mod.MetaDataAgent._generate_section_decomposed)
         assert "exemplar_guidance" in source, (
             "exemplar_guidance not used inside _generate_section_decomposed body"
         )
-        assert "compile_paragraph_prompt" in source, (
-            "compile_paragraph_prompt not called in _generate_section_decomposed"
+        assert "compile_core_prompt" in source or "compile_paragraph_prompt" in source, (
+            "Neither compile_core_prompt nor compile_paragraph_prompt called "
+            "in _generate_section_decomposed"
         )
 
 

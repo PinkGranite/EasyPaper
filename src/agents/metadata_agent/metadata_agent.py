@@ -71,6 +71,9 @@ from ..shared.prompt_compiler import (
     compile_introduction_prompt,
     compile_body_section_prompt,
     compile_paragraph_prompt,
+    compile_core_prompt,
+    compile_citation_prompt,
+    apply_citation_edits,
     compile_synthesis_prompt,
     extract_contributions_from_intro,
     SECTION_PROMPTS,
@@ -87,7 +90,7 @@ from ..planner_agent.models import (
     PlanRequest,
     calculate_total_words,
 )
-from ..shared.table_converter import convert_tables
+from ..shared.table_converter import convert_tables, inject_float_refs
 from ..shared.session_memory import SessionMemory, ReviewRecord
 from ..shared.code_context import (
     CodeContextBuilder,
@@ -2654,32 +2657,50 @@ class MetaDataAgent(ReActAgent):
             latex = ""
             verification_feedback = ""
 
-            for attempt in range(MAX_CLAIM_RETRIES):
-                extra_constraints = verification_feedback if attempt > 0 else ""
+            figs_to_ref = getattr(para, "figures_to_reference", []) or []
+            tables_to_ref = getattr(para, "tables_to_reference", []) or []
 
-                para_prompt = compile_paragraph_prompt(
+            for attempt in range(MAX_CLAIM_RETRIES):
+                # === Stage 1: Core content (no citations, CITE/FLOAT markers) ===
+                core_prompt = compile_core_prompt(
                     paragraph_plan=para,
                     section_type=section_type,
                     section_context=section_context,
                     evidence_snippets=evidence_snippets,
-                    valid_refs=para_valid_refs,
-                    constraints=extra_constraints or None,
                     section_title=section_title_str,
                     paragraph_index=pidx,
                     total_paragraphs=total_paras,
-                    template_guide=template_guide,
-                    exemplar_guidance=exemplar_guidance or None,
                 )
+                if attempt > 0 and verification_feedback:
+                    core_prompt += f"\n\n### Revision Guidance\n{verification_feedback}"
 
-                para_result = await self._writer.generate_paragraph(
-                    paragraph_prompt=para_prompt,
+                core_result = await self._writer.generate_core_content(
+                    core_prompt=core_prompt,
                     section_type=section_type,
-                    valid_refs=para_valid_refs,
                     paragraph_index=pidx,
-                    claim_id=para.claim_id,
+                )
+                raw_latex = core_result.raw_latex
+
+                # === Stage 2: Citation injection ===
+                assigned_refs_for_prompt = []
+                for rkey in para_valid_refs:
+                    assigned_refs_for_prompt.append({"id": rkey, "title": "", "abstract": ""})
+
+                cite_prompt = compile_citation_prompt(
+                    raw_latex=raw_latex,
+                    assigned_refs=assigned_refs_for_prompt,
+                    section_type=section_type,
+                )
+                cite_result = await self._writer.inject_citations(
+                    citation_prompt=cite_prompt,
+                    valid_refs=para_valid_refs,
+                )
+                latex = apply_citation_edits(
+                    raw_latex, cite_result.actions, valid_keys=valid_keys_set,
                 )
 
-                latex = para_result.latex_content if hasattr(para_result, "latex_content") else para_result.get("latex_content", "")
+                # === Stage 3: Float reference injection ===
+                latex = inject_float_refs(latex, figs_to_ref, tables_to_ref)
 
                 vr = await verifier.verify(
                     generated_text=latex,

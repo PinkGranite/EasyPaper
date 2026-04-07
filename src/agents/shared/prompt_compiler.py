@@ -12,6 +12,7 @@ import os
 import re
 
 from ...prompts import PromptLoader as _PromptLoader
+from .table_converter import normalize_caption
 
 if TYPE_CHECKING:
     from ...skills.models import WritingSkill
@@ -441,7 +442,8 @@ def _format_figure_placement_guidance(section_plan: Any, figures: List[Any]) -> 
         if not fig:
             continue
 
-        caption = fig.caption if hasattr(fig, "caption") else fig.get("caption", "")
+        raw_caption = fig.caption if hasattr(fig, "caption") else fig.get("caption", "")
+        caption = normalize_caption(raw_caption)
         desc = fig.description if hasattr(fig, "description") else fig.get("description", "")
         file_path = fig.file_path if hasattr(fig, "file_path") else fig.get("file_path", "")
         wide = fp.is_wide
@@ -532,7 +534,8 @@ def _format_table_placement_guidance(
         if not tbl:
             continue
 
-        caption = tbl.caption if hasattr(tbl, "caption") else tbl.get("caption", "")
+        raw_caption = tbl.caption if hasattr(tbl, "caption") else tbl.get("caption", "")
+        caption = normalize_caption(raw_caption)
         desc = tbl.description if hasattr(tbl, "description") else tbl.get("description", "")
         wide = tp.is_wide
 
@@ -1458,6 +1461,244 @@ def compile_paragraph_prompt(
 # =========================================================================
 # Template-slot filling prompt (Phase 2, Task 2.4)
 # =========================================================================
+
+# =========================================================================
+# Stage 1: Core content prompt (no citations, CITE/FLOAT markers)
+# =========================================================================
+
+def compile_core_prompt(
+    paragraph_plan: Any,
+    section_type: str,
+    section_context: str = "",
+    evidence_snippets: Optional[List[str]] = None,
+    section_title: str = "",
+    paragraph_index: int = 0,
+    total_paragraphs: int = 1,
+) -> str:
+    """
+    Compile a prompt for Stage 1 core content writing (no citations, no refs).
+    - **Description**:
+        - Generates a prompt that instructs the LLM to produce pure academic
+          prose with [CITE:{topic}] and [FLOAT:{id}] markers.
+        - No \\cite{} or \\ref{} instructions are included.
+        - Evidence budget is larger than compile_paragraph_prompt (400 chars).
+
+    - **Args**:
+        - `paragraph_plan`: ParagraphPlan with key_point, supporting_points, etc.
+        - `section_type` (str): Parent section type.
+        - `section_context` (str): Already-generated paragraphs for coherence.
+        - `evidence_snippets` (List[str]): Evidence text for factual accuracy.
+        - `section_title` (str): Display title of the section.
+        - `paragraph_index` (int): 0-based index of this paragraph.
+        - `total_paragraphs` (int): Total paragraph count in the section.
+
+    - **Returns**:
+        - `str`: Compiled prompt for Stage 1 core content generation.
+    """
+    evidence_snippets = evidence_snippets or []
+
+    key_point = getattr(paragraph_plan, "key_point", "")
+    supporting_points = getattr(paragraph_plan, "supporting_points", [])
+    role = getattr(paragraph_plan, "role", "evidence")
+    sentence_plans = getattr(paragraph_plan, "sentence_plans", [])
+    approx_sentences = getattr(paragraph_plan, "effective_sentence_count",
+                               getattr(paragraph_plan, "approx_sentences", 5))
+    figs_to_ref = getattr(paragraph_plan, "figures_to_reference", [])
+    tables_to_ref = getattr(paragraph_plan, "tables_to_reference", [])
+
+    parts: List[str] = []
+
+    parts.append(
+        f"## Task: Write Paragraph {paragraph_index + 1}/{total_paragraphs} "
+        f"of the **{section_title or section_type}** section\n"
+    )
+
+    parts.append(f"**Role**: {role}")
+    parts.append(f"**Key point**: {key_point}")
+    if supporting_points:
+        sp_text = "; ".join(supporting_points)
+        parts.append(f"**Supporting points**: {sp_text}")
+    parts.append(f"**Target length**: ~{approx_sentences} sentences")
+
+    if sentence_plans:
+        parts.append("\n### Sentence-level Plan")
+        for sp in sentence_plans:
+            eid_str = ", ".join(sp.evidence_ids) if sp.evidence_ids else "—"
+            parts.append(
+                f"- [{sp.sentence_id}] role={sp.role.value}, "
+                f"evidence={eid_str}, ~{sp.approx_words} words"
+            )
+
+    if evidence_snippets:
+        parts.append("\n### Bound Evidence (use ONLY this evidence for factual claims)")
+        for i, snippet in enumerate(evidence_snippets):
+            truncated = _truncate_text(snippet, 400)
+            parts.append(f"{i + 1}. {truncated}")
+
+    if section_context:
+        parts.append(
+            "\n### Previously Generated Content (maintain coherence)\n"
+            + _truncate_text(section_context, PROMPT_BUDGETS.get("intro_context_chars", 1600))
+        )
+
+    float_ids = []
+    for fid in figs_to_ref:
+        float_ids.append(fid)
+    for tid in tables_to_ref:
+        float_ids.append(tid)
+
+    parts.append(
+        "\n### Output Requirements — STAGE 1 CORE CONTENT\n"
+        "- Write academic prose for this single paragraph.\n"
+        "- **DO NOT** use \\cite{} commands. Instead, mark sentences needing "
+        "citations with `[CITE:{topic}]` markers (e.g. `[CITE:contrastive_learning]`).\n"
+        "- **DO NOT** use \\ref{} commands. Instead, mark where table/figure "
+        "discussion belongs with `[FLOAT:{id}]` markers "
+        "(e.g. `[FLOAT:tab:results]`, `[FLOAT:fig:arch]`).\n"
+        "- Do NOT include \\section or \\subsection commands.\n"
+        "- Every factual claim must be supported by evidence from the list above."
+    )
+
+    if float_ids:
+        parts.append(
+            "\n**Floats to reference in this paragraph**: "
+            + ", ".join(f"`[FLOAT:{fid}]`" for fid in float_ids)
+        )
+
+    return "\n".join(parts)
+
+
+# =========================================================================
+# Stage 2: Citation injection prompt
+# =========================================================================
+
+def compile_citation_prompt(
+    raw_latex: str,
+    assigned_refs: List[Dict[str, str]],
+    section_type: str = "",
+) -> str:
+    """
+    Compile a prompt for Stage 2 citation injection.
+    - **Description**:
+        - Takes the raw LaTeX from Stage 1 (with [CITE:...] markers) and the
+          full assigned reference pool. Instructs the LLM to produce a JSON
+          array of CitationAction edits.
+
+    - **Args**:
+        - `raw_latex` (str): Stage 1 output with [CITE:...] markers.
+        - `assigned_refs` (List[dict]): Full reference pool for this section.
+        - `section_type` (str): Parent section type.
+
+    - **Returns**:
+        - `str`: Compiled prompt for citation injection.
+    """
+    parts: List[str] = []
+
+    parts.append(
+        "## Task: Citation Injection\n"
+        "You are given academic prose with `[CITE:{topic}]` markers indicating "
+        "where citations are needed. Your job is to match each marker to the "
+        "best reference(s) from the pool below and output edit instructions.\n"
+    )
+
+    parts.append("### Raw Text (with markers)")
+    parts.append("```latex")
+    parts.append(raw_latex)
+    parts.append("```\n")
+
+    parts.append("### Available References")
+    for ref in assigned_refs:
+        ref_id = ref.get("id", "")
+        title = ref.get("title", "")
+        abstract = ref.get("abstract", "")[:300] if ref.get("abstract") else ""
+        parts.append(f"- **{ref_id}**: {title}")
+        if abstract:
+            parts.append(f"  Abstract: {abstract}")
+    parts.append("")
+
+    parts.append(
+        "### Output Format\n"
+        "Return a JSON array of edit actions. Each action has:\n"
+        "- `action`: one of `replace_marker`, `insert_sentence`, `rewrite_sentence`\n"
+        "- `marker_or_location`: the marker text (e.g. `[CITE:contrastive]`) or "
+        "location (e.g. `after_sentence:2`)\n"
+        "- `new_text`: the replacement text including \\cite{} commands\n"
+        "- `cite_keys`: array of citation keys used\n\n"
+        "Example:\n"
+        "```json\n"
+        "[\n"
+        '  {"action": "replace_marker", "marker_or_location": "[CITE:vlm]", '
+        '"new_text": "\\\\cite{radford2021clip}", "cite_keys": ["radford2021clip"]}\n'
+        "]\n"
+        "```\n"
+        "ONLY use citation keys from the Available References list above."
+    )
+
+    return "\n".join(parts)
+
+
+# =========================================================================
+# Stage 2: apply_citation_edits (mechanical)
+# =========================================================================
+
+def apply_citation_edits(
+    latex: str,
+    actions: List[Any],
+    valid_keys: Optional[set] = None,
+) -> str:
+    """
+    Apply citation edit actions to LaTeX content.
+    - **Description**:
+        - Mechanically applies CitationAction edits from Stage 2.
+        - Strips invalid citation keys from \\cite{} commands.
+        - Cleans up any leftover [CITE:...] markers.
+
+    - **Args**:
+        - `latex` (str): Stage 1 output with markers.
+        - `actions` (List[CitationAction]): Edit actions from the LLM.
+        - `valid_keys` (set): Allowed citation keys.
+
+    - **Returns**:
+        - `str`: LaTeX with citations applied and validated.
+    """
+    valid_keys = valid_keys or set()
+    result = latex
+
+    for action in actions:
+        act_type = action.action if hasattr(action, "action") else action.get("action", "")
+        marker = action.marker_or_location if hasattr(action, "marker_or_location") else action.get("marker_or_location", "")
+        new_text = action.new_text if hasattr(action, "new_text") else action.get("new_text", "")
+        cite_keys = action.cite_keys if hasattr(action, "cite_keys") else action.get("cite_keys", [])
+
+        filtered_keys = [k for k in cite_keys if k in valid_keys]
+
+        if not filtered_keys and cite_keys:
+            if act_type == "replace_marker" and marker in result:
+                result = result.replace(marker, "")
+            continue
+
+        if filtered_keys != cite_keys:
+            cite_str = ",".join(filtered_keys)
+            new_text = re.sub(r'\\cite\{[^}]*\}', f'\\\\cite{{{cite_str}}}', new_text)
+
+        if act_type == "replace_marker":
+            if marker in result:
+                result = result.replace(marker, new_text, 1)
+        elif act_type == "insert_sentence":
+            match = re.match(r'after_sentence:(\d+)', marker)
+            if match:
+                sent_idx = int(match.group(1))
+                sentences = re.split(r'(?<=[.!?])\s+', result)
+                if sent_idx <= len(sentences):
+                    sentences.insert(sent_idx, new_text)
+                    result = " ".join(sentences)
+        elif act_type == "rewrite_sentence":
+            pass
+
+    result = re.sub(r'\[CITE:[^\]]*\]\s*', '', result)
+
+    return result
+
 
 def compile_template_fill_prompt(
     template: Any,

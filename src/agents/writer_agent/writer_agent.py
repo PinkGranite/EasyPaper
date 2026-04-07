@@ -22,7 +22,10 @@ from ...config.schema import ModelConfig, ToolsConfig
 from ...prompts import PromptLoader as _PromptLoader
 from ..react_base import ReActAgent
 from .router import create_writer_router
-from .models import GeneratedContent, ReviewResult, ParagraphResult
+from .models import (
+    GeneratedContent, ReviewResult, ParagraphResult,
+    CoreContentResult, CitationAction, CitationEditResult,
+)
 from ..shared.tools import (
     ToolRegistry,
     CitationValidatorTool,
@@ -1018,3 +1021,141 @@ class WriterAgent(ReActAgent):
                 section_type, paragraph_index, str(e),
             )
             return ParagraphResult(paragraph_index=paragraph_index)
+
+    # -----------------------------------------------------------------
+    # Decomposed pipeline: Stage 1 — Core content (no citations)
+    # -----------------------------------------------------------------
+
+    async def generate_core_content(
+        self,
+        core_prompt: str,
+        section_type: str,
+        paragraph_index: int,
+        max_retries: int = 2,
+    ) -> CoreContentResult:
+        """
+        Generate core academic prose with CITE/FLOAT markers (Stage 1).
+        - **Description**:
+            - Produces pure prose without \\cite{} or \\ref{} commands.
+            - The LLM marks citation-needed spots with [CITE:{topic}]
+              and float reference spots with [FLOAT:{id}].
+
+        - **Args**:
+            - `core_prompt` (str): Compiled prompt from compile_core_prompt.
+            - `section_type` (str): Parent section type for logging.
+            - `paragraph_index` (int): 0-based index.
+            - `max_retries` (int): Retry count.
+
+        - **Returns**:
+            - `CoreContentResult`: Raw LaTeX with markers.
+        """
+        from langchain_core.messages import SystemMessage, HumanMessage
+
+        system_msg = SystemMessage(content=(
+            "You are an expert academic writer. Write high-quality prose. "
+            "Mark citation-needed spots with [CITE:{topic}] markers. "
+            "Mark figure/table discussion spots with [FLOAT:{id}] markers. "
+            "Do NOT use \\cite{} or \\ref{} commands."
+        ))
+        human_msg = HumanMessage(content=core_prompt)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = await self.client.ainvoke(
+                    messages=[system_msg, human_msg],
+                    model_name=self.model_name,
+                )
+                raw = response.content if hasattr(response, "content") else str(response)
+                latex_content = raw.strip()
+
+                word_count = len(latex_content.split())
+                return CoreContentResult(
+                    raw_latex=latex_content,
+                    paragraph_index=paragraph_index,
+                    word_count=word_count,
+                    attempt=attempt,
+                )
+            except Exception as e:
+                logger.error(
+                    "writer.generate_core_content error attempt=%d section=%s para=%d: %s",
+                    attempt, section_type, paragraph_index, str(e),
+                )
+                if attempt >= max_retries:
+                    return CoreContentResult(
+                        paragraph_index=paragraph_index,
+                        attempt=attempt,
+                    )
+
+        return CoreContentResult(paragraph_index=paragraph_index)
+
+    # -----------------------------------------------------------------
+    # Decomposed pipeline: Stage 2 — Citation injection
+    # -----------------------------------------------------------------
+
+    async def inject_citations(
+        self,
+        citation_prompt: str,
+        valid_refs: List[str],
+    ) -> CitationEditResult:
+        """
+        Produce citation edit instructions via LLM (Stage 2).
+        - **Description**:
+            - Takes a prompt with the raw text and reference pool,
+              asks the LLM to return a JSON array of CitationAction edits.
+
+        - **Args**:
+            - `citation_prompt` (str): Compiled from compile_citation_prompt.
+            - `valid_refs` (List[str]): Allowed citation keys.
+
+        - **Returns**:
+            - `CitationEditResult`: Parsed edit actions.
+        """
+        from langchain_core.messages import SystemMessage, HumanMessage
+        import json
+
+        system_msg = SystemMessage(content=(
+            "You are a citation specialist. Analyze the text and reference pool, "
+            "then output a JSON array of citation edit actions. "
+            "Output ONLY the JSON array, no other text."
+        ))
+        human_msg = HumanMessage(content=citation_prompt)
+
+        try:
+            response = await self.client.ainvoke(
+                messages=[system_msg, human_msg],
+                model_name=self.model_name,
+            )
+            raw = response.content if hasattr(response, "content") else str(response)
+            raw = raw.strip()
+
+            if raw.startswith("```"):
+                lines = raw.split("\n")
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                raw = "\n".join(lines)
+
+            valid_set = set(valid_refs)
+            actions: List[CitationAction] = []
+
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        if isinstance(item, dict):
+                            cite_keys = item.get("cite_keys", [])
+                            filtered = [k for k in cite_keys if k in valid_set]
+                            actions.append(CitationAction(
+                                action=item.get("action", "replace_marker"),
+                                marker_or_location=item.get("marker_or_location", ""),
+                                new_text=item.get("new_text", ""),
+                                cite_keys=filtered,
+                            ))
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("writer.inject_citations json_parse_error")
+
+            return CitationEditResult(actions=actions, raw_response=raw)
+        except Exception as e:
+            logger.error("writer.inject_citations error: %s", str(e))
+            return CitationEditResult(raw_response=str(e))

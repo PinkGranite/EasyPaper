@@ -293,6 +293,8 @@ def build_conversion_prompt(
     """
     parts: List[str] = []
 
+    caption = normalize_caption(caption)
+
     parts.append(
         "You are an expert LaTeX typesetter. Convert the following table data "
         "into a properly formatted LaTeX table.\n"
@@ -977,6 +979,80 @@ async def convert_tables(
 
 
 # =========================================================================
+# Caption normalization
+# =========================================================================
+
+_CAPTION_PREFIX_RE = re.compile(
+    r'^(?:Table|Figure|Tab\.|Fig\.|TABLE|FIGURE|FIG\.)\s*\d+[\.:]\s*',
+    re.IGNORECASE,
+)
+
+
+def normalize_caption(caption: str) -> str:
+    """
+    Strip redundant numbering prefixes from captions.
+    - **Description**:
+        - LaTeX auto-generates "Table N." / "Figure N." via \\caption{}.
+          If the source caption already contains such a prefix the rendered
+          output will read "Table 1. Table 1. ...", causing duplication.
+        - This function strips the leading prefix so \\caption{} produces
+          the correct single-numbered caption.
+
+    - **Args**:
+        - `caption` (str): Raw caption text, possibly with numbering prefix.
+
+    - **Returns**:
+        - `str`: Caption with the redundant prefix removed.
+    """
+    if not caption:
+        return ""
+    return _CAPTION_PREFIX_RE.sub('', caption).strip()
+
+
+# =========================================================================
+# Float reference injection (Stage 3 of decomposed writer pipeline)
+# =========================================================================
+
+_FLOAT_MARKER_RE = re.compile(r'\[FLOAT:([^\]]+)\]')
+
+
+def inject_float_refs(
+    latex: str,
+    figures_to_ref: List[str],
+    tables_to_ref: List[str],
+) -> str:
+    """
+    Replace [FLOAT:{id}] markers with proper LaTeX references.
+    - **Description**:
+        - Stage 3 of the decomposed writer pipeline.
+        - Mechanically replaces markers placed by Stage 1 (core content).
+        - Cleans up any orphan markers that don't match known IDs.
+
+    - **Args**:
+        - `latex` (str): LaTeX content with [FLOAT:...] markers.
+        - `figures_to_ref` (List[str]): Figure IDs (e.g. "fig:arch").
+        - `tables_to_ref` (List[str]): Table IDs (e.g. "tab:results").
+
+    - **Returns**:
+        - `str`: LaTeX with markers replaced by Table~\\ref / Figure~\\ref.
+    """
+    known_ids = set(figures_to_ref or []) | set(tables_to_ref or [])
+    fig_set = set(figures_to_ref or [])
+
+    def _replace(m: re.Match) -> str:
+        fid = m.group(1)
+        if fid in fig_set:
+            return f"Figure~\\ref{{{fid}}}"
+        if fid in known_ids:
+            return f"Table~\\ref{{{fid}}}"
+        return ""
+
+    result = _FLOAT_MARKER_RE.sub(_replace, latex)
+    result = re.sub(r'\s{2,}', ' ', result)
+    return result
+
+
+# =========================================================================
 # Direct-injection helpers (post-Writer processing)
 # =========================================================================
 
@@ -1075,7 +1151,7 @@ def inject_tables(
                     table_latex,
                 )
         else:
-            caption = getattr(tbl, "caption", "") or tbl_id
+            caption = normalize_caption(getattr(tbl, "caption", "") or tbl_id)
             table_latex = (
                 f"\\begin{{{env_name}}}[htbp]\n"
                 f"\\centering\n"
