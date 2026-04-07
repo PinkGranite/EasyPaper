@@ -2,7 +2,8 @@ name: Build & Push EasyPaper
 
 on:
   push:
-    branches: [commercial]
+    tags:
+      - "vc*"
 
 env:
   REGISTRY: ghcr.io
@@ -27,6 +28,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/easypaper
           tags: |
+            type=ref,event=tag
             type=sha,prefix=
             type=raw,value=latest
 
