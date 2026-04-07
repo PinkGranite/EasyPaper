@@ -4014,8 +4014,8 @@ class MetaDataAgent(ReActAgent):
             if paper_plan:
                 table_assignments: Dict[str, str] = {}
                 for sec in paper_plan.sections:
-                    if sec.table_definitions:
-                        for tdef in sec.table_definitions:
+                    if sec.tables:
+                        for tdef in sec.tables:
                             label = getattr(tdef, "label", None) or getattr(tdef, "table_id", None)
                             if label:
                                 table_assignments[label] = sec.section_type
