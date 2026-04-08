@@ -92,11 +92,12 @@ class EvidenceChecker(FeedbackChecker):
                 if referenced:
                     anchored_claims += 1
                 else:
+                    expected = self._resolve_citation_keys(bound_evidence_ids, dag)
                     drifted_claims_list.append({
                         "claim_id": claim.node_id,
                         "claim_text": (claim.statement or "")[:100],
                         "section_type": section_type,
-                        "expected_evidence": bound_evidence_ids,
+                        "expected_evidence": expected,
                     })
                     section_feedbacks_list.append({
                         "section_type": section_type,
@@ -174,12 +175,32 @@ class EvidenceChecker(FeedbackChecker):
         """
         Check if at least one bound evidence ID is referenced in the content.
         - **Description**:
-            - Searches for evidence IDs in \\cite{}, \\ref{}, or as raw strings
-            - Also checks the label/description of the evidence node
+            - For LITERATURE nodes, checks the actual citation key (source_path)
+              in \\cite{} commands rather than the internal node ID (e.g. LIT001).
+            - For other node types, searches for evidence IDs in \\ref{} or as
+              raw strings, plus the node label if available.
         """
         if not evidence_ids:
             return True
         for eid in evidence_ids:
+            ev_node = dag.evidence_nodes.get(eid) if hasattr(dag, "evidence_nodes") else None
+
+            # For LITERATURE nodes, match against the real citation key (source_path)
+            if ev_node and hasattr(ev_node, "node_type"):
+                from ....models.evidence_graph import EvidenceNodeType
+                if ev_node.node_type == EvidenceNodeType.LITERATURE and ev_node.source_path:
+                    cite_key = ev_node.source_path
+                    cite_pattern = re.compile(
+                        r"\\(?:cite|citep|citet|citealp)\{[^}]*"
+                        + re.escape(cite_key)
+                        + r"[^}]*\}"
+                    )
+                    if cite_pattern.search(content):
+                        return True
+                    if cite_key in content:
+                        return True
+                    continue
+
             if eid in content:
                 return True
             cite_pattern = re.compile(
@@ -187,11 +208,47 @@ class EvidenceChecker(FeedbackChecker):
             )
             if cite_pattern.search(content):
                 return True
-            ev_node = dag.evidence_nodes.get(eid) if hasattr(dag, "evidence_nodes") else None
             if ev_node and hasattr(ev_node, "label") and ev_node.label:
                 if ev_node.label.lower() in content.lower():
                     return True
         return False
+
+    @staticmethod
+    def _resolve_citation_keys(
+        evidence_ids: List[str],
+        dag: Any,
+    ) -> List[str]:
+        """
+        Convert internal evidence node IDs to user-facing identifiers.
+        - **Description**:
+            - For LITERATURE nodes, returns the actual citation key (source_path)
+              instead of the internal ID (e.g. LIT001) so that downstream prompts
+              give the LLM actionable BibTeX keys.
+            - For non-LITERATURE nodes (figures, tables, code), keeps the original ID.
+
+        - **Args**:
+            - `evidence_ids` (List[str]): Internal evidence node IDs.
+            - `dag` (EvidenceDAG): The evidence DAG.
+
+        - **Returns**:
+            - `List[str]`: Resolved identifiers (citation keys or original IDs).
+        """
+        from ....models.evidence_graph import EvidenceNodeType
+
+        resolved: List[str] = []
+        evidence_nodes = getattr(dag, "evidence_nodes", {})
+        for eid in evidence_ids:
+            ev_node = evidence_nodes.get(eid)
+            if (
+                ev_node
+                and getattr(ev_node, "node_type", None) == EvidenceNodeType.LITERATURE
+                and ev_node.source_path
+            ):
+                if ev_node.source_path not in resolved:
+                    resolved.append(ev_node.source_path)
+            else:
+                resolved.append(eid)
+        return resolved
 
     def generate_revision_prompt(
         self,
@@ -222,11 +279,12 @@ class EvidenceChecker(FeedbackChecker):
         ]
 
         for dc in relevant:
+            expected = dc.get("expected_evidence", [])
             parts.append(
                 f"- Claim: \"{dc.get('claim_text', 'unknown')}\"\n"
-                f"  Expected evidence: {dc.get('expected_evidence', [])}\n"
-                f"  Ensure this claim references at least one of the listed evidence items "
-                f"via \\cite{{}} or \\ref{{}}."
+                f"  Required citation keys: {expected}\n"
+                f"  Ensure this claim references at least one of the listed keys "
+                f"via \\cite{{}}."
             )
 
         parts.append(f"\nCurrent content:\n{current_content}")

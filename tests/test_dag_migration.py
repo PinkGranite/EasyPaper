@@ -930,3 +930,143 @@ class TestFullRoundTrip:
         """Verify the main FastAPI app loads without import errors."""
         from src.main import app
         assert app is not None
+
+
+# =========================================================================
+# 9. EvidenceChecker: citation key resolution (LIT node ID mismatch fix)
+# =========================================================================
+
+
+class TestEvidenceCheckerCitationKeyResolution:
+    """
+    Verify that EvidenceChecker resolves LITERATURE node IDs (LIT001)
+    to actual BibTeX citation keys (source_path) when checking and prompting.
+    """
+
+    def _build_dag_with_literature(self):
+        from src.models.evidence_graph import (
+            EvidenceDAG, EvidenceNode, ClaimNode, DAGEdge,
+            EvidenceNodeType, ClaimNodeType, EdgeType,
+        )
+        dag = EvidenceDAG()
+        dag.add_evidence(EvidenceNode(
+            node_id="LIT001",
+            node_type=EvidenceNodeType.LITERATURE,
+            content="Proposed Flamingo architecture",
+            source_path="alayrac2022flamingo",
+            confidence=0.9,
+        ))
+        dag.add_evidence(EvidenceNode(
+            node_id="LIT002",
+            node_type=EvidenceNodeType.LITERATURE,
+            content="BLIP-2 bootstrapping approach",
+            source_path="li2023blip2",
+            confidence=0.95,
+        ))
+        dag.add_evidence(EvidenceNode(
+            node_id="FIG001",
+            node_type=EvidenceNodeType.FIGURE,
+            content="Architecture diagram",
+            source_path="figures/arch.png",
+        ))
+        dag.add_claim(ClaimNode(
+            node_id="CLM001",
+            node_type=ClaimNodeType.CONTEXT,
+            statement="Flamingo introduced cross-attention for VL alignment.",
+            section_scope=["introduction"],
+        ))
+        dag.add_claim(ClaimNode(
+            node_id="CLM002",
+            node_type=ClaimNodeType.METHOD_CLAIM,
+            statement="BLIP-2 uses Q-Former for efficient bridging.",
+            section_scope=["method"],
+        ))
+        dag.add_edge(DAGEdge(
+            source_id="LIT001", target_id="CLM001", is_bound=True,
+        ))
+        dag.add_edge(DAGEdge(
+            source_id="LIT002", target_id="CLM002", is_bound=True,
+        ))
+        dag.add_edge(DAGEdge(
+            source_id="FIG001", target_id="CLM002", is_bound=True,
+        ))
+        return dag
+
+    def test_check_refs_matches_citation_key_not_node_id(self):
+        """Content with \\cite{alayrac2022flamingo} should match LIT001."""
+        from src.agents.reviewer_agent.checkers.evidence_check import EvidenceChecker
+        dag = self._build_dag_with_literature()
+        content = r"Prior work \cite{alayrac2022flamingo} introduced cross-attention."
+        assert EvidenceChecker._check_evidence_references(content, ["LIT001"], dag) is True
+
+    def test_check_refs_rejects_bare_node_id_for_literature(self):
+        """Content with \\cite{LIT001} should NOT match — LIT001 is not a real key."""
+        from src.agents.reviewer_agent.checkers.evidence_check import EvidenceChecker
+        dag = self._build_dag_with_literature()
+        content = r"Prior work \cite{LIT001} introduced cross-attention."
+        assert EvidenceChecker._check_evidence_references(content, ["LIT001"], dag) is False
+
+    def test_check_refs_no_citation_key_present(self):
+        """Content without any matching citation key should fail."""
+        from src.agents.reviewer_agent.checkers.evidence_check import EvidenceChecker
+        dag = self._build_dag_with_literature()
+        content = r"Prior work introduced cross-attention for vision-language."
+        assert EvidenceChecker._check_evidence_references(content, ["LIT001"], dag) is False
+
+    def test_check_refs_non_literature_still_uses_node_id(self):
+        """FIG001 (non-LITERATURE) should still match by node ID / \\ref{}."""
+        from src.agents.reviewer_agent.checkers.evidence_check import EvidenceChecker
+        dag = self._build_dag_with_literature()
+        content = r"As shown in Figure \ref{FIG001}, the architecture..."
+        assert EvidenceChecker._check_evidence_references(content, ["FIG001"], dag) is True
+
+    def test_check_refs_multi_cite_command(self):
+        """\\cite{key1,alayrac2022flamingo,key3} should match LIT001."""
+        from src.agents.reviewer_agent.checkers.evidence_check import EvidenceChecker
+        dag = self._build_dag_with_literature()
+        content = r"Related approaches \cite{key1,alayrac2022flamingo,key3} show..."
+        assert EvidenceChecker._check_evidence_references(content, ["LIT001"], dag) is True
+
+    def test_resolve_citation_keys_converts_lit_ids(self):
+        """_resolve_citation_keys should convert LIT001 → alayrac2022flamingo."""
+        from src.agents.reviewer_agent.checkers.evidence_check import EvidenceChecker
+        dag = self._build_dag_with_literature()
+        resolved = EvidenceChecker._resolve_citation_keys(["LIT001", "LIT002"], dag)
+        assert "alayrac2022flamingo" in resolved
+        assert "li2023blip2" in resolved
+        assert "LIT001" not in resolved
+        assert "LIT002" not in resolved
+
+    def test_resolve_citation_keys_keeps_non_literature_ids(self):
+        """Non-LITERATURE nodes (FIG001) should keep their original ID."""
+        from src.agents.reviewer_agent.checkers.evidence_check import EvidenceChecker
+        dag = self._build_dag_with_literature()
+        resolved = EvidenceChecker._resolve_citation_keys(["FIG001", "LIT001"], dag)
+        assert "FIG001" in resolved
+        assert "alayrac2022flamingo" in resolved
+
+    def test_revision_prompt_uses_citation_keys(self):
+        """generate_revision_prompt should emit actual citation keys, not LIT IDs."""
+        from src.agents.reviewer_agent.checkers.evidence_check import EvidenceChecker
+        from src.agents.reviewer_agent.models import FeedbackResult, Severity
+        checker = EvidenceChecker()
+        feedback = FeedbackResult(
+            checker_name="evidence_check",
+            passed=False,
+            severity=Severity.WARNING,
+            message="test",
+            details={
+                "drifted_claims": [
+                    {
+                        "claim_id": "CLM001",
+                        "claim_text": "Flamingo introduced cross-attention.",
+                        "section_type": "introduction",
+                        "expected_evidence": ["alayrac2022flamingo"],
+                    },
+                ],
+            },
+        )
+        prompt = checker.generate_revision_prompt("introduction", "some content", feedback)
+        assert "alayrac2022flamingo" in prompt
+        assert "LIT001" not in prompt
+        assert "Required citation keys" in prompt
