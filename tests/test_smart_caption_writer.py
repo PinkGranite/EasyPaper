@@ -916,3 +916,161 @@ class TestCaptionNormInPrompts:
         assert "Wide diagram" in out
         assert "Table 2." not in out
         assert "Data" in out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 3: Subsection support — planner, prompt compiler, decomposed gen
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestSubsectionTriggering:
+    """Planner should auto-enable subsections when paragraphs >= 5 and clusters >= 2."""
+
+    def test_auto_enable_sectioning_for_long_sections(self):
+        """Sections with >= 5 paragraphs and >= 2 topic_clusters should get
+        sectioning_recommended=True even if the LLM returned False."""
+        from src.agents.planner_agent.models import SectionPlan, ParagraphPlan
+
+        plan = SectionPlan(
+            section_type="method",
+            section_title="Method",
+            sectioning_recommended=False,
+            topic_clusters=["architecture", "training"],
+            paragraphs=[
+                ParagraphPlan(key_point=f"Point {i}")
+                for i in range(6)
+            ],
+        )
+        from src.agents.planner_agent.planner_agent import PlannerAgent
+        import inspect
+
+        source = inspect.getsource(PlannerAgent.create_plan)
+        assert "sectioning_recommended" in source
+        # The heuristic should override LLM's false to true
+        assert "topic_clusters" in source
+
+
+class TestSubsectionPromptFormatting:
+    """Prompt compiler must format subsections with grouped headings."""
+
+    def test_paragraph_guidance_groups_by_subsection(self):
+        """When subsections exist, _format_paragraph_guidance must include
+        subsection titles and group paragraphs under them."""
+        from src.agents.shared.prompt_compiler import _format_paragraph_guidance
+        from src.agents.planner_agent.models import (
+            SectionPlan, SubSectionPlan, ParagraphPlan,
+        )
+
+        plan = SectionPlan(
+            section_type="method",
+            section_title="Method",
+            subsections=[
+                SubSectionPlan(
+                    title="Architecture",
+                    paragraphs=[
+                        ParagraphPlan(key_point="Transformer design"),
+                        ParagraphPlan(key_point="Attention mechanism"),
+                    ],
+                ),
+                SubSectionPlan(
+                    title="Training",
+                    paragraphs=[
+                        ParagraphPlan(key_point="Pre-training"),
+                        ParagraphPlan(key_point="Fine-tuning"),
+                    ],
+                ),
+            ],
+        )
+        out = _format_paragraph_guidance(plan)
+        assert "Architecture" in out, (
+            "_format_paragraph_guidance must mention subsection title 'Architecture'"
+        )
+        assert "Training" in out, (
+            "_format_paragraph_guidance must mention subsection title 'Training'"
+        )
+        assert "subsection" in out.lower() or "\\subsection" in out, (
+            "_format_paragraph_guidance must reference \\subsection when subsections exist"
+        )
+
+    def test_structure_contract_allows_subsection_when_present(self):
+        """_format_structure_quality_contract must NOT forbid \\subsection{}
+        when section_plan.subsections is non-empty."""
+        from src.agents.shared.prompt_compiler import _format_structure_quality_contract
+        from src.agents.planner_agent.models import (
+            SectionPlan, SubSectionPlan, ParagraphPlan,
+        )
+
+        plan = SectionPlan(
+            section_type="method",
+            section_title="Method",
+            sectioning_recommended=True,
+            subsections=[
+                SubSectionPlan(
+                    title="Arch",
+                    paragraphs=[ParagraphPlan(key_point="x")],
+                ),
+            ],
+        )
+        out = _format_structure_quality_contract("method", plan)
+        assert "DO NOT use" not in out, (
+            "Structure contract must not forbid \\subsection{} when subsections exist"
+        )
+
+    def test_structure_contract_forbids_subsection_when_not_present(self):
+        """_format_structure_quality_contract should still forbid \\subsection{}
+        when there are no subsections and sectioning_recommended=False."""
+        from src.agents.shared.prompt_compiler import _format_structure_quality_contract
+        from src.agents.planner_agent.models import SectionPlan, ParagraphPlan
+
+        plan = SectionPlan(
+            section_type="method",
+            section_title="Method",
+            sectioning_recommended=False,
+            paragraphs=[
+                ParagraphPlan(key_point=f"P{i}") for i in range(4)
+            ],
+        )
+        out = _format_structure_quality_contract("method", plan)
+        assert "DO NOT use" in out
+
+
+class TestDecomposedSubsectionHeaders:
+    """_generate_section_decomposed must insert \\subsection{} headers."""
+
+    def test_decomposed_inserts_subsection_headers(self):
+        """Source of _generate_section_decomposed must contain subsection
+        header insertion logic."""
+        import inspect
+        from src.agents.metadata_agent.metadata_agent import MetaDataAgent
+
+        source = inspect.getsource(MetaDataAgent._generate_section_decomposed)
+        assert "\\subsection{" in source or "subsection_title" in source, (
+            "_generate_section_decomposed must insert \\subsection{} headers "
+            "before each subsection's paragraphs"
+        )
+
+    def test_compile_core_prompt_accepts_subsection_title(self):
+        """compile_core_prompt should accept a subsection_title parameter."""
+        import inspect
+        from src.agents.shared.prompt_compiler import compile_core_prompt
+
+        sig = inspect.signature(compile_core_prompt)
+        assert "subsection_title" in sig.parameters, (
+            "compile_core_prompt must accept subsection_title so the LLM knows "
+            "which subsection the paragraph belongs to"
+        )
+
+    def test_compile_core_prompt_includes_subsection_context(self):
+        """When subsection_title is provided, compile_core_prompt should
+        include it in the output."""
+        from src.agents.shared.prompt_compiler import compile_core_prompt
+        from src.agents.planner_agent.models import ParagraphPlan
+
+        para = ParagraphPlan(key_point="Attention design", approx_sentences=4)
+        out = compile_core_prompt(
+            paragraph_plan=para,
+            section_type="method",
+            section_title="Methodology",
+            subsection_title="Self-Attention Architecture",
+        )
+        assert "Self-Attention Architecture" in out

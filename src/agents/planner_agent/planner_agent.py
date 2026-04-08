@@ -961,7 +961,16 @@ class PlannerAgent(BaseAgent):
                 order=order,
             )
 
-            # Split into subsections if recommended or multiple clusters detected
+            # Heuristic: auto-enable sectioning for long sections with clusters
+            all_paras = section._all_paragraphs()
+            if (
+                not section.sectioning_recommended
+                and len(all_paras) >= 5
+                and len(section.topic_clusters) >= 2
+                and section_type not in ("abstract", "conclusion", "introduction")
+            ):
+                section.sectioning_recommended = True
+
             if section.sectioning_recommended and len(section.topic_clusters) > 1:
                 section = self._split_into_subsections(section, section.topic_clusters)
 

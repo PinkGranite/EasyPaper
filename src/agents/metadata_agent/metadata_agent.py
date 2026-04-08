@@ -2243,6 +2243,7 @@ class MetaDataAgent(ReActAgent):
         evidence_dag: Optional[EvidenceDAG] = None,
         template_guide: Optional[TemplateWriterGuide] = None,
         exemplar_guidance: Optional[str] = None,
+        emitter: Optional[ProgressEmitter] = None,
     ) -> SectionResult:
         """
         Generate Introduction section — delegates to WriterAgent.
@@ -2331,20 +2332,22 @@ class MetaDataAgent(ReActAgent):
                 else []
             )
             writer_valid_keys = list(dict.fromkeys(list(section_keys) + list(reserve_keys)))
-            result = await self._writer.run(
-                system_prompt=GENERATION_SYSTEM_PROMPT,
-                user_prompt=prompt,
+            section_title_str = section_plan.section_title if section_plan else "Introduction"
+            content = await self._generate_section_decomposed(
                 section_type="introduction",
-                valid_citation_keys=writer_valid_keys,
-                key_points=key_points or None,
+                section_plan=section_plan,
+                writer_valid_keys=writer_valid_keys,
+                section_title_str=section_title_str,
+                evidence_dag=evidence_dag,
                 memory=memory,
-                peers={"planner": self._planner, "reviewer": self._reviewer},
+                emitter=emitter,
+                template_guide=template_guide,
+                exemplar_guidance=exemplar_guidance,
             )
-            content = result.get("generated_content", "")
             if not content.strip():
                 return SectionResult(
                     section_type="introduction",
-                    section_title=section_plan.section_title if section_plan else "Introduction",
+                    section_title=section_title_str,
                     status="error",
                     error="Writer returned empty introduction content",
                 )
@@ -2352,7 +2355,7 @@ class MetaDataAgent(ReActAgent):
 
             return SectionResult(
                 section_type="introduction",
-                section_title=section_plan.section_title if section_plan else "Introduction",
+                section_title=section_title_str,
                 status="ok",
                 latex_content=content,
                 word_count=word_count,
@@ -2508,38 +2511,18 @@ class MetaDataAgent(ReActAgent):
             )
             writer_valid_keys = list(dict.fromkeys(list(section_keys) + list(reserve_keys)))
 
-            # ---------------------------------------------------------------
-            # Decomposed generation: paragraph-by-paragraph when DAG bindings
-            # are available.  Falls back to section-level generation otherwise.
-            # ---------------------------------------------------------------
-            has_claim_bindings = (
-                evidence_dag is not None
-                and section_plan is not None
-                and any(p.claim_id for p in section_plan.paragraphs)
+            # Unified decomposed generation for all body sections
+            content = await self._generate_section_decomposed(
+                section_type=section_type,
+                section_plan=section_plan,
+                writer_valid_keys=writer_valid_keys,
+                section_title_str=section_title_str,
+                evidence_dag=evidence_dag,
+                memory=memory,
+                emitter=emitter,
+                template_guide=template_guide,
+                exemplar_guidance=exemplar_guidance,
             )
-            if has_claim_bindings:
-                content = await self._generate_section_decomposed(
-                    section_type=section_type,
-                    section_plan=section_plan,
-                    evidence_dag=evidence_dag,
-                    writer_valid_keys=writer_valid_keys,
-                    section_title_str=section_title_str,
-                    memory=memory,
-                    emitter=emitter,
-                    template_guide=template_guide,
-                    exemplar_guidance=exemplar_guidance,
-                )
-            else:
-                result = await self._writer.run(
-                    system_prompt=GENERATION_SYSTEM_PROMPT,
-                    user_prompt=prompt,
-                    section_type=section_type,
-                    valid_citation_keys=writer_valid_keys,
-                    key_points=key_points or None,
-                    memory=memory,
-                    peers={"planner": self._planner, "reviewer": self._reviewer},
-                )
-                content = result.get("generated_content", "")
             word_count = len(content.split())
 
             # Use plan's title if available
@@ -2577,32 +2560,31 @@ class MetaDataAgent(ReActAgent):
         self,
         section_type: str,
         section_plan: SectionPlan,
-        evidence_dag: EvidenceDAG,
         writer_valid_keys: List[str],
         section_title_str: str = "",
+        evidence_dag: Optional[EvidenceDAG] = None,
         memory: Optional[SessionMemory] = None,
         emitter: Optional[ProgressEmitter] = None,
         template_guide: Optional[TemplateWriterGuide] = None,
         exemplar_guidance: Optional[str] = None,
     ) -> str:
         """
-        Generate a section paragraph-by-paragraph with verify-retry-degrade.
+        Generate a section paragraph-by-paragraph via the 3-stage pipeline.
         - **Description**:
-            - Iterates over ``section_plan.paragraphs``.
-            - For each paragraph with a ``claim_id``, compiles a focused prompt
-              and calls ``writer.generate_paragraph()``.
-            - Immediately verifies the output using ``ClaimVerifier``.
-            - On failure, retries up to ``MAX_CLAIM_RETRIES`` with feedback.
-            - After exhausting retries, degrades to template-slot filling
-              if ``TEMPLATE_FALLBACK_ENABLED`` and a template is available.
-            - Accumulates ``section_context`` for coherence.
+            - Iterates over ``section_plan._all_paragraphs()`` (flat + subsection).
+            - For each paragraph runs: Stage 1 core content -> Stage 2 citation
+              injection -> Stage 3 float ref injection.
+            - When ``claim_id`` is present and ``evidence_dag`` is available,
+              gathers evidence and runs ``ClaimVerifier`` with retry/degrade.
+            - When ``claim_id`` is empty, runs the 3-stage pipeline without
+              evidence context and skips claim verification.
 
         - **Args**:
             - ``section_type`` (str): Section identifier.
             - ``section_plan`` (SectionPlan): Plan with paragraph-level structure.
-            - ``evidence_dag`` (EvidenceDAG): The evidence graph.
             - ``writer_valid_keys`` (List[str]): Superset of allowed citation keys.
             - ``section_title_str`` (str): Display title for prompt context.
+            - ``evidence_dag`` (EvidenceDAG, optional): The evidence graph.
             - ``memory`` (SessionMemory, optional): Shared memory.
             - ``emitter`` (ProgressEmitter, optional): Emits paragraph-level SSE events.
 
@@ -2619,35 +2601,55 @@ class MetaDataAgent(ReActAgent):
         verifier = ClaimVerifier()
         paragraph_outputs: List[str] = []
         section_context = ""
-        total_paras = len(section_plan.paragraphs)
+        all_paras = section_plan._all_paragraphs()
+        total_paras = len(all_paras)
         verify_stats = {"passed": 0, "retried": 0, "degraded": 0, "skipped": 0}
 
-        for pidx, para in enumerate(section_plan.paragraphs):
-            if not para.claim_id:
-                paragraph_outputs.append("")
-                verify_stats["skipped"] += 1
-                continue
+        # Build a mapping from paragraph index to subsection title for header insertion
+        para_subsection_title: Dict[int, Optional[str]] = {}
+        subsection_first_para: Dict[int, str] = {}
+        subsections = getattr(section_plan, "subsections", None) or []
+        if subsections:
+            pidx_offset = len(section_plan.paragraphs)
+            for sub in subsections:
+                sub_title = getattr(sub, "title", "")
+                sub_paras = getattr(sub, "paragraphs", [])
+                if sub_paras and sub_title:
+                    subsection_first_para[pidx_offset] = sub_title
+                for sp in sub_paras:
+                    para_subsection_title[pidx_offset] = sub_title
+                    pidx_offset += 1
+
+        for pidx, para in enumerate(all_paras):
+            # Insert \subsection{} header before the first paragraph of each subsection
+            if pidx in subsection_first_para:
+                subsection_title = subsection_first_para[pidx]
+                paragraph_outputs.append(f"\\subsection{{{subsection_title}}}")
+
+            has_claim = bool(para.claim_id and evidence_dag is not None)
+            current_subsection_title = para_subsection_title.get(pidx, "")
 
             if emitter is not None:
                 await emitter.paragraph_start(
                     section_type=section_type,
                     paragraph_index=pidx,
-                    claim_id=para.claim_id,
+                    claim_id=para.claim_id or "",
                     total_paragraphs=total_paras,
                     phase=Phase.BODY_SECTIONS,
                 )
 
-            # Gather evidence for this paragraph's claim
-            evidence_nodes = evidence_dag.get_evidence_for_claim(para.claim_id)
             evidence_snippets: List[str] = []
             evidence_snippet_map: Dict[str, str] = {}
             para_valid_refs: List[str] = list(writer_valid_keys)
-            for enode in evidence_nodes:
-                snippet = enode.content or enode.source_path or enode.node_id
-                evidence_snippets.append(snippet)
-                evidence_snippet_map[enode.node_id] = snippet
-                if enode.source_path and enode.source_path not in para_valid_refs:
-                    para_valid_refs.append(enode.source_path)
+
+            if has_claim:
+                evidence_nodes = evidence_dag.get_evidence_for_claim(para.claim_id)
+                for enode in evidence_nodes:
+                    snippet = enode.content or enode.source_path or enode.node_id
+                    evidence_snippets.append(snippet)
+                    evidence_snippet_map[enode.node_id] = snippet
+                    if enode.source_path and enode.source_path not in para_valid_refs:
+                        para_valid_refs.append(enode.source_path)
 
             for r in para.references_to_cite:
                 if r not in para_valid_refs:
@@ -2660,16 +2662,18 @@ class MetaDataAgent(ReActAgent):
             figs_to_ref = getattr(para, "figures_to_reference", []) or []
             tables_to_ref = getattr(para, "tables_to_reference", []) or []
 
-            for attempt in range(MAX_CLAIM_RETRIES):
+            max_attempts = MAX_CLAIM_RETRIES if has_claim else 1
+            for attempt in range(max_attempts):
                 # === Stage 1: Core content (no citations, CITE/FLOAT markers) ===
                 core_prompt = compile_core_prompt(
                     paragraph_plan=para,
                     section_type=section_type,
                     section_context=section_context,
-                    evidence_snippets=evidence_snippets,
+                    evidence_snippets=evidence_snippets if has_claim else None,
                     section_title=section_title_str,
                     paragraph_index=pidx,
                     total_paragraphs=total_paras,
+                    subsection_title=current_subsection_title,
                 )
                 if attempt > 0 and verification_feedback:
                     core_prompt += f"\n\n### Revision Guidance\n{verification_feedback}"
@@ -2702,6 +2706,11 @@ class MetaDataAgent(ReActAgent):
                 # === Stage 3: Float reference injection ===
                 latex = inject_float_refs(latex, figs_to_ref, tables_to_ref)
 
+                # === Verification (only when claim bindings exist) ===
+                if not has_claim:
+                    verify_stats["passed"] += 1
+                    break
+
                 vr = await verifier.verify(
                     generated_text=latex,
                     paragraph_plan=para,
@@ -2717,7 +2726,7 @@ class MetaDataAgent(ReActAgent):
                         claim_id=para.claim_id,
                         passed=vr.passed,
                         attempt=attempt + 1,
-                        max_attempts=MAX_CLAIM_RETRIES,
+                        max_attempts=max_attempts,
                         feedback_summary=fb,
                         phase=Phase.BODY_SECTIONS,
                     )
@@ -2735,8 +2744,7 @@ class MetaDataAgent(ReActAgent):
                     f"{len(vr.coverage_gaps)} coverage gaps"
                 )
             else:
-                # Exhausted retries — try template-slot filling as fallback
-                if TEMPLATE_FALLBACK_ENABLED and para.paragraph_template:
+                if has_claim and TEMPLATE_FALLBACK_ENABLED and para.paragraph_template:
                     try:
                         tmpl_data = para.paragraph_template
                         if isinstance(tmpl_data, dict):
@@ -2771,7 +2779,7 @@ class MetaDataAgent(ReActAgent):
                 await emitter.paragraph_content(
                     section_type=section_type,
                     paragraph_index=pidx,
-                    claim_id=para.claim_id,
+                    claim_id=para.claim_id or "",
                     content=latex,
                     word_count=wc,
                     phase=Phase.BODY_SECTIONS,
@@ -2834,22 +2842,12 @@ class MetaDataAgent(ReActAgent):
                     }
                 )
 
-            synthesis_system = (
-                "You are an expert academic writer. Use present tense for methods, "
-                "no contractions (it is, do not, cannot), no possessives on method "
-                "names (the performance of X, not X's performance). "
-                "Place key information at sentence end. Output pure LaTeX only."
-            )
-
-            result = await self._writer.run(
-                system_prompt=synthesis_system,
-                user_prompt=prompt,
+            core_result = await self._writer.generate_core_content(
+                core_prompt=prompt,
                 section_type=section_type,
-                enable_review=False,
-                memory=memory,
-                peers={"planner": self._planner, "reviewer": self._reviewer},
+                paragraph_index=0,
             )
-            content = result.get("generated_content", "")
+            content = core_result.raw_latex
 
             # Hard rule: strip ALL citations and cross-references from
             # abstract and conclusion — these must be self-contained.
@@ -3890,6 +3888,7 @@ class MetaDataAgent(ReActAgent):
         paper_plan: Optional[PaperPlan] = None,
         figures: Optional[List[FigureSpec]] = None,
         metadata_tables: Optional[List[TableSpec]] = None,
+        template_guide: Optional[TemplateWriterGuide] = None,
     ) -> Tuple[Optional[str], Optional[str], List[str], Dict[str, List[str]]]:
         """
         Compile PDF using Typesetter Agent (multi-file mode).
@@ -4023,20 +4022,36 @@ class MetaDataAgent(ReActAgent):
             )
             
             from ..typesetter_agent.models import TemplateConfig
+            detected_column_format = "single"
+            if template_guide and template_guide.column_format:
+                detected_column_format = template_guide.column_format
+            elif template_path:
+                try:
+                    tg = TemplateAnalyzer.analyze_zip(template_path)
+                    detected_column_format = tg.column_format or "single"
+                except Exception:
+                    pass
             ts_template_config = TemplateConfig(
                 paper_title=paper_title,
                 paper_authors="EasyPaper",
+                column_format=detected_column_format,
             )
 
-            # Promote wide tables to table* in double-column templates
-            if ts_template_config.column_format == "double":
-                from ..shared.table_converter import (
-                    add_adjustbox_safety,
-                    smart_promote_wide_tables,
-                )
+            from ..shared.table_converter import (
+                add_adjustbox_safety,
+                smart_promote_wide_tables,
+            )
+            # Promote wide tables to table* only in double-column templates
+            if detected_column_format == "double":
                 for sec_type in list(generated_sections.keys()):
-                    tex = smart_promote_wide_tables(generated_sections[sec_type])
-                    generated_sections[sec_type] = add_adjustbox_safety(tex)
+                    generated_sections[sec_type] = smart_promote_wide_tables(
+                        generated_sections[sec_type]
+                    )
+            # Always apply adjustbox safety to prevent overflow in any layout
+            for sec_type in list(generated_sections.keys()):
+                generated_sections[sec_type] = add_adjustbox_safety(
+                    generated_sections[sec_type]
+                )
 
             # Prefer in-process peer TypesetterAgent (SDK mode); fall back to HTTP.
             if self._typesetter is not None:

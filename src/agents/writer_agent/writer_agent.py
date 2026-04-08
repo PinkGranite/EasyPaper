@@ -233,10 +233,11 @@ class WriterAgent(ReActAgent):
         """
         Initialize the agent workflow graph with iterative review.
         
-        Graph structure:
-        START -> generate_content -> mini_review -> (decision)
-            -> if passed or max_iterations: extract_references -> END
-            -> if not passed: revise_content -> mini_review (loop)
+        .. deprecated::
+            This LangGraph workflow is no longer used. All generation now goes
+            through the decomposed 3-stage pipeline (generate_core_content ->
+            inject_citations -> inject_float_refs). Kept for backward
+            compatibility with external callers only.
         """
         agent_builder = StateGraph(WriterAgentState)
         
@@ -774,6 +775,9 @@ class WriterAgent(ReActAgent):
         current_content: Optional[str] = None,
     ):
         """
+        .. deprecated::
+            All section generation now uses the decomposed 3-stage pipeline.
+            This method is retained for backward compatibility with external callers.
         Run the Writer Agent with iterative review and ReAct consultation.
 
         - **Args**:

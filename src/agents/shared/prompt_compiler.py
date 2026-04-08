@@ -304,9 +304,10 @@ def _format_paragraph_guidance(section_plan: Any) -> str:
     - **Returns**:
         - `str`: Formatted paragraph guidance for the LLM prompt
     """
-    paragraphs = getattr(section_plan, "paragraphs", None)
-    if not paragraphs:
-        # Backward-compat: fall back to key_points + target_words
+    subsections = getattr(section_plan, "subsections", None) or []
+    paragraphs = getattr(section_plan, "paragraphs", None) or []
+
+    if not paragraphs and not subsections:
         parts = []
         key_points = getattr(section_plan, "key_points", None)
         if callable(key_points):
@@ -324,38 +325,89 @@ def _format_paragraph_guidance(section_plan: Any) -> str:
             parts.append(f"**Writing Guidance**: {guidance}")
         return "\n".join(parts) if parts else ""
 
+    if subsections:
+        return _format_subsection_guidance(subsections, section_plan)
+
+    return _format_flat_paragraph_guidance(paragraphs, section_plan)
+
+
+def _format_flat_paragraph_guidance(paragraphs: list, section_plan: Any) -> str:
+    """Format guidance for flat (non-subsection) paragraph lists."""
     n = len(paragraphs)
     total_sentences = sum(getattr(p, "approx_sentences", 5) for p in paragraphs)
 
     lines = [f"Write this section with **{n} paragraphs** (~{total_sentences} sentences total):\n"]
 
     for i, para in enumerate(paragraphs, 1):
-        role = getattr(para, "role", "evidence")
-        sents = getattr(para, "approx_sentences", 5)
-        kp = getattr(para, "key_point", "")
-        supporting = getattr(para, "supporting_points", [])
-        refs = getattr(para, "references_to_cite", [])
-        fig_refs = getattr(para, "figures_to_reference", [])
-        tbl_refs = getattr(para, "tables_to_reference", [])
-
-        lines.append(f"**Paragraph {i}** (role: {role}, ~{sents} sentences):")
-        if kp:
-            lines.append(f"  - Key point: {kp}")
-        for sp in supporting:
-            lines.append(f"  - Supporting: {sp}")
-        if refs:
-            lines.append(f"  - Cite: {', '.join(refs)}")
-        if fig_refs:
-            lines.append(f"  - Reference figures: {', '.join(fig_refs)}")
-        if tbl_refs:
-            lines.append(f"  - Reference tables: {', '.join(tbl_refs)}")
-        lines.append("")
+        _append_paragraph_entry(lines, para, i)
 
     guidance = getattr(section_plan, "writing_guidance", "")
     if guidance:
         lines.append(f"**Writing Guidance**: {guidance}")
 
     return "\n".join(lines)
+
+
+def _format_subsection_guidance(subsections: list, section_plan: Any) -> str:
+    """Format guidance when subsections are present, grouping paragraphs under headings."""
+    all_paras = []
+    for sub in subsections:
+        all_paras.extend(getattr(sub, "paragraphs", []))
+    top_paras = getattr(section_plan, "paragraphs", []) or []
+    all_paras = top_paras + all_paras
+    n = len(all_paras)
+    total_sentences = sum(getattr(p, "approx_sentences", 5) for p in all_paras)
+
+    lines = [
+        f"Write this section with **{n} paragraphs** (~{total_sentences} sentences total), "
+        f"organized into **{len(subsections)} subsections**.\n"
+    ]
+    lines.append(
+        "Use `\\subsection{Title}` to introduce each subsection group.\n"
+    )
+
+    global_idx = 1
+    for top_para in top_paras:
+        _append_paragraph_entry(lines, top_para, global_idx)
+        global_idx += 1
+
+    for sub in subsections:
+        title = getattr(sub, "title", "Untitled")
+        sub_paras = getattr(sub, "paragraphs", [])
+        lines.append(f"### \\subsection{{{title}}}")
+        for para in sub_paras:
+            _append_paragraph_entry(lines, para, global_idx)
+            global_idx += 1
+
+    guidance = getattr(section_plan, "writing_guidance", "")
+    if guidance:
+        lines.append(f"**Writing Guidance**: {guidance}")
+
+    return "\n".join(lines)
+
+
+def _append_paragraph_entry(lines: list, para: Any, idx: int) -> None:
+    """Append a single paragraph entry to the guidance lines."""
+    role = getattr(para, "role", "evidence")
+    sents = getattr(para, "approx_sentences", 5)
+    kp = getattr(para, "key_point", "")
+    supporting = getattr(para, "supporting_points", [])
+    refs = getattr(para, "references_to_cite", [])
+    fig_refs = getattr(para, "figures_to_reference", [])
+    tbl_refs = getattr(para, "tables_to_reference", [])
+
+    lines.append(f"**Paragraph {idx}** (role: {role}, ~{sents} sentences):")
+    if kp:
+        lines.append(f"  - Key point: {kp}")
+    for sp in supporting:
+        lines.append(f"  - Supporting: {sp}")
+    if refs:
+        lines.append(f"  - Cite: {', '.join(refs)}")
+    if fig_refs:
+        lines.append(f"  - Reference figures: {', '.join(fig_refs)}")
+    if tbl_refs:
+        lines.append(f"  - Reference tables: {', '.join(tbl_refs)}")
+    lines.append("")
 
 
 def _format_structure_quality_contract(section_type: str, section_plan: Any) -> str:
@@ -370,15 +422,18 @@ def _format_structure_quality_contract(section_type: str, section_plan: Any) -> 
         return ""
 
     paragraphs = getattr(section_plan, "paragraphs", None) or []
-    paragraph_count = len(paragraphs)
+    subsections = getattr(section_plan, "subsections", None) or []
+    has_subsections = bool(subsections)
+    all_paras_method = getattr(section_plan, "_all_paragraphs", None)
+    total_paragraph_count = len(all_paras_method()) if callable(all_paras_method) else len(paragraphs)
     topic_clusters = getattr(section_plan, "topic_clusters", None) or []
     transition_intents = getattr(section_plan, "transition_intents", None) or []
     sectioning_recommended = bool(
         getattr(section_plan, "sectioning_recommended", False)
     )
 
-    # For short sections, avoid over-constraining structure.
-    if paragraph_count < 3 and not sectioning_recommended:
+    # For short sections without subsections, avoid over-constraining structure.
+    if total_paragraph_count < 3 and not sectioning_recommended and not has_subsections:
         return ""
 
     lines: List[str] = ["## Structure Quality Contract"]
@@ -399,13 +454,22 @@ def _format_structure_quality_contract(section_type: str, section_plan: Any) -> 
         for intent in transition_intents[:3]:
             lines.append(f"  - {intent}")
 
-    if sectioning_recommended:
+    subsections = getattr(section_plan, "subsections", None) or []
+    has_subsections = bool(subsections)
+
+    if has_subsections or sectioning_recommended:
         lines.append(
             "- This section is structurally dense; explicit `\\subsection{}` headings are recommended."
         )
         lines.append(
             "- Ensure block boundaries are unmistakable with clear transition language."
         )
+        if has_subsections:
+            titles = [getattr(s, "title", "") for s in subsections if getattr(s, "title", "")]
+            if titles:
+                lines.append(
+                    f"- Expected subsections: {', '.join(titles)}"
+                )
     else:
         lines.append(
             "- **DO NOT use `\\subsection{}` commands in this section.**"
@@ -1504,6 +1568,7 @@ def compile_core_prompt(
     section_title: str = "",
     paragraph_index: int = 0,
     total_paragraphs: int = 1,
+    subsection_title: str = "",
 ) -> str:
     """
     Compile a prompt for Stage 1 core content writing (no citations, no refs).
@@ -1521,6 +1586,7 @@ def compile_core_prompt(
         - `section_title` (str): Display title of the section.
         - `paragraph_index` (int): 0-based index of this paragraph.
         - `total_paragraphs` (int): Total paragraph count in the section.
+        - `subsection_title` (str): Title of the subsection this paragraph belongs to.
 
     - **Returns**:
         - `str`: Compiled prompt for Stage 1 core content generation.
@@ -1538,9 +1604,12 @@ def compile_core_prompt(
 
     parts: List[str] = []
 
+    heading = f"the **{section_title or section_type}** section"
+    if subsection_title:
+        heading += f" > **{subsection_title}** subsection"
     parts.append(
         f"## Task: Write Paragraph {paragraph_index + 1}/{total_paragraphs} "
-        f"of the **{section_title or section_type}** section\n"
+        f"of {heading}\n"
     )
 
     parts.append(f"**Role**: {role}")

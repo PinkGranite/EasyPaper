@@ -955,3 +955,126 @@ class TestEndToEndPipeline:
         assert len(result) == 2
         assert "tab:t0" in result
         assert "tab:t1" in result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 6: adjustbox safety — nested braces & compile_pdf integration
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestAdjustboxNestedBraces:
+    """add_adjustbox_safety must handle column specs with nested braces."""
+
+    def test_adjustbox_wraps_tabular_with_p_columns(self):
+        """Column specs like p{3cm} contain nested braces that the regex must handle."""
+        from src.agents.shared.table_converter import add_adjustbox_safety
+
+        latex = (
+            "\\begin{table}[htbp]\n"
+            "\\centering\n"
+            "\\caption{Para cols.}\\label{tab:pcol}\n"
+            "\\begin{tabular}{lp{3cm}p{4cm}}\n"
+            "\\toprule\n"
+            "Name & Description & Notes \\\\\n"
+            "\\midrule\n"
+            "A & Some text & More text \\\\\n"
+            "\\bottomrule\n"
+            "\\end{tabular}\n"
+            "\\end{table}"
+        )
+        out = add_adjustbox_safety(latex)
+        assert "\\adjustbox" in out, (
+            "add_adjustbox_safety failed to wrap tabular with p{...} column specs"
+        )
+        assert "max width=\\columnwidth" in out
+
+    def test_adjustbox_wraps_tabular_with_nested_brace_colspec(self):
+        """Column specs like >{\raggedright}p{3cm} have multiple nested brace groups."""
+        from src.agents.shared.table_converter import add_adjustbox_safety
+
+        latex = (
+            "\\begin{table}[htbp]\n"
+            "\\centering\n"
+            "\\caption{Nested.}\\label{tab:nested}\n"
+            "\\begin{tabular}{l>{\\raggedright}p{3cm}>{\\centering\\arraybackslash}p{4cm}}\n"
+            "\\toprule\n"
+            "Name & Description & Notes \\\\\n"
+            "\\midrule\n"
+            "A & Some text & More text \\\\\n"
+            "\\bottomrule\n"
+            "\\end{tabular}\n"
+            "\\end{table}"
+        )
+        out = add_adjustbox_safety(latex)
+        assert "\\adjustbox" in out, (
+            "add_adjustbox_safety failed on column specs with >{}p{} nested braces"
+        )
+        assert "max width=\\columnwidth" in out
+
+    def test_adjustbox_wraps_tabular_with_mixed_p_and_at(self):
+        """Column specs with @{} and p{} combined."""
+        from src.agents.shared.table_converter import add_adjustbox_safety
+
+        latex = (
+            "\\begin{table*}[htbp]\n"
+            "\\centering\n"
+            "\\caption{Mixed.}\\label{tab:mixed}\n"
+            "\\begin{tabular}{@{}lp{2.5cm}c@{}}\n"
+            "\\toprule\n"
+            "X & Y & Z \\\\\n"
+            "\\midrule\n"
+            "1 & 2 & 3 \\\\\n"
+            "\\bottomrule\n"
+            "\\end{tabular}\n"
+            "\\end{table*}"
+        )
+        out = add_adjustbox_safety(latex)
+        assert "\\adjustbox" in out
+        assert "max width=\\textwidth" in out
+
+
+class TestCompilePdfAdjustboxIntegration:
+    """_compile_pdf must apply add_adjustbox_safety using the correct column_format."""
+
+    def test_compile_pdf_signature_accepts_template_guide(self):
+        """_compile_pdf should accept a template_guide parameter."""
+        import inspect
+        from src.agents.metadata_agent.metadata_agent import MetaDataAgent
+
+        sig = inspect.signature(MetaDataAgent._compile_pdf)
+        assert "template_guide" in sig.parameters, (
+            "_compile_pdf must accept 'template_guide' so column_format can be detected"
+        )
+
+    def test_compile_pdf_uses_template_guide_column_format(self):
+        """When template_guide has column_format='double', TemplateConfig must reflect it."""
+        import ast
+        import inspect
+        import textwrap
+        from src.agents.metadata_agent.metadata_agent import MetaDataAgent
+
+        source = inspect.getsource(MetaDataAgent._compile_pdf)
+        tree = ast.parse(textwrap.dedent(source))
+
+        found_adjustbox_import = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "add_adjustbox_safety":
+                        found_adjustbox_import = True
+        assert found_adjustbox_import, (
+            "_compile_pdf must import and use add_adjustbox_safety"
+        )
+
+    def test_adjustbox_applied_unconditionally_or_with_correct_format(self):
+        """add_adjustbox_safety must be called — not gated by a always-false condition."""
+        import inspect
+        from src.agents.metadata_agent.metadata_agent import MetaDataAgent
+
+        source = inspect.getsource(MetaDataAgent._compile_pdf)
+        assert "add_adjustbox_safety" in source, (
+            "_compile_pdf must call add_adjustbox_safety"
+        )
+        assert 'TemplateConfig(\n' not in source or 'column_format' in source, (
+            "TemplateConfig must be constructed with column_format from template_guide"
+        )
