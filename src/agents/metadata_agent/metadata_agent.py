@@ -4030,11 +4030,13 @@ class MetaDataAgent(ReActAgent):
 
             # Promote wide tables to table* in double-column templates
             if ts_template_config.column_format == "double":
-                from ..shared.table_converter import smart_promote_wide_tables
+                from ..shared.table_converter import (
+                    add_adjustbox_safety,
+                    smart_promote_wide_tables,
+                )
                 for sec_type in list(generated_sections.keys()):
-                    generated_sections[sec_type] = smart_promote_wide_tables(
-                        generated_sections[sec_type]
-                    )
+                    tex = smart_promote_wide_tables(generated_sections[sec_type])
+                    generated_sections[sec_type] = add_adjustbox_safety(tex)
 
             # Prefer in-process peer TypesetterAgent (SDK mode); fall back to HTTP.
             if self._typesetter is not None:

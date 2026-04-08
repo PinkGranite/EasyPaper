@@ -889,10 +889,10 @@ class WriterAgent(ReActAgent):
         - **Returns**:
             - ``ParagraphResult``: Generated content + metadata.
         """
-        from langchain_core.messages import SystemMessage, HumanMessage
-
-        system_msg = SystemMessage(content=WRITER_SYSTEM_BASE)
-        human_msg = HumanMessage(content=paragraph_prompt)
+        messages = [
+            {"role": "system", "content": WRITER_SYSTEM_BASE},
+            {"role": "user", "content": paragraph_prompt},
+        ]
 
         valid_set = set(valid_refs)
         latex_content = ""
@@ -901,11 +901,13 @@ class WriterAgent(ReActAgent):
 
         for attempt in range(1, max_retries + 1):
             try:
-                response = await self.client.ainvoke(
-                    messages=[system_msg, human_msg],
-                    model_name=self.model_name,
+                response = await self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=4000,
                 )
-                raw = response.content if hasattr(response, "content") else str(response)
+                raw = response.choices[0].message.content or ""
                 latex_content = raw.strip()
 
                 cite_pattern = re.compile(r"\\cite\{([^}]+)\}")
@@ -981,21 +983,23 @@ class WriterAgent(ReActAgent):
         - **Returns**:
             - ``ParagraphResult``: Generated content from template.
         """
-        from langchain_core.messages import SystemMessage, HumanMessage
-
-        system_msg = SystemMessage(content=(
-            "You are filling a structured template for an academic paper paragraph. "
-            "Fill each slot with appropriate academic content. "
-            "Use ONLY the provided citation keys. Output LaTeX only."
-        ))
-        human_msg = HumanMessage(content=template_prompt)
+        messages = [
+            {"role": "system", "content": (
+                "You are filling a structured template for an academic paper paragraph. "
+                "Fill each slot with appropriate academic content. "
+                "Use ONLY the provided citation keys. Output LaTeX only."
+            )},
+            {"role": "user", "content": template_prompt},
+        ]
 
         try:
-            response = await self.client.ainvoke(
-                messages=[system_msg, human_msg],
-                model_name=self.model_name,
+            response = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=0.5,
+                max_tokens=4000,
             )
-            raw = response.content if hasattr(response, "content") else str(response)
+            raw = response.choices[0].message.content or ""
             latex_content = raw.strip()
 
             valid_set = set(valid_refs)
@@ -1049,23 +1053,25 @@ class WriterAgent(ReActAgent):
         - **Returns**:
             - `CoreContentResult`: Raw LaTeX with markers.
         """
-        from langchain_core.messages import SystemMessage, HumanMessage
-
-        system_msg = SystemMessage(content=(
-            "You are an expert academic writer. Write high-quality prose. "
-            "Mark citation-needed spots with [CITE:{topic}] markers. "
-            "Mark figure/table discussion spots with [FLOAT:{id}] markers. "
-            "Do NOT use \\cite{} or \\ref{} commands."
-        ))
-        human_msg = HumanMessage(content=core_prompt)
+        messages = [
+            {"role": "system", "content": (
+                "You are an expert academic writer. Write high-quality prose. "
+                "Mark citation-needed spots with [CITE:{topic}] markers. "
+                "Mark figure/table discussion spots with [FLOAT:{id}] markers. "
+                "Do NOT use \\cite{} or \\ref{} commands."
+            )},
+            {"role": "user", "content": core_prompt},
+        ]
 
         for attempt in range(1, max_retries + 1):
             try:
-                response = await self.client.ainvoke(
-                    messages=[system_msg, human_msg],
-                    model_name=self.model_name,
+                response = await self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=4000,
                 )
-                raw = response.content if hasattr(response, "content") else str(response)
+                raw = response.choices[0].message.content or ""
                 latex_content = raw.strip()
 
                 word_count = len(latex_content.split())
@@ -1110,22 +1116,25 @@ class WriterAgent(ReActAgent):
         - **Returns**:
             - `CitationEditResult`: Parsed edit actions.
         """
-        from langchain_core.messages import SystemMessage, HumanMessage
         import json
 
-        system_msg = SystemMessage(content=(
-            "You are a citation specialist. Analyze the text and reference pool, "
-            "then output a JSON array of citation edit actions. "
-            "Output ONLY the JSON array, no other text."
-        ))
-        human_msg = HumanMessage(content=citation_prompt)
+        messages = [
+            {"role": "system", "content": (
+                "You are a citation specialist. Analyze the text and reference pool, "
+                "then output a JSON array of citation edit actions. "
+                "Output ONLY the JSON array, no other text."
+            )},
+            {"role": "user", "content": citation_prompt},
+        ]
 
         try:
-            response = await self.client.ainvoke(
-                messages=[system_msg, human_msg],
-                model_name=self.model_name,
+            response = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=4000,
             )
-            raw = response.content if hasattr(response, "content") else str(response)
+            raw = response.choices[0].message.content or ""
             raw = raw.strip()
 
             if raw.startswith("```"):

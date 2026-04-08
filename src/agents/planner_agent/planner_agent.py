@@ -14,6 +14,7 @@ from typing import List, Dict, Any, Optional
 from fastapi import APIRouter
 from ..base import BaseAgent
 from ..shared.llm_client import LLMClient
+from ..shared.table_converter import normalize_caption
 from ..shared.reference_assignment import claim_matrix_refs_for_section
 from ...config.schema import ModelConfig
 from .models import (
@@ -101,6 +102,13 @@ Given a paper's structure and venue, decide the total citation count and
 per-section allocation. Output ONLY a JSON object."""
 STEP2_CITATION_SYSTEM = _prompt_loader.load(
     "planner", "step2_citation", default=_STEP2_CITATION_SYSTEM_DEFAULT
+)
+
+_ELEMENT_ASSIGNMENT_SYSTEM_DEFAULT = """You assign figures and tables to the single best section for semantic fit.
+Output ONLY a JSON object mapping each element id to one section_type string from the plan.
+No markdown, no code fences, no explanation."""
+ELEMENT_ASSIGNMENT_SYSTEM = _prompt_loader.load(
+    "planner", "element_assignment", default=_ELEMENT_ASSIGNMENT_SYSTEM_DEFAULT
 )
 
 STEP2_CITATION_USER = """Decide the citation strategy for this paper:
@@ -675,8 +683,17 @@ class PlannerAgent(BaseAgent):
         """
         n_figures = len(request.figures) if request.figures else 0
         n_tables = len(request.tables) if request.tables else 0
+
+        # VLM analysis before word budget so wide-figure counts use VLM + geometry
+        figure_analyses: Dict[str, Any] = {}
+        table_analyses: Dict[str, Any] = {}
+        if self.vlm_service:
+            figure_analyses = await self._analyze_figures(request.figures or [])
+            table_analyses = await self._analyze_tables(request.tables or [])
+
         n_wide_figures = sum(
-            1 for f in (request.figures or []) if self._should_be_wide_figure(f)
+            1 for f in (request.figures or [])
+            if self._should_be_wide_figure(f, figure_analyses.get(getattr(f, "id", "")))
         )
         n_wide_tables = sum(
             1 for t in (request.tables or []) if self._should_be_wide_table(t)
@@ -693,13 +710,6 @@ class PlannerAgent(BaseAgent):
         target_pages = request.target_pages or 10
         style_guide = request.style_guide or "DEFAULT"
         total_paragraphs = estimate_target_paragraphs(total_words)
-
-        # VLM analysis for figures and tables
-        figure_analyses: Dict[str, Any] = {}
-        table_analyses: Dict[str, Any] = {}
-        if self.vlm_service:
-            figure_analyses = await self._analyze_figures(request.figures or [])
-            table_analyses = await self._analyze_tables(request.tables or [])
 
         reference_keys = self._extract_reference_keys(request.references)
         figure_info = self._format_figure_info(request.figures or [], figure_analyses)
@@ -1005,7 +1015,9 @@ class PlannerAgent(BaseAgent):
             citation_strategy=citation_strategy,
         )
 
-        self._assign_figure_table_definitions(paper_plan, request, figure_analyses, table_analyses)
+        await self._assign_figure_table_definitions(
+            paper_plan, request, figure_analyses, table_analyses,
+        )
 
         logger.info(
             "planner.plan_created sections=%d sentences=%d",
@@ -2568,7 +2580,7 @@ class PlannerAgent(BaseAgent):
     # Building PaperPlan from LLM output
     # =====================================================================
 
-    def _build_paper_plan(
+    async def _build_paper_plan(
         self,
         plan_data: Dict[str, Any],
         request: PlanRequest,
@@ -2718,7 +2730,9 @@ class PlannerAgent(BaseAgent):
         )
 
         # Assign any unassigned figures/tables to sections
-        self._assign_figure_table_definitions(paper_plan, request, figure_analyses, table_analyses)
+        await self._assign_figure_table_definitions(
+            paper_plan, request, figure_analyses, table_analyses,
+        )
 
         return paper_plan
 
@@ -3059,7 +3073,7 @@ class PlannerAgent(BaseAgent):
     # Figure/Table assignment
     # =====================================================================
 
-    def _assign_figure_table_definitions(
+    async def _assign_figure_table_definitions(
         self,
         paper_plan: PaperPlan,
         request: PlanRequest,
@@ -3082,75 +3096,91 @@ class PlannerAgent(BaseAgent):
         fa = figure_analyses or {}
         ta = table_analyses or {}
 
-        # Assign unassigned figures
         for fig_id, fig_info in all_figures.items():
-            if self._should_be_wide_figure(fig_info):
+            if self._should_be_wide_figure(fig_info, fa.get(fig_id)):
                 if fig_id not in paper_plan.wide_figures:
                     paper_plan.wide_figures.append(fig_id)
 
-            if fig_id in figures_defined:
-                continue
-
-            target = self._find_best_section(
-                paper_plan, fig_id, fig_info,
-                fa.get(fig_id),
-                {
-                    "architecture": "method", "overview": "method",
-                    "framework": "method", "model": "method",
-                    "pipeline": "method", "result": "result",
-                    "ablation": "result", "comparison": "experiment",
-                    "performance": "experiment",
-                },
-                fallback="method",
-            )
-            if target:
-                vlm_data = fa.get(fig_id)
-                target.figures.append(FigurePlacement(
-                    figure_id=fig_id,
-                    semantic_role=getattr(vlm_data, "semantic_role", "") if vlm_data else "",
-                    message=getattr(vlm_data, "message", "") if vlm_data else "",
-                    is_wide=getattr(vlm_data, "is_wide", False) if vlm_data else self._should_be_wide_figure(fig_info),
-                    position_hint="mid",
-                    caption_guidance=getattr(vlm_data, "caption_guidance", "") if vlm_data else "",
-                ))
-                figures_defined.add(fig_id)
-
-        # Assign unassigned tables
         for tbl_id, tbl_info in all_tables.items():
             if self._should_be_wide_table(tbl_info):
                 if tbl_id not in paper_plan.wide_tables:
                     paper_plan.wide_tables.append(tbl_id)
 
-            if tbl_id in tables_defined:
-                continue
+        unassigned_figs = {
+            fid: info for fid, info in all_figures.items()
+            if fid not in figures_defined
+        }
+        unassigned_tbls = {
+            tid: info for tid, info in all_tables.items()
+            if tid not in tables_defined
+        }
 
-            target = self._find_best_section(
-                paper_plan, tbl_id, tbl_info,
-                ta.get(tbl_id),
-                {
-                    "main": "experiment", "result": "experiment",
-                    "comparison": "experiment", "ablation": "result",
-                    "hyperparameter": "experiment", "statistics": "experiment",
-                    "dataset": "experiment",
-                },
-                fallback="experiment",
+        llm_raw: Dict[str, Any] = {}
+        if unassigned_figs or unassigned_tbls:
+            user_prompt = self._build_assignment_prompt(
+                paper_plan,
+                unassigned_figs,
+                unassigned_tbls,
+                figure_analyses=fa,
+                table_analyses=ta,
             )
-            if target:
-                vlm_data = ta.get(tbl_id)
-                target.tables.append(TablePlacement(
-                    table_id=tbl_id,
-                    semantic_role=getattr(vlm_data, "semantic_role", "") if vlm_data else "",
-                    message=getattr(vlm_data, "message", "") if vlm_data else "",
-                    is_wide=getattr(vlm_data, "is_wide", False) if vlm_data else self._should_be_wide_table(tbl_info),
-                    position_hint="mid",
-                ))
-                tables_defined.add(tbl_id)
+            try:
+                llm_raw = await self._llm_json_call(
+                    ELEMENT_ASSIGNMENT_SYSTEM,
+                    user_prompt,
+                    "element_assignment",
+                )
+            except Exception as exc:
+                logger.warning("planner.element_assignment_failed err=%s", exc)
+                llm_raw = {}
+
+        combined: Dict[str, Any] = {**unassigned_figs, **unassigned_tbls}
+        assignment = self._parse_element_assignment(
+            json.dumps(llm_raw) if llm_raw else "{}",
+            combined,
+            paper_plan,
+        )
+        section_by_type = {s.section_type: s for s in paper_plan.sections}
+
+        for fig_id, fig_info in unassigned_figs.items():
+            st = assignment.get(fig_id, "")
+            target = section_by_type.get(st)
+            if not target:
+                continue
+            vlm_data = fa.get(fig_id)
+            target.figures.append(FigurePlacement(
+                figure_id=fig_id,
+                semantic_role=getattr(vlm_data, "semantic_role", "") if vlm_data else "",
+                message=getattr(vlm_data, "message", "") if vlm_data else "",
+                is_wide=self._should_be_wide_figure(fig_info, vlm_data),
+                position_hint="mid",
+                caption_guidance=getattr(vlm_data, "caption_guidance", "") if vlm_data else "",
+            ))
+
+        for tbl_id, tbl_info in unassigned_tbls.items():
+            st = assignment.get(tbl_id, "")
+            target = section_by_type.get(st)
+            if not target:
+                continue
+            vlm_data = ta.get(tbl_id)
+            target.tables.append(TablePlacement(
+                table_id=tbl_id,
+                semantic_role=getattr(vlm_data, "semantic_role", "") if vlm_data else "",
+                message=getattr(vlm_data, "message", "") if vlm_data else "",
+                is_wide=(
+                    getattr(vlm_data, "is_wide", False) if vlm_data
+                    else self._should_be_wide_table(tbl_info)
+                ),
+                position_hint="mid",
+            ))
 
     @staticmethod
     def _build_assignment_prompt(
         plan: Any,
         figures: Dict[str, Any],
         tables: Dict[str, Any],
+        figure_analyses: Optional[Dict[str, Any]] = None,
+        table_analyses: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Build an LLM prompt for assigning figures/tables to sections.
@@ -3158,37 +3188,63 @@ class PlannerAgent(BaseAgent):
             - `plan`: PaperPlan with sections.
             - `figures` (dict): figure_id -> element info.
             - `tables` (dict): table_id -> element info.
+            - `figure_analyses` (dict, optional): VLM outputs keyed by figure id.
+            - `table_analyses` (dict, optional): VLM outputs keyed by table id.
         - **Returns**:
             - `str`: LLM prompt text.
         """
+        fa = figure_analyses or {}
+        ta = table_analyses or {}
         lines: List[str] = [
             "You are an academic paper layout expert.",
             "Assign each figure and table to the BEST section for its content.",
+            "Match element semantics to section themes and paragraph key points.",
             "",
             "## Available Sections",
         ]
         for sec in plan.sections:
             title = getattr(sec, "section_title", "") or sec.section_type
             key_points = []
-            for p in getattr(sec, "paragraphs", [])[:2]:
+            for p in getattr(sec, "paragraphs", [])[:3]:
                 kp = getattr(p, "key_point", "")
                 if kp:
                     key_points.append(kp)
-            kp_str = "; ".join(key_points) if key_points else ""
+            for sub in getattr(sec, "subsections", [])[:2]:
+                for p in getattr(sub, "paragraphs", [])[:2]:
+                    kp = getattr(p, "key_point", "")
+                    if kp:
+                        key_points.append(kp)
+            kp_str = "; ".join(key_points) if key_points else "(no key points yet)"
             lines.append(f"- **{sec.section_type}** ({title}): {kp_str}")
 
         lines.append("")
         lines.append("## Elements to Assign")
 
         for fid, info in figures.items():
-            cap = getattr(info, "caption", "") if hasattr(info, "caption") else ""
+            raw_cap = getattr(info, "caption", "") if hasattr(info, "caption") else ""
+            cap = normalize_caption(str(raw_cap or ""))
             desc = getattr(info, "description", "") if hasattr(info, "description") else ""
-            lines.append(f"- {fid}: caption=\"{cap}\", description=\"{desc}\"")
+            vlm = fa.get(fid)
+            vlm_bits = ""
+            if vlm:
+                role = getattr(vlm, "semantic_role", "") or ""
+                msg = (getattr(vlm, "message", "") or "")[:240]
+                sug = getattr(vlm, "suggested_section", "") or ""
+                vlm_bits = f' vlm_role="{role}" vlm_summary="{msg}" vlm_suggested_section="{sug}"'
+            lines.append(f"- {fid}: caption=\"{cap}\", description=\"{desc}\"{vlm_bits}")
 
         for tid, info in tables.items():
-            cap = getattr(info, "caption", "") if hasattr(info, "caption") else ""
+            raw_cap = getattr(info, "caption", "") if hasattr(info, "caption") else ""
+            cap = normalize_caption(str(raw_cap or ""))
             desc = getattr(info, "description", "") if hasattr(info, "description") else ""
-            lines.append(f"- {tid}: caption=\"{cap}\", description=\"{desc}\"")
+            vlm = ta.get(tid)
+            vlm_bits = ""
+            if vlm:
+                role = getattr(vlm, "semantic_role", "") or ""
+                msg = (getattr(vlm, "message", "") or "")[:240]
+                sug = getattr(vlm, "suggested_section", "") or ""
+                vlm_bits = f' vlm_role="{role}" vlm_summary="{msg}" vlm_suggested_section="{sug}"'
+            lines.append(f"- {tid}: caption=\"{cap}\", description=\"{desc}\"{vlm_bits}")
 
         lines.append("")
         lines.append("## Rules")
@@ -3342,7 +3398,7 @@ class PlannerAgent(BaseAgent):
     # Default plan (fallback)
     # =====================================================================
 
-    def _create_default_plan(
+    async def _create_default_plan(
         self, request: PlanRequest, total_words: int,
     ) -> PaperPlan:
         """Create a default plan when LLM fails."""
@@ -3370,7 +3426,7 @@ class PlannerAgent(BaseAgent):
             sections=sections,
             contributions=[f"We propose {request.title}"],
         )
-        self._assign_figure_table_definitions(plan, request)
+        await self._assign_figure_table_definitions(plan, request, None, None)
         return plan
 
     # =====================================================================
@@ -3599,9 +3655,45 @@ class PlannerAgent(BaseAgent):
         return deps.get(section_type, [])
 
     @staticmethod
-    def _should_be_wide_figure(fig_info: Any) -> bool:
+    def _should_be_wide_figure(
+        fig_info: Any,
+        vlm_analysis: Optional[Any] = None,
+    ) -> bool:
+        """
+        Decide if a figure should use figure* (two-column span).
+        - **Description**:
+            - Honors explicit ``wide`` flag, then VLM ``is_wide`` when analysis exists,
+              then image aspect ratio (PIL), then caption/description keywords.
+
+        - **Args**:
+            - `fig_info` (Any): Figure spec with optional ``wide``, ``file_path``, text fields.
+            - `vlm_analysis` (Any, optional): VLM result with ``is_wide``; omit if unavailable.
+
+        - **Returns**:
+            - `bool`: True if the figure should span both columns.
+        """
         if getattr(fig_info, "wide", False):
             return True
+        if vlm_analysis is not None:
+            return bool(getattr(vlm_analysis, "is_wide", False))
+        path = getattr(fig_info, "file_path", "") or ""
+        if path:
+            try:
+                from PIL import Image
+            except ImportError:
+                Image = None  # type: ignore[assignment,misc]
+            if Image is not None:
+                try:
+                    with Image.open(path) as im:
+                        w, h = im.size
+                    if h > 0 and w > 0:
+                        ratio = w / h
+                        if ratio > 1.8:
+                            return True
+                        if ratio < 1.0:
+                            return False
+                except Exception:
+                    pass
         wide_keywords = [
             "comparison", "overview", "architecture", "pipeline",
             "framework", "full", "complete", "main", "overall",

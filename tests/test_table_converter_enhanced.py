@@ -639,6 +639,92 @@ class TestSmartPromoteWideTables:
         assert "\\scriptsize" in result or "\\small" in result or "\\tiny" in result
 
 
+class TestPhase3EnhancedWidthAndAdjustbox:
+    """Loose row width, multicolumn heuristics, and adjustbox safety wrapper."""
+
+    def test_long_row_without_booktabs_triggers_resize(self):
+        from src.agents.shared.table_converter import smart_promote_wide_tables
+
+        long_cell = "X" * 58
+        content = (
+            "\\begin{table}[htbp]\n"
+            "\\centering\n"
+            "\\caption{T.}\\label{tab:loose}\n"
+            "\\begin{tabular}{llll}\n"
+            f"{long_cell} & b & c & d \\\\\n"
+            "a & b & c & d \\\\\n"
+            "\\end{tabular}\n"
+            "\\end{table}"
+        )
+        result = smart_promote_wide_tables(content)
+        assert "\\resizebox" in result
+
+    def test_multicolumn_span_triggers_resize(self):
+        from src.agents.shared.table_converter import smart_promote_wide_tables
+
+        content = (
+            "\\begin{table}[htbp]\n"
+            "\\centering\n"
+            "\\caption{MC.}\\label{tab:mc}\n"
+            "\\begin{tabular}{ccc}\n"
+            "\\multicolumn{3}{c}{Wide spanning header text here} \\\\\n"
+            "a & b & c \\\\\n"
+            "\\end{tabular}\n"
+            "\\end{table}"
+        )
+        result = smart_promote_wide_tables(content)
+        assert "\\resizebox" in result
+
+    def test_add_adjustbox_wraps_plain_tabular(self):
+        from src.agents.shared.table_converter import add_adjustbox_safety
+
+        latex = (
+            "\\begin{table}[htbp]\n"
+            "\\centering\n"
+            "\\caption{X}\\label{tab:adj}\n"
+            "\\begin{tabular}{cc}\n"
+            "a & b \\\\\n"
+            "\\end{tabular}\n"
+            "\\end{table}"
+        )
+        out = add_adjustbox_safety(latex)
+        assert "\\adjustbox" in out
+        assert "max width=\\columnwidth" in out
+
+    def test_add_adjustbox_skips_existing_resizebox(self):
+        from src.agents.shared.table_converter import add_adjustbox_safety
+
+        latex = (
+            "\\begin{table}[htbp]\n"
+            "\\centering\n"
+            "\\caption{X}\\label{tab:r}\n"
+            "\\resizebox{\\columnwidth}{!}{\n"
+            "\\begin{tabular}{cc}\n"
+            "a & b \\\\\n"
+            "\\end{tabular}\n"
+            "}\n"
+            "\\end{table}"
+        )
+        out = add_adjustbox_safety(latex)
+        assert "\\adjustbox" not in out
+
+    def test_add_adjustbox_table_star_uses_textwidth(self):
+        from src.agents.shared.table_converter import add_adjustbox_safety
+
+        latex = (
+            "\\begin{table*}[htbp]\n"
+            "\\centering\n"
+            "\\caption{W}\\label{tab:star}\n"
+            "\\begin{tabular}{ccc}\n"
+            "1 & 2 & 3 \\\\\n"
+            "\\end{tabular}\n"
+            "\\end{table*}"
+        )
+        out = add_adjustbox_safety(latex)
+        assert "\\adjustbox" in out
+        assert "max width=\\textwidth" in out
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Phase 5: End-to-end integration tests with real CSV data + pipeline wiring
 # ═══════════════════════════════════════════════════════════════════════════

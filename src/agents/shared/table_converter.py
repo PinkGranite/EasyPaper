@@ -618,8 +618,9 @@ class TableValidator:
 
 # Thresholds for smart promotion decisions
 _PROMOTE_TO_TABLE_STAR_MIN_COLS = 9
-_RESIZEBOX_MIN_COLS = 5
-_RESIZEBOX_MIN_CONTENT_WIDTH = 60
+_RESIZEBOX_MIN_COLS = 4
+_RESIZEBOX_MIN_CONTENT_WIDTH = 55
+_MULTICOLUMN_WIDE_MIN_SPAN = 3
 _FONT_SHRINK_MIN_COLS = 12
 
 
@@ -658,6 +659,60 @@ def _count_cols_from_spec(col_spec: str) -> int:
     """
     stripped = re.sub(r'\{[^}]*\}', '', col_spec)
     return len(re.findall(r'[lcrpXm]', stripped, re.IGNORECASE))
+
+
+def _estimate_max_tabular_row_width(body: str) -> int:
+    """
+    Estimate max raw text width across tabular rows (no booktabs required).
+    - **Description**:
+        - Scans lines between ``\\begin{tabular}`` and ``\\end{tabular}`` that
+          look like data rows (contain ``&`` and row terminator ``\\\\``).
+        - Complements ``_estimate_row_width`` for tables without ``\\toprule``.
+
+    - **Args**:
+        - `body` (str): Table environment body (may include caption, etc.).
+
+    - **Returns**:
+        - `int`: Maximum cleaned character width among detected rows.
+    """
+    tab_m = re.search(r'\\begin\{tabular[*]?\}\{[^}]*\}', body)
+    if not tab_m:
+        return 0
+    rest = body[tab_m.end():]
+    end_m = re.search(r'\\end\{tabular[*]?\}', rest)
+    if not end_m:
+        return 0
+    chunk = rest[: end_m.start()]
+    max_w = 0
+    for line in chunk.split("\n"):
+        stripped = line.strip()
+        if "&" not in stripped or "\\\\" not in stripped:
+            continue
+        if stripped.startswith("%"):
+            continue
+        clean = re.sub(r'\\[a-zA-Z]+\{[^}]*\}', '', stripped)
+        clean = re.sub(r'\\[a-zA-Z]+', '', clean)
+        clean = clean.replace("\\\\", "").replace("&", "").strip()
+        max_w = max(max_w, len(clean))
+    return max_w
+
+
+def _max_multicolumn_span(body: str) -> int:
+    """
+    Return the largest N in ``\\multicolumn{N}{...}`` within the table body.
+    - **Args**:
+        - `body` (str): Table environment body.
+
+    - **Returns**:
+        - `int`: Maximum span, or 0 if none.
+    """
+    spans = []
+    for m in re.finditer(r'\\multicolumn\{(\d+)\}', body):
+        try:
+            spans.append(int(m.group(1)))
+        except ValueError:
+            continue
+    return max(spans) if spans else 0
 
 
 def smart_promote_wide_tables(content: str) -> str:
@@ -701,12 +756,19 @@ def smart_promote_wide_tables(content: str) -> str:
 
         col_count = _count_cols_from_spec(col_spec)
 
-        # Estimate content width from first data row
+        # Estimate content width from first data row (booktabs) and any row
         content_width = _estimate_row_width(body)
+        loose_width = _estimate_max_tabular_row_width(body)
+        row_width = max(content_width, loose_width)
+        mc_span = _max_multicolumn_span(body)
 
         needs_resize = (
             col_count >= _RESIZEBOX_MIN_COLS
-            or content_width >= _RESIZEBOX_MIN_CONTENT_WIDTH
+            or row_width >= _RESIZEBOX_MIN_CONTENT_WIDTH
+            or (
+                mc_span >= _MULTICOLUMN_WIDE_MIN_SPAN
+                and col_count >= 3
+            )
         )
         needs_promote = (
             col_count >= _PROMOTE_TO_TABLE_STAR_MIN_COLS
@@ -752,6 +814,50 @@ def smart_promote_wide_tables(content: str) -> str:
         return f"{begin_tag}{new_body}{end_tag}"
 
     return env_pattern.sub(_process_table, content)
+
+
+def add_adjustbox_safety(content: str) -> str:
+    """
+    Wrap each ``tabular`` in ``\\adjustbox{max width=...}`` when not already scaled.
+    - **Description**:
+        - For double-column papers, shrinks tables that would overflow the column.
+        - Skips environments that already use ``\\resizebox`` or ``\\adjustbox``.
+        - Requires ``\\usepackage{adjustbox}`` (auto-injected by Typesetter when missing).
+
+    - **Args**:
+        - `content` (str): LaTeX fragment (e.g. one section body).
+
+    - **Returns**:
+        - `str`: Content with optional ``adjustbox`` wrappers added.
+    """
+    env_pattern = re.compile(
+        r'(\\begin\{(table\*?)\})(.*?)(\\end\{\2\})',
+        re.DOTALL,
+    )
+    tabular_full = re.compile(
+        r'(\\begin\{tabular[*]?\}\{[^}]*\}.*?\\end\{tabular[*]?\})',
+        re.DOTALL,
+    )
+
+    def _wrap(m: re.Match[str]) -> str:
+        begin_tag = m.group(1)
+        env_name = m.group(2)
+        body = m.group(3)
+        end_tag = m.group(4)
+        if "\\adjustbox" in body or "\\resizebox" in body:
+            return m.group(0)
+        tab_match = tabular_full.search(body)
+        if not tab_match:
+            return m.group(0)
+        original = tab_match.group(0)
+        width = "\\textwidth" if env_name == "table*" else "\\columnwidth"
+        wrapped_tab = (
+            f"\\adjustbox{{max width={width},center}}{{\n{original}\n}}"
+        )
+        new_body = body[: tab_match.start()] + wrapped_tab + body[tab_match.end() :]
+        return f"{begin_tag}{new_body}{end_tag}"
+
+    return env_pattern.sub(_wrap, content)
 
 
 def _estimate_row_width(body: str) -> int:

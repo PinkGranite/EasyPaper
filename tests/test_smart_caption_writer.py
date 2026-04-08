@@ -207,6 +207,8 @@ class TestLLMAssignElements:
         prompt = PlannerAgent._build_assignment_prompt(plan, figures, tables)
         assert "method" in prompt
         assert "Methodology" in prompt
+        assert "Describe architecture" in prompt
+        assert "Show performance" in prompt
         assert "fig:arch" in prompt
         assert "tab:perf" in prompt
 
@@ -456,3 +458,461 @@ class TestCompileCitationPrompt:
         assert "jones2023" in result
         assert "[CITE:deep_learning]" in result
         assert "JSON" in result or "json" in result
+
+
+# ============================= PHASE 4: FIGURE WIDTH =========================
+# ===========================================================================
+
+
+class TestFigureWidthDecision:
+    """PlannerAgent._should_be_wide_figure: VLM, aspect ratio, keyword fallback."""
+
+    def _open_context(self, size):
+        ctx = MagicMock()
+        ctx.__enter__.return_value = MagicMock(size=size)
+        ctx.__exit__.return_value = None
+        return ctx
+
+    def test_explicit_wide_flag_respected(self):
+        from src.agents.planner_agent.planner_agent import PlannerAgent
+
+        fig = SimpleNamespace(
+            id="f1", caption="", description="", wide=True, file_path="/any.png",
+        )
+        assert PlannerAgent._should_be_wide_figure(fig, None) is True
+
+    def test_vlm_is_wide_overrides_aspect_ratio(self):
+        from src.agents.planner_agent.planner_agent import PlannerAgent
+
+        fig = SimpleNamespace(
+            id="f1", caption="", description="", wide=False, file_path="/x.png",
+        )
+        vlm = SimpleNamespace(is_wide=True)
+        with patch("PIL.Image.open", side_effect=AssertionError("should not open")):
+            assert PlannerAgent._should_be_wide_figure(fig, vlm) is True
+
+    def test_vlm_false_returns_false_without_pil(self):
+        from src.agents.planner_agent.planner_agent import PlannerAgent
+
+        fig = SimpleNamespace(
+            id="f1", caption="architecture overview", description="",
+            wide=False, file_path="/x.png",
+        )
+        vlm = SimpleNamespace(is_wide=False)
+        with patch("PIL.Image.open", side_effect=AssertionError("should not open")):
+            assert PlannerAgent._should_be_wide_figure(fig, vlm) is False
+
+    def test_wide_aspect_ratio_returns_true(self):
+        from src.agents.planner_agent.planner_agent import PlannerAgent
+
+        fig = SimpleNamespace(
+            id="f1", caption="", description="", wide=False, file_path="/w.png",
+        )
+        with patch(
+            "PIL.Image.open",
+            return_value=self._open_context((1200, 400)),
+        ):
+            assert PlannerAgent._should_be_wide_figure(fig, None) is True
+
+    def test_tall_aspect_ratio_returns_false(self):
+        from src.agents.planner_agent.planner_agent import PlannerAgent
+
+        fig = SimpleNamespace(
+            id="f1", caption="", description="", wide=False, file_path="/t.png",
+        )
+        with patch(
+            "PIL.Image.open",
+            return_value=self._open_context((400, 800)),
+        ):
+            assert PlannerAgent._should_be_wide_figure(fig, None) is False
+
+    def test_square_aspect_ratio_uses_keywords(self):
+        from src.agents.planner_agent.planner_agent import PlannerAgent
+
+        fig_wide_kw = SimpleNamespace(
+            id="f1", caption="Model architecture diagram", description="",
+            wide=False, file_path="/s.png",
+        )
+        fig_narrow_kw = SimpleNamespace(
+            id="f2", caption="Simple accuracy plot", description="",
+            wide=False, file_path="/s2.png",
+        )
+        with patch(
+            "PIL.Image.open",
+            return_value=self._open_context((600, 600)),
+        ):
+            assert PlannerAgent._should_be_wide_figure(fig_wide_kw, None) is True
+            assert PlannerAgent._should_be_wide_figure(fig_narrow_kw, None) is False
+
+    def test_no_file_path_uses_keywords(self):
+        from src.agents.planner_agent.planner_agent import PlannerAgent
+
+        fig = SimpleNamespace(
+            id="f1", caption="Full pipeline overview", description="",
+            wide=False, file_path="",
+        )
+        assert PlannerAgent._should_be_wide_figure(fig, None) is True
+
+
+# ============================= PHASE 2: LLM ALLOCATION =========================
+# ===========================================================================
+
+
+class TestLLMAllocationIntegration:
+    """Async _assign_figure_table_definitions uses LLM + semantic prompt context."""
+
+    @pytest.mark.asyncio
+    async def test_assign_uses_llm_not_keywords(self):
+        from src.agents.planner_agent.planner_agent import PlannerAgent
+        from src.agents.planner_agent.models import (
+            FigureInfo,
+            PaperPlan,
+            PaperType,
+            ParagraphPlan,
+            PlanRequest,
+            SectionPlan,
+            TableInfo,
+        )
+
+        cfg = MagicMock()
+        cfg.model_name = "m"
+        cfg.api_key = "k"
+        cfg.base_url = "http://127.0.0.1"
+        agent = PlannerAgent(cfg, vlm_service=None)
+        agent._llm_json_call = AsyncMock(
+            return_value={"fig:a": "method", "tab:b": "result"},
+        )
+
+        sections = [
+            SectionPlan(
+                section_type="introduction",
+                section_title="Intro",
+                paragraphs=[ParagraphPlan(key_point="Motivation")],
+            ),
+            SectionPlan(
+                section_type="method",
+                section_title="Method",
+                paragraphs=[ParagraphPlan(key_point="Describe model")],
+            ),
+            SectionPlan(
+                section_type="result",
+                section_title="Results",
+                paragraphs=[ParagraphPlan(key_point="Show numbers")],
+            ),
+        ]
+        plan = PaperPlan(
+            title="T",
+            paper_type=PaperType.EMPIRICAL,
+            sections=sections,
+            contributions=["c"],
+        )
+        request = PlanRequest(
+            idea_hypothesis="i",
+            method="m",
+            data="d",
+            experiments="e",
+            figures=[FigureInfo(id="fig:a", caption="Q-Former architecture")],
+            tables=[TableInfo(id="tab:b", caption="Zero-shot VQA accuracy")],
+        )
+
+        await agent._assign_figure_table_definitions(plan, request, {}, {})
+
+        method_sec = next(s for s in plan.sections if s.section_type == "method")
+        result_sec = next(s for s in plan.sections if s.section_type == "result")
+        assert any(f.figure_id == "fig:a" for f in method_sec.figures)
+        assert any(t.table_id == "tab:b" for t in result_sec.tables)
+        agent._llm_json_call.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_assign_distributes_tables_across_sections(self):
+        from src.agents.planner_agent.planner_agent import PlannerAgent
+        from src.agents.planner_agent.models import (
+            PaperPlan,
+            PaperType,
+            ParagraphPlan,
+            PlanRequest,
+            SectionPlan,
+            TableInfo,
+        )
+
+        cfg = MagicMock()
+        cfg.model_name = "m"
+        cfg.api_key = "k"
+        cfg.base_url = "http://127.0.0.1"
+        agent = PlannerAgent(cfg, vlm_service=None)
+        agent._llm_json_call = AsyncMock(
+            return_value={
+                "tab:main": "result",
+                "tab:setup": "experiment_setup",
+            },
+        )
+
+        sections = [
+            SectionPlan(
+                section_type="introduction",
+                section_title="Intro",
+                paragraphs=[ParagraphPlan(key_point="Overview")],
+            ),
+            SectionPlan(
+                section_type="experiment_setup",
+                section_title="Experimental setup",
+                paragraphs=[ParagraphPlan(key_point="Datasets and baselines")],
+            ),
+            SectionPlan(
+                section_type="result",
+                section_title="Results",
+                paragraphs=[ParagraphPlan(key_point="Main metrics")],
+            ),
+        ]
+        plan = PaperPlan(
+            title="T",
+            paper_type=PaperType.EMPIRICAL,
+            sections=sections,
+            contributions=["c"],
+        )
+        request = PlanRequest(
+            idea_hypothesis="i",
+            method="m",
+            data="d",
+            experiments="e",
+            tables=[
+                TableInfo(id="tab:main", caption="Main comparison"),
+                TableInfo(id="tab:setup", caption="Training hyperparameters"),
+            ],
+        )
+
+        await agent._assign_figure_table_definitions(plan, request, {}, {})
+
+        res = next(s for s in plan.sections if s.section_type == "result")
+        exp = next(s for s in plan.sections if s.section_type == "experiment_setup")
+        assert any(t.table_id == "tab:main" for t in res.tables)
+        assert any(t.table_id == "tab:setup" for t in exp.tables)
+
+    def test_assign_prompt_includes_vlm_and_normalized_caption(self):
+        from src.agents.planner_agent.planner_agent import PlannerAgent
+
+        sections = [
+            _make_section_plan("result", "Results", ["Main scores"]),
+        ]
+        plan = SimpleNamespace(sections=sections)
+        fig = _make_element_info("fig:x", "Figure 2. Ablations")
+        vlm = SimpleNamespace(
+            semantic_role="ablation_study",
+            message="Shows component contributions",
+            suggested_section="result",
+        )
+        prompt = PlannerAgent._build_assignment_prompt(
+            plan, {"fig:x": fig}, {}, figure_analyses={"fig:x": vlm},
+        )
+        assert "Main scores" in prompt
+        assert "Figure 2." not in prompt
+        assert "ablation_study" in prompt
+        assert "vlm_summary=" in prompt
+
+    @pytest.mark.asyncio
+    async def test_assign_fallback_on_llm_failure(self):
+        from src.agents.planner_agent.planner_agent import PlannerAgent
+        from src.agents.planner_agent.models import (
+            PaperPlan,
+            PaperType,
+            ParagraphPlan,
+            PlanRequest,
+            SectionPlan,
+            TableInfo,
+        )
+
+        cfg = MagicMock()
+        cfg.model_name = "m"
+        cfg.api_key = "k"
+        cfg.base_url = "http://127.0.0.1"
+        agent = PlannerAgent(cfg, vlm_service=None)
+        agent._llm_json_call = AsyncMock(side_effect=RuntimeError("api down"))
+
+        sections = [
+            SectionPlan(
+                section_type="introduction",
+                section_title="Intro",
+                paragraphs=[ParagraphPlan(key_point="Overview")],
+            ),
+            SectionPlan(
+                section_type="result",
+                section_title="Results",
+                paragraphs=[ParagraphPlan(key_point="Numbers")],
+            ),
+        ]
+        plan = PaperPlan(
+            title="T",
+            paper_type=PaperType.EMPIRICAL,
+            sections=sections,
+            contributions=["c"],
+        )
+        request = PlanRequest(
+            idea_hypothesis="i",
+            method="m",
+            data="d",
+            experiments="e",
+            tables=[TableInfo(id="tab:z", caption="Performance on benchmark")],
+        )
+
+        await agent._assign_figure_table_definitions(plan, request, {}, {})
+
+        placed = []
+        for sec in plan.sections:
+            placed.extend(t.table_id for t in sec.tables)
+        assert "tab:z" in placed
+
+    @pytest.mark.asyncio
+    async def test_assign_respects_capacity(self):
+        from src.agents.planner_agent.planner_agent import PlannerAgent
+        from src.agents.planner_agent.models import (
+            PaperPlan,
+            PaperType,
+            ParagraphPlan,
+            PlanRequest,
+            SectionPlan,
+            TableInfo,
+        )
+
+        cfg = MagicMock()
+        cfg.model_name = "m"
+        cfg.api_key = "k"
+        cfg.base_url = "http://127.0.0.1"
+        agent = PlannerAgent(cfg, vlm_service=None)
+        agent._llm_json_call = AsyncMock(
+            return_value={f"tab:{i}": "result" for i in range(6)},
+        )
+
+        sections = [
+            SectionPlan(
+                section_type="introduction",
+                section_title="Intro",
+                paragraphs=[ParagraphPlan(key_point="I")],
+            ),
+            SectionPlan(
+                section_type="method",
+                section_title="Method",
+                paragraphs=[ParagraphPlan(key_point="M")],
+            ),
+            SectionPlan(
+                section_type="result",
+                section_title="Results",
+                paragraphs=[ParagraphPlan(key_point="R")],
+            ),
+            SectionPlan(
+                section_type="analysis",
+                section_title="Analysis",
+                paragraphs=[ParagraphPlan(key_point="A")],
+            ),
+        ]
+        plan = PaperPlan(
+            title="T",
+            paper_type=PaperType.EMPIRICAL,
+            sections=sections,
+            contributions=["c"],
+        )
+        tables = [
+            TableInfo(id=f"tab:{i}", caption=f"Table {i}")
+            for i in range(6)
+        ]
+        request = PlanRequest(
+            idea_hypothesis="i",
+            method="m",
+            data="d",
+            experiments="e",
+            tables=tables,
+        )
+
+        await agent._assign_figure_table_definitions(plan, request, {}, {})
+
+        result_sec = next(s for s in plan.sections if s.section_type == "result")
+        assert len(result_sec.tables) <= 3
+
+
+# ============================= PHASE 1: PROMPT CAPTION NORMALIZATION =========
+# ===========================================================================
+
+
+class TestCaptionNormInPrompts:
+    """Prompts must not echo 'Figure N.' / 'Table N.' into model context (duplicate numbering)."""
+
+    def test_compile_section_prompt_normalizes_captions(self):
+        from src.agents.shared.prompt_compiler import compile_section_prompt
+
+        fig = SimpleNamespace(id="fig:arch", caption="Figure 2. Architecture overview")
+        tbl = SimpleNamespace(id="tab:main", caption="Table 3. Main results")
+        out = compile_section_prompt(
+            "method",
+            thesis="t",
+            figures=[fig],
+            tables=[tbl],
+        )
+        assert "Figure 2." not in out
+        assert "Architecture overview" in out
+        assert "Table 3." not in out
+        assert "Main results" in out
+
+    def test_compile_introduction_prompt_normalizes_captions(self):
+        from src.agents.shared.prompt_compiler import compile_introduction_prompt
+
+        fig = SimpleNamespace(id="fig:q", caption="Figure 2. (Left) Q-Former")
+        tbl = SimpleNamespace(id="tab:x", caption="Table 1. Comparison")
+        out = compile_introduction_prompt(
+            paper_title="T",
+            idea_hypothesis="i",
+            method_summary="m",
+            data_summary="d",
+            experiments_summary="e",
+            section_plan=None,
+            figures=[fig],
+            tables=[tbl],
+        )
+        assert "Figure 2." not in out
+        assert "(Left) Q-Former" in out
+        assert "Table 1." not in out
+        assert "Comparison" in out
+
+    def test_compile_body_section_prompt_normalizes_captions(self):
+        from src.agents.shared.prompt_compiler import compile_body_section_prompt
+
+        fig = SimpleNamespace(id="fig:a", caption="Figure 4. Examples")
+        tbl = SimpleNamespace(id="tab:b", caption="Table 5. Stats")
+        plan = SimpleNamespace(
+            section_type="result",
+            section_title="Results",
+            paragraphs=[],
+            figures=[],
+            tables=[],
+            figures_to_reference=["fig:a"],
+            tables_to_reference=["tab:b"],
+            assigned_refs=[],
+        )
+        out = compile_body_section_prompt(
+            section_type="result",
+            metadata_content="meta",
+            intro_context="intro",
+            section_plan=plan,
+            figures=[fig],
+            tables=[tbl],
+        )
+        assert "Figure 4." not in out
+        assert "Examples" in out
+        assert "Table 5." not in out
+        assert "Stats" in out
+
+    def test_compile_body_section_prompt_legacy_fallback_normalizes(self):
+        from src.agents.shared.prompt_compiler import compile_body_section_prompt
+
+        fig = SimpleNamespace(id="fig:a", caption="Figure 2. Wide diagram")
+        tbl = SimpleNamespace(id="tab:b", caption="Table 2. Data")
+        out = compile_body_section_prompt(
+            section_type="method",
+            metadata_content="m",
+            intro_context="i",
+            section_plan=None,
+            figures=[fig],
+            tables=[tbl],
+        )
+        assert "Figure 2." not in out
+        assert "Wide diagram" in out
+        assert "Table 2." not in out
+        assert "Data" in out

@@ -393,6 +393,7 @@ class TemplateAnalyzer:
 # ═══════════════════════════════════════════════════════════════════════════
 
 COMMAND_TO_PACKAGE: Dict[str, str] = {
+    "\\adjustbox": "adjustbox",
     # booktabs
     "\\toprule": "booktabs",
     "\\midrule": "booktabs",

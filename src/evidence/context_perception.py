@@ -88,7 +88,7 @@ class ContextPerceptionModule:
                 "experiments": getattr(metadata, "experiments", ""),
             }
 
-        dag = self._dag_builder.build(
+        dag = await self._dag_builder.build(
             code_context=code_context,
             research_context=research_context,
             figures=figures or [],

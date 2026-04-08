@@ -221,15 +221,17 @@ class TestDocumentSpec:
 class TestDAGBuilder:
     """Verify DAGBuilder can construct a DAG from scratch."""
 
-    def test_build_empty_dag(self):
+    @pytest.mark.asyncio
+    async def test_build_empty_dag(self):
         from src.evidence.dag_builder import DAGBuilder
         builder = DAGBuilder()
-        dag = builder.build()
+        dag = await builder.build()
         assert dag is not None
         assert len(dag.evidence_nodes) == 0
         assert len(dag.claim_nodes) == 0
 
-    def test_build_with_code_context(self):
+    @pytest.mark.asyncio
+    async def test_build_with_code_context(self):
         from src.evidence.dag_builder import DAGBuilder
         builder = DAGBuilder()
         code_context = {
@@ -250,10 +252,11 @@ class TestDAGBuilder:
                 },
             ],
         }
-        dag = builder.build(code_context=code_context)
+        dag = await builder.build(code_context=code_context)
         assert len(dag.evidence_nodes) >= 2, "Should have at least 2 code evidence nodes"
 
-    def test_build_with_research_context(self):
+    @pytest.mark.asyncio
+    async def test_build_with_research_context(self):
         from src.evidence.dag_builder import DAGBuilder
         builder = DAGBuilder()
         research_context = {
@@ -262,10 +265,11 @@ class TestDAGBuilder:
                 {"ref_id": "vaswani2017", "title": "Attention", "contribution": "Self-attention"},
             ],
         }
-        dag = builder.build(research_context=research_context)
+        dag = await builder.build(research_context=research_context)
         assert len(dag.evidence_nodes) >= 2
 
-    def test_build_with_plan(self):
+    @pytest.mark.asyncio
+    async def test_build_with_plan(self):
         from src.evidence.dag_builder import DAGBuilder
         from src.agents.planner_agent.models import (
             PaperPlan, SectionPlan, ParagraphPlan,
@@ -289,10 +293,11 @@ class TestDAGBuilder:
             ],
         )
         builder = DAGBuilder()
-        dag = builder.build(paper_plan=plan)
+        dag = await builder.build(paper_plan=plan)
         assert len(dag.claim_nodes) >= 3, "Should extract claims from paragraphs"
 
-    def test_full_dag_with_edges(self):
+    @pytest.mark.asyncio
+    async def test_full_dag_with_edges(self):
         from src.evidence.dag_builder import DAGBuilder
         from src.agents.planner_agent.models import (
             PaperPlan, SectionPlan, ParagraphPlan,
@@ -314,7 +319,7 @@ class TestDAGBuilder:
                 ),
             ],
         )
-        dag = builder.build(code_context=code_context, paper_plan=plan)
+        dag = await builder.build(code_context=code_context, paper_plan=plan)
         assert len(dag.edges) > 0, "Should have heuristic edges"
 
 

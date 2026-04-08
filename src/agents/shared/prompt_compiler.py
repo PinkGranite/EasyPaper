@@ -21,6 +21,30 @@ if TYPE_CHECKING:
 _prompt_loader = _PromptLoader()
 
 
+def _prompt_caption(elem: Any) -> str:
+    """
+    Extract caption from a figure/table spec and strip duplicate numbering for prompts.
+    - **Description**:
+        - LaTeX adds \"Figure N.\" via \\caption; raw metadata often repeats it.
+        - Normalizes before injecting into LLM prompts.
+
+    - **Args**:
+        - `elem` (Any): FigureSpec, TableSpec, or dict with optional \"caption\".
+
+    - **Returns**:
+        - `str`: Normalized caption, or empty string if missing.
+    """
+    if elem is None:
+        return ""
+    if isinstance(elem, dict):
+        raw = str(elem.get("caption", "") or "")
+    elif hasattr(elem, "caption"):
+        raw = str(getattr(elem, "caption", "") or "")
+    else:
+        return ""
+    return normalize_caption(raw) if raw else ""
+
+
 PROMPT_BUDGETS: Dict[str, int] = {
     "metadata_content_chars": 2800,
     "intro_context_chars": 1600,
@@ -648,12 +672,17 @@ def compile_section_prompt(
                 figs_info.append(f"- {fig.figure_id}")
             elif hasattr(fig, "id"):
                 fig_str = f"- {fig.id}"
-                if hasattr(fig, "caption") and fig.caption:
-                    fig_str += f": {fig.caption}"
+                cap = _prompt_caption(fig)
+                if cap:
+                    fig_str += f": {cap}"
                 figs_info.append(fig_str)
             elif isinstance(fig, dict):
                 fig_id = fig.get("figure_id", fig.get("id", "unknown"))
-                figs_info.append(f"- {fig_id}")
+                cap = _prompt_caption(fig)
+                line = f"- {fig_id}"
+                if cap:
+                    line += f": {cap}"
+                figs_info.append(line)
         if figs_info:
             prompt_parts.append(f"\n## Available Figures\n" + "\n".join(figs_info))
 
@@ -664,12 +693,17 @@ def compile_section_prompt(
                 tables_info.append(f"- {tbl.table_id}")
             elif hasattr(tbl, "id"):
                 tbl_str = f"- {tbl.id}"
-                if hasattr(tbl, "caption") and tbl.caption:
-                    tbl_str += f": {tbl.caption}"
+                cap = _prompt_caption(tbl)
+                if cap:
+                    tbl_str += f": {cap}"
                 tables_info.append(tbl_str)
             elif isinstance(tbl, dict):
                 tbl_id = tbl.get("table_id", tbl.get("id", "unknown"))
-                tables_info.append(f"- {tbl_id}")
+                cap = _prompt_caption(tbl)
+                line = f"- {tbl_id}"
+                if cap:
+                    line += f": {cap}"
+                tables_info.append(line)
         if tables_info:
             prompt_parts.append(f"\n## Available Tables\n" + "\n".join(tables_info))
 
@@ -837,7 +871,7 @@ The Introduction is the LEADER section that:
         figs_info = []
         for fig in figures:
             fig_id = fig.id if hasattr(fig, "id") else fig.get("id", "")
-            caption = fig.caption if hasattr(fig, "caption") else fig.get("caption", "")
+            caption = _prompt_caption(fig)
             if fig_id:
                 figs_info.append(f"- \\ref{{{fig_id}}}: {caption}")
         if figs_info:
@@ -852,7 +886,7 @@ The Introduction is the LEADER section that:
         tables_info = []
         for tbl in tables:
             tbl_id = tbl.id if hasattr(tbl, "id") else tbl.get("id", "")
-            caption = tbl.caption if hasattr(tbl, "caption") else tbl.get("caption", "")
+            caption = _prompt_caption(tbl)
             if tbl_id:
                 tables_info.append(f"- \\ref{{{tbl_id}}}: {caption}")
         if tables_info:
@@ -1059,9 +1093,7 @@ def compile_body_section_prompt(
                     figure_map[fid] = fig
             for fig_id in figs_to_ref:
                 fig = figure_map.get(fig_id)
-                caption = ""
-                if fig:
-                    caption = fig.caption if hasattr(fig, "caption") else fig.get("caption", "")
+                caption = _prompt_caption(fig) if fig else ""
                 prompt += f"- {fig_id}: {caption} -> use `Figure~\\\\ref{{{fig_id}}}`\n"
 
         # Table placement guidance
@@ -1080,9 +1112,7 @@ def compile_body_section_prompt(
                     table_map[tid] = tbl
             for tbl_id in tbls_to_ref:
                 tbl = table_map.get(tbl_id)
-                caption = ""
-                if tbl:
-                    caption = tbl.caption if hasattr(tbl, "caption") else tbl.get("caption", "")
+                caption = _prompt_caption(tbl) if tbl else ""
                 prompt += f"- {tbl_id}: {caption} -> use `Table~\\\\ref{{{tbl_id}}}`\n"
 
     else:
@@ -1091,7 +1121,7 @@ def compile_body_section_prompt(
             figs_info = []
             for fig in figures:
                 fig_id = fig.id if hasattr(fig, "id") else fig.get("id", "")
-                caption = fig.caption if hasattr(fig, "caption") else fig.get("caption", "")
+                caption = _prompt_caption(fig)
                 if fig_id:
                     figs_info.append(f"- {fig_id}: {caption}")
             if figs_info:
@@ -1101,7 +1131,7 @@ def compile_body_section_prompt(
             tables_info = []
             for tbl in tables:
                 tbl_id = tbl.id if hasattr(tbl, "id") else tbl.get("id", "")
-                caption = tbl.caption if hasattr(tbl, "caption") else tbl.get("caption", "")
+                caption = _prompt_caption(tbl)
                 if tbl_id:
                     tables_info.append(f"- {tbl_id}: {caption}")
             if tables_info:
