@@ -106,8 +106,15 @@ class SubSectionPlan(BaseModel):
         - Enables hierarchical structure within a section (e.g., multiple experiments
           within the Experiments section, multiple components within Method)
         - Each subsection has a clear title and ordered paragraphs
+        - mission/key_themes/depends_on/transition_from_previous are populated
+          by the incremental planning pipeline (Step 5b) to provide cumulative
+          context for sequential subsection generation.
     """
     title: str = ""
+    mission: str = ""
+    key_themes: List[str] = Field(default_factory=list)
+    depends_on: List[str] = Field(default_factory=list)
+    transition_from_previous: str = ""
     paragraphs: List[ParagraphPlan] = Field(default_factory=list)
 
 
@@ -153,9 +160,13 @@ class SectionPlan(BaseModel):
     - **Description**:
         - Contains paragraph-level structure instead of word counts
         - Figures/Tables use placement objects with semantic info
+        - mission/key_content are populated by Step 1 of the incremental
+          planning pipeline to provide structured context for later steps.
     """
     section_type: str
     section_title: str = ""
+    mission: str = ""
+    key_content: List[str] = Field(default_factory=list)
     paragraphs: List[ParagraphPlan] = Field(default_factory=list)
     subsections: List[SubSectionPlan] = Field(default_factory=list)
     figures: List[FigurePlacement] = Field(default_factory=list)

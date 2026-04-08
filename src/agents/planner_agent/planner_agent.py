@@ -80,8 +80,18 @@ Output JSON:
   "contributions": ["Contribution 1", "Contribution 2", ...],
   "narrative_style": "technical|tutorial|concise|comprehensive",
   "sections": [
-    {{"section_type": "abstract", "section_title": "Abstract"}},
-    {{"section_type": "introduction", "section_title": "Introduction"}},
+    {{
+      "section_type": "abstract",
+      "section_title": "Abstract",
+      "mission": "What this section must accomplish in 1-2 sentences",
+      "key_content": ["Content point 1", "Content point 2"]
+    }},
+    {{
+      "section_type": "introduction",
+      "section_title": "Introduction",
+      "mission": "Motivate the problem and present contributions",
+      "key_content": ["Problem background", "Research gap", "Proposed approach", "Contributions summary"]
+    }},
     ...
   ],
   "structure_rationale": "Why this structure suits the venue and content",
@@ -92,6 +102,9 @@ IMPORTANT:
 - "abstract" is always required.
 - Choose sections appropriate for {style_guide}. Use your knowledge of venue norms.
 - Each section needs section_type (lowercase, e.g. "method", "result") and section_title.
+- Each section MUST include "mission" (1-2 sentence goal) and "key_content" (list of content points to cover).
+- The mission should capture what the section must accomplish, not just describe its topic.
+- key_content should list concrete content points that the section needs to address.
 - For empirical studies, consider whether a dedicated Method section is needed.
 - Conclusion is optional; for Nature-style, it may be integrated into Discussion.
 Output valid JSON only."""
@@ -762,13 +775,15 @@ class PlannerAgent(BaseAgent):
         abstract_focus = structure.get("abstract_focus", "")
 
         raw_sections = structure.get("sections", [])
-        section_order: List[Dict[str, str]] = []
+        section_order: List[Dict[str, Any]] = []
         for s in raw_sections:
             if isinstance(s, dict) and s.get("section_type"):
                 st = self._normalize_section_type_name(str(s["section_type"]))
                 section_order.append({
                     "section_type": st,
                     "section_title": s.get("section_title", self._get_section_title(st)),
+                    "mission": s.get("mission", ""),
+                    "key_content": s.get("key_content", []) if isinstance(s.get("key_content"), list) else [],
                 })
 
         if not section_order or len(section_order) < 3:
@@ -830,7 +845,7 @@ class PlannerAgent(BaseAgent):
         )
 
         # =============================================================
-        # STEP 3: Per-Section Planning
+        # STEP 3: Figure/Table Assignment (unchanged)
         # =============================================================
         n_body = sum(
             1 for s in section_order
@@ -838,22 +853,22 @@ class PlannerAgent(BaseAgent):
         )
         sections: List[SectionPlan] = []
 
-        # Pre-assign figures to sections so each figure is DEFINED in
-        # exactly one section.  Other sections may still REFERENCE it.
         figure_assignment = self._assign_figures_to_sections(
             request.figures or [], section_order,
         )
 
+        # Build initial SectionPlan shells with mission/key_content from Step 1,
+        # plus figure/table placements and citation budgets.
         for order, sec_info in enumerate(section_order):
             section_type = sec_info["section_type"]
             section_title = sec_info["section_title"]
 
-            # Abstract and conclusion are synthesis sections generated
-            # separately; skip Step 3 planning (no figures, no paragraphs).
             if section_type in ("abstract", "conclusion"):
                 sections.append(SectionPlan(
                     section_type=section_type,
                     section_title=section_title,
+                    mission=sec_info.get("mission", ""),
+                    key_content=sec_info.get("key_content", []),
                     paragraphs=[],
                     figures=[],
                     tables=[],
@@ -862,7 +877,6 @@ class PlannerAgent(BaseAgent):
                     citation_budget={"target_refs": 0, "min_refs": 0, "max_refs": 0},
                     order=order,
                 ))
-                logger.info("planner.step3_skip section=%s (synthesis)", section_type)
                 continue
 
             # Allocate word budget per section proportionally
@@ -874,52 +888,18 @@ class PlannerAgent(BaseAgent):
             else:
                 section_words = max(400, total_words // max(1, n_body))
 
-            section_paragraphs = max(1, section_words // WORDS_PER_PARAGRAPH)
-
-            # Build per-section figure info distinguishing DEFINE vs REFERENCE
+            # Build figure/table placements for this section
             section_figure_info = self._format_section_figure_info(
                 request.figures or [], figure_analyses or {},
                 section_type, figure_assignment,
             )
-
-            step3_prompt = STEP3_SECTION_USER.format(
-                section_type=section_type,
-                section_title=section_title,
-                title=request.title,
-                paper_type=paper_type.value,
-                style_guide=style_guide,
-                section_words=section_words,
-                section_paragraphs=section_paragraphs,
-                contributions=", ".join(contributions) if contributions else "Not specified",
-                figure_info=section_figure_info,
-                table_info=table_info,
-                reference_keys=", ".join(reference_keys) if reference_keys else "None",
-                code_writing_assets_summary=code_summary,
-                idea_hypothesis=request.idea_hypothesis[:1500],
-                method=request.method[:1500],
-                data=request.data[:1000],
-                experiments=request.experiments[:1500],
-            )
-            section_data = await self._llm_json_call(
-                STEP3_SECTION_SYSTEM, step3_prompt,
-                f"step3_{section_type}",
-            )
-
-            # Parse paragraphs
-            raw_paragraphs = section_data.get("paragraphs", [])
-            paragraphs = self._parse_paragraph_plans(raw_paragraphs)
-            if not paragraphs:
-                default_sents = max(3, section_words // WORDS_PER_SENTENCE)
-                paragraphs = self._generate_default_paragraphs(
-                    section_type, default_sents, section_data,
-                )
-
-            # Parse figure/table placements
             figure_placements = self._build_figure_placements(
-                section_data.get("figures", []), figure_analyses or {},
+                [{"figure_id": fid} for fid in figure_assignment
+                 if figure_assignment.get(fid) == section_type],
+                figure_analyses or {},
             )
             table_placements = self._build_table_placements(
-                section_data.get("tables", []), table_analyses or {},
+                [], table_analyses or {},
             )
 
             # Citation budget from Step 2
@@ -932,54 +912,89 @@ class PlannerAgent(BaseAgent):
             else:
                 citation_budget = {}
 
-            section = SectionPlan(
+            sections.append(SectionPlan(
                 section_type=section_type,
                 section_title=section_title,
-                paragraphs=paragraphs,
+                mission=sec_info.get("mission", ""),
+                key_content=sec_info.get("key_content", []),
+                paragraphs=[],
                 figures=figure_placements,
                 tables=table_placements,
-                figures_to_reference=section_data.get("figures_to_reference", []),
-                tables_to_reference=section_data.get("tables_to_reference", []),
-                content_sources=section_data.get(
-                    "content_sources", self._get_default_sources(section_type),
-                ),
+                content_sources=self._get_default_sources(section_type),
                 depends_on=self._get_dependencies(section_type),
                 citation_budget=citation_budget,
-                topic_clusters=self._normalize_string_list(
-                    section_data.get("topic_clusters", []), max_items=4,
-                ),
-                transition_intents=self._normalize_string_list(
-                    section_data.get("transition_intents", []), max_items=3,
-                ),
-                sectioning_recommended=self._coerce_bool(
-                    section_data.get("sectioning_recommended", False),
-                ),
-                code_focus=self._normalize_code_focus(
-                    section_data.get("code_focus", {}),
-                ),
-                writing_guidance=section_data.get("writing_guidance", ""),
                 order=order,
+            ))
+
+        # =============================================================
+        # STEP 4 + 5a/5b: Incremental Per-Section Planning
+        # =============================================================
+        prior_sections_summary = ""
+        prior_key_points = ""
+
+        for section in sections:
+            if section.section_type in ("abstract", "conclusion"):
+                continue
+
+            section_words = max(400, total_words // max(1, n_body))
+            alloc = (citation_strategy.get("section_allocation") or {}).get(section.section_type, {})
+            if isinstance(alloc, dict) and alloc.get("target_refs"):
+                total_target = int(citation_strategy.get("total_target", 1) or 1)
+                share = int(alloc.get("target_refs", 0)) / max(1, total_target)
+                section_words = max(400, int(total_words * max(share, 0.1)))
+
+            # Step 4: Decide structure
+            structure_decision = await self._decide_section_structure(
+                section=section,
+                paper_type=paper_type.value,
+                contributions=contributions,
+                venue=style_guide,
+                word_budget=section_words,
+                prior_sections_summary=prior_sections_summary,
             )
 
-            # Heuristic: auto-enable sectioning for long sections with clusters
-            all_paras = section._all_paragraphs()
-            if (
-                not section.sectioning_recommended
-                and len(all_paras) >= 5
-                and len(section.topic_clusters) >= 2
-                and section_type not in ("abstract", "conclusion", "introduction")
-            ):
+            needs_subs = self._coerce_bool(structure_decision.get("needs_subsections", False))
+
+            if needs_subs:
+                # Step 5b: Subsection paragraph plans
+                section.subsections = await self._plan_subsection_paragraphs(
+                    section=section,
+                    subsection_structure=structure_decision,
+                    reference_keys=reference_keys,
+                )
                 section.sectioning_recommended = True
-
-            if section.sectioning_recommended and len(section.topic_clusters) > 1:
-                section = self._split_into_subsections(section, section.topic_clusters)
-
-            sections.append(section)
+                sub_summary = ", ".join(s.title for s in section.subsections)
+                total_paras_in_section = sum(
+                    len(s.paragraphs) for s in section.subsections
+                )
+                prior_sections_summary += (
+                    f"{section.section_type}: {total_paras_in_section} paras, "
+                    f"{len(section.subsections)} subs ({sub_summary}); "
+                )
+                for sub in section.subsections:
+                    for p in sub.paragraphs:
+                        if p.key_point:
+                            prior_key_points += f"- [{section.section_type}/{sub.title}] {p.key_point}\n"
+            else:
+                # Step 5a: Flat paragraph plans
+                section.paragraphs = await self._plan_flat_paragraphs(
+                    section=section,
+                    word_budget=section_words,
+                    reference_keys=reference_keys,
+                    prior_key_points=prior_key_points,
+                )
+                prior_sections_summary += (
+                    f"{section.section_type}: {len(section.paragraphs)} paras, flat; "
+                )
+                for p in section.paragraphs:
+                    if p.key_point:
+                        prior_key_points += f"- [{section.section_type}] {p.key_point}\n"
 
             logger.info(
-                "planner.step3_section section=%s paragraphs=%d sentences=%d",
-                section_type, len(paragraphs),
-                sum(p.approx_sentences for p in paragraphs),
+                "planner.step4_5 section=%s subsections=%s paragraphs=%d",
+                section.section_type,
+                len(section.subsections) if section.subsections else 0,
+                len(section._all_paragraphs()),
             )
 
         # Whole-plan paragraph budget validation
@@ -2764,6 +2779,285 @@ class PlannerAgent(BaseAgent):
                 cluster_index=raw.get("cluster_index"),
             ))
         return paragraphs
+
+    # =================================================================
+    # Incremental Planning: Step 4 -- Per-Section Structure Decision
+    # =================================================================
+
+    _STEP4_STRUCTURE_SYSTEM = (
+        "You are an expert academic paper planner. "
+        "Decide whether a section needs subsections based on its mission and content scope. "
+        "Output ONLY a JSON object. No markdown, no explanation."
+    )
+
+    async def _decide_section_structure(
+        self,
+        section: SectionPlan,
+        paper_type: str,
+        contributions: List[str],
+        venue: str,
+        word_budget: int,
+        prior_sections_summary: str,
+    ) -> Dict[str, Any]:
+        """
+        Decide whether a section needs subsections and, if so, what they are.
+        - **Description**:
+            - Uses only mission/key_content (no raw metadata) as context.
+            - Includes prior_sections_summary for cumulative awareness.
+            - Returns dict with needs_subsections, reasoning, optional subsections[].
+
+        - **Args**:
+            - `section` (SectionPlan): Section with mission/key_content populated.
+            - `paper_type` (str): e.g. "empirical", "survey".
+            - `contributions` (List[str]): Paper's key contributions.
+            - `venue` (str): Target venue / style guide.
+            - `word_budget` (int): Approximate word budget for this section.
+            - `prior_sections_summary` (str): Summary of earlier sections' structure.
+
+        - **Returns**:
+            - `Dict[str, Any]`: Structure decision with needs_subsections, reasoning,
+              and optional subsections/cross_subsection_transitions.
+        """
+        figures_str = ", ".join(f.figure_id for f in section.figures) if section.figures else "None"
+        tables_str = ", ".join(t.table_id for t in section.tables) if section.tables else "None"
+
+        prompt = f"""Decide whether this section needs subsections:
+
+**Section**: {section.section_title} ({section.section_type})
+**Mission**: {section.mission}
+**Key content points**: {json.dumps(section.key_content)}
+**Paper type**: {paper_type}
+**Contributions**: {json.dumps(contributions)}
+**Venue**: {venue}
+**Word budget**: ~{word_budget} words
+**Assigned figures**: {figures_str}
+**Assigned tables**: {tables_str}
+**Prior sections structure**: {prior_sections_summary or "None (this is the first body section)"}
+
+Output JSON:
+{{
+  "needs_subsections": true/false,
+  "reasoning": "Why subsections are/aren't needed",
+  "subsections": [
+    {{
+      "title": "Subsection Title",
+      "mission": "What this subsection must accomplish",
+      "key_themes": ["theme1", "theme2"],
+      "depends_on": ["Title of predecessor subsection if any"],
+      "approx_paragraphs": 3
+    }}
+  ],
+  "cross_subsection_transitions": ["Transition guidance between sub_i and sub_i+1"]
+}}
+
+If needs_subsections is false, omit subsections and cross_subsection_transitions.
+Only recommend subsections when the content is genuinely complex enough to warrant them (typically 3+ distinct themes or multi-stage processes).
+Output valid JSON only."""
+
+        return await self._llm_json_call(
+            self._STEP4_STRUCTURE_SYSTEM, prompt, f"step4_{section.section_type}",
+        )
+
+    # =================================================================
+    # Incremental Planning: Step 5a -- Flat Paragraph Plan
+    # =================================================================
+
+    _STEP5A_SYSTEM = (
+        "You are an expert academic paper planner. "
+        "Generate a paragraph-level plan for a paper section. "
+        "Output ONLY a JSON object. No markdown, no explanation."
+    )
+
+    async def _plan_flat_paragraphs(
+        self,
+        section: SectionPlan,
+        word_budget: int,
+        reference_keys: List[str],
+        prior_key_points: str,
+    ) -> List[ParagraphPlan]:
+        """
+        Generate flat paragraph plans for a section without subsections.
+        - **Description**:
+            - Uses section.mission/key_content instead of raw metadata.
+            - Includes prior_key_points for cumulative cross-section context.
+
+        - **Args**:
+            - `section` (SectionPlan): Section with mission/key_content populated.
+            - `word_budget` (int): Approximate word budget for this section.
+            - `reference_keys` (List[str]): Available reference keys for citation.
+            - `prior_key_points` (str): Key points from earlier sections (cumulative).
+
+        - **Returns**:
+            - `List[ParagraphPlan]`: Ordered list of paragraph plans.
+        """
+        figures_str = ", ".join(f.figure_id for f in section.figures) if section.figures else "None"
+        tables_str = ", ".join(t.table_id for t in section.tables) if section.tables else "None"
+        approx_paragraphs = max(1, word_budget // WORDS_PER_PARAGRAPH)
+
+        prompt = f"""Generate a paragraph plan for this section:
+
+**Section**: {section.section_title} ({section.section_type})
+**Mission**: {section.mission}
+**Key content points**: {json.dumps(section.key_content)}
+**Word budget**: ~{word_budget} words (~{approx_paragraphs} paragraphs)
+**Assigned figures**: {figures_str}
+**Assigned tables**: {tables_str}
+**Available references**: {", ".join(reference_keys[:20]) if reference_keys else "None"}
+**Prior sections key points**: {prior_key_points or "None (first section)"}
+
+Output JSON:
+{{
+  "paragraphs": [
+    {{
+      "key_point": "Main point of this paragraph",
+      "supporting_points": ["detail 1", "detail 2"],
+      "approx_sentences": 4,
+      "role": "topic|evidence|analysis|transition|conclusion",
+      "references_to_cite": ["ref_key1"],
+      "figures_to_reference": ["fig1"],
+      "tables_to_reference": ["tab1"]
+    }}
+  ]
+}}
+
+Guidelines:
+- Each paragraph should have a single clear key_point.
+- Order paragraphs logically to fulfill the section mission.
+- Assign figures/tables to the most relevant paragraph.
+- approx_sentences: typically 3-6 for body paragraphs.
+Output valid JSON only."""
+
+        data = await self._llm_json_call(
+            self._STEP5A_SYSTEM, prompt, f"step5a_{section.section_type}",
+        )
+        paragraphs = self._parse_paragraph_plans(data.get("paragraphs", []))
+        if not paragraphs:
+            paragraphs = [ParagraphPlan(
+                key_point=f"Content for {section.section_title}",
+                approx_sentences=max(3, word_budget // WORDS_PER_SENTENCE),
+            )]
+        return paragraphs
+
+    # =================================================================
+    # Incremental Planning: Step 5b -- Subsection Paragraph Plans
+    # =================================================================
+
+    _STEP5B_SYSTEM = (
+        "You are an expert academic paper planner. "
+        "Generate a paragraph-level plan for one subsection within a paper section. "
+        "Output ONLY a JSON object. No markdown, no explanation."
+    )
+
+    async def _plan_subsection_paragraphs(
+        self,
+        section: SectionPlan,
+        subsection_structure: Dict[str, Any],
+        reference_keys: List[str],
+    ) -> List[SubSectionPlan]:
+        """
+        Generate paragraph plans for each subsection sequentially with cumulative context.
+        - **Description**:
+            - Iterates subsections in order; for sub_i, the prompt includes
+              key_points from sub_0..sub_{i-1} (cumulative).
+            - Cross-subsection transitions are included for sub_1+.
+
+        - **Args**:
+            - `section` (SectionPlan): Parent section with mission/key_content.
+            - `subsection_structure` (Dict): Output from _decide_section_structure().
+            - `reference_keys` (List[str]): Available reference keys.
+
+        - **Returns**:
+            - `List[SubSectionPlan]`: Ordered list of subsection plans with paragraphs.
+        """
+        raw_subs = subsection_structure.get("subsections", [])
+        transitions = subsection_structure.get("cross_subsection_transitions", [])
+        all_titles = [s.get("title", f"Subsection {i+1}") for i, s in enumerate(raw_subs)]
+
+        cumulative_key_points: List[str] = []
+        result: List[SubSectionPlan] = []
+
+        for i, sub_info in enumerate(raw_subs):
+            sub_title = sub_info.get("title", f"Subsection {i+1}")
+            sub_mission = sub_info.get("mission", "")
+            sub_key_themes = sub_info.get("key_themes", [])
+            sub_depends_on = sub_info.get("depends_on", [])
+            sub_approx_paras = sub_info.get("approx_paragraphs", 2)
+
+            transition = transitions[i - 1] if i > 0 and i - 1 < len(transitions) else ""
+
+            cumulative_str = "\n".join(
+                f"- {kp}" for kp in cumulative_key_points
+            ) if cumulative_key_points else "None (this is the first subsection)"
+
+            figures_str = ", ".join(f.figure_id for f in section.figures) if section.figures else "None"
+            tables_str = ", ".join(t.table_id for t in section.tables) if section.tables else "None"
+
+            prompt = f"""Generate a paragraph plan for this subsection:
+
+**Parent section**: {section.section_title} ({section.section_type})
+**Section mission**: {section.mission}
+**Full subsection structure**: {json.dumps(all_titles)}
+
+**Current subsection**: {sub_title}
+**Subsection mission**: {sub_mission}
+**Key themes**: {json.dumps(sub_key_themes)}
+**Depends on**: {json.dumps(sub_depends_on)}
+**Target paragraphs**: ~{sub_approx_paras}
+**Assigned figures**: {figures_str}
+**Assigned tables**: {tables_str}
+**Available references**: {", ".join(reference_keys[:15]) if reference_keys else "None"}
+
+**Transition from previous subsection**: {transition or "N/A (first subsection)"}
+**Key points from previous subsections**:
+{cumulative_str}
+
+Output JSON:
+{{
+  "paragraphs": [
+    {{
+      "key_point": "Main point of this paragraph",
+      "supporting_points": ["detail 1", "detail 2"],
+      "approx_sentences": 4,
+      "role": "topic|evidence|analysis|transition|conclusion",
+      "references_to_cite": ["ref_key1"]
+    }}
+  ],
+  "subsection_key_points": ["1-2 sentence summary of what this subsection covers"]
+}}
+
+Guidelines:
+- Each paragraph should have a single clear key_point.
+- Build on previous subsections' key_points for narrative continuity.
+- subsection_key_points will be passed to subsequent subsections as context.
+Output valid JSON only."""
+
+            data = await self._llm_json_call(
+                self._STEP5B_SYSTEM, prompt, f"step5b_{section.section_type}_{i}",
+            )
+
+            paragraphs = self._parse_paragraph_plans(data.get("paragraphs", []))
+            if not paragraphs:
+                paragraphs = [ParagraphPlan(
+                    key_point=f"Content for {sub_title}",
+                    approx_sentences=max(3, sub_approx_paras * 4),
+                )]
+
+            new_key_points = data.get("subsection_key_points", [])
+            if isinstance(new_key_points, list):
+                cumulative_key_points.extend(new_key_points)
+            elif isinstance(new_key_points, str):
+                cumulative_key_points.append(new_key_points)
+
+            result.append(SubSectionPlan(
+                title=sub_title,
+                mission=sub_mission,
+                key_themes=sub_key_themes if isinstance(sub_key_themes, list) else [],
+                depends_on=sub_depends_on if isinstance(sub_depends_on, list) else [],
+                transition_from_previous=transition,
+                paragraphs=paragraphs,
+            ))
+
+        return result
 
     def _split_into_subsections(
         self,

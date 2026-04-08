@@ -927,27 +927,15 @@ class TestSubsectionTriggering:
     """Planner should auto-enable subsections when paragraphs >= 5 and clusters >= 2."""
 
     def test_auto_enable_sectioning_for_long_sections(self):
-        """Sections with >= 5 paragraphs and >= 2 topic_clusters should get
-        sectioning_recommended=True even if the LLM returned False."""
-        from src.agents.planner_agent.models import SectionPlan, ParagraphPlan
-
-        plan = SectionPlan(
-            section_type="method",
-            section_title="Method",
-            sectioning_recommended=False,
-            topic_clusters=["architecture", "training"],
-            paragraphs=[
-                ParagraphPlan(key_point=f"Point {i}")
-                for i in range(6)
-            ],
-        )
+        """Subsection decisions are now LLM-driven via _decide_section_structure (Step 4)
+        instead of a heuristic based on topic_clusters. Verify the new method exists
+        and that sectioning_recommended is set in the pipeline."""
         from src.agents.planner_agent.planner_agent import PlannerAgent
         import inspect
 
         source = inspect.getsource(PlannerAgent.create_plan)
         assert "sectioning_recommended" in source
-        # The heuristic should override LLM's false to true
-        assert "topic_clusters" in source
+        assert "_decide_section_structure" in source
 
 
 class TestSubsectionPromptFormatting:
