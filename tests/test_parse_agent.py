@@ -5,14 +5,10 @@ Tests with a real PDF file and checks for JSON output.
 import pytest
 import asyncio
 import json
-import sys
 from pathlib import Path
 
-# Add the src directory to Python path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from config.schema import ModelConfig
-from agents.parse_agent.parse_agent import ParseAgent
+from src.config.schema import ModelConfig
+from src.agents.parse_agent.parse_agent import ParseAgent
 
 
 class TestParseAgentSimple:

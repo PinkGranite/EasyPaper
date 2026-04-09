@@ -10,7 +10,7 @@ from .reviewer_agent import ReviewerAgent
 from .planner_agent import PlannerAgent
 from .vlm_review_agent import VLMReviewAgent
 from .shared.vlm_service import VLMService
-from config.schema import AgentConfig, VLMServiceConfig
+from src.config.schema import AgentConfig, VLMServiceConfig
 
 if TYPE_CHECKING:
     from ..skills.registry import SkillRegistry
