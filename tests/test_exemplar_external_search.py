@@ -199,7 +199,7 @@ class TestSearchExternal:
         mock_tool_result.data = {"papers": mock_search_results, "total_found": 3}
 
         with patch(
-            "src.agents.shared.exemplar_selector.PaperSearchTool"
+            "src.agents.shared.tools.paper_search.PaperSearchTool"
         ) as MockTool:
             tool_instance = MockTool.return_value
             tool_instance.execute = AsyncMock(return_value=mock_tool_result)
@@ -224,7 +224,7 @@ class TestSearchExternal:
         mock_tool_result.data = {"papers": mock_search_results, "total_found": 3}
 
         with patch(
-            "src.agents.shared.exemplar_selector.PaperSearchTool"
+            "src.agents.shared.tools.paper_search.PaperSearchTool"
         ) as MockTool:
             tool_instance = MockTool.return_value
             tool_instance.execute = AsyncMock(return_value=mock_tool_result)
@@ -248,7 +248,7 @@ class TestSearchExternal:
         mock_tool_result.data = {"papers": [], "total_found": 0}
 
         with patch(
-            "src.agents.shared.exemplar_selector.PaperSearchTool"
+            "src.agents.shared.tools.paper_search.PaperSearchTool"
         ) as MockTool:
             tool_instance = MockTool.return_value
             tool_instance.execute = AsyncMock(return_value=mock_tool_result)
@@ -289,7 +289,7 @@ class TestSelectWithExternalFallback:
         mock_tool_result.data = {"papers": mock_search_results, "total_found": 3}
 
         with patch(
-            "src.agents.shared.exemplar_selector.PaperSearchTool"
+            "src.agents.shared.tools.paper_search.PaperSearchTool"
         ) as MockTool:
             tool_instance = MockTool.return_value
             tool_instance.execute = AsyncMock(return_value=mock_tool_result)
@@ -334,7 +334,7 @@ class TestSelectWithExternalFallback:
         selector = ExemplarSelector(mock_client, "gpt-4")
 
         with patch(
-            "src.agents.shared.exemplar_selector.PaperSearchTool"
+            "src.agents.shared.tools.paper_search.PaperSearchTool"
         ) as MockTool:
             result = await selector.select(
                 good_core_refs, sample_metadata, default_config,
