@@ -2860,6 +2860,9 @@ class MetaDataAgent(ReActAgent):
                 )
                 # Strip any remaining bare \ref{...}
                 content = re.sub(r'~?\\ref\{[^}]*\}', '', content)
+                # Strip Stage-1 pseudo-markers (synthesis sections skip Stage-2 injection)
+                content = re.sub(r'\[CITE:[^\]]*\]', '', content)
+                content = re.sub(r'\[FLOAT:[^\]]*\]', '', content)
                 # Clean orphaned parentheses like "(, )" or "( )"
                 content = re.sub(r'\(\s*[,;]?\s*\)', '', content)
                 content = re.sub(r'  +', ' ', content)

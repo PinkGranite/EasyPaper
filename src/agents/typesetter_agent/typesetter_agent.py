@@ -406,6 +406,53 @@ class TypesetterAgent(BaseAgent):
             return root
         return path
 
+    def _build_figure_id_map(
+        self,
+        figure_paths: Dict[str, str],
+        work_dir: str,
+    ) -> Dict[str, str]:
+        """
+        Build multi-variant mapping from figure IDs to relative file paths.
+        - **Description**:
+            - For each figure_id → file_path pair, registers the canonical
+              mapping plus common variants the Writer LLM might produce
+              (e.g. colon→underscore, bare name, basename of file_path).
+            - All paths use forward slashes for LaTeX compatibility.
+
+        - **Args**:
+            - `figure_paths` (Dict[str, str]): fig_id → absolute or relative file path.
+            - `work_dir` (str): Temporary compilation directory.
+
+        - **Returns**:
+            - `Dict[str, str]`: Multi-variant mapping, target → relative LaTeX path.
+        """
+        id_map: Dict[str, str] = {}
+        for fig_id, file_path in figure_paths.items():
+            if not fig_id or not file_path:
+                continue
+            filename = os.path.basename(file_path)
+            if not filename:
+                continue
+            candidate = os.path.join("figures", filename).replace("\\", "/")
+            abs_candidate = os.path.join(work_dir, candidate)
+            if not os.path.exists(abs_candidate):
+                continue
+            rel_path = self._strip_graphics_extension(candidate)
+
+            variants = {fig_id}
+            variants.add(fig_id.replace(":", "_"))
+            if ":" in fig_id:
+                variants.add(fig_id.split(":", 1)[1])
+            stem = os.path.splitext(filename)[0]
+            variants.add(stem)
+            variants.add(f"figures/{stem}")
+            variants.add(f"figures/{filename}")
+
+            for v in variants:
+                if v and v not in id_map:
+                    id_map[v] = rel_path
+        return id_map
+
     def _rewrite_includegraphics_targets(
         self,
         content: str,
@@ -415,6 +462,7 @@ class TypesetterAgent(BaseAgent):
         """
         Rewrite includegraphics targets using resource-aware resolution.
         - **Description**:
+            - Normalizes backslash path separators to forward slashes.
             - Resolution order:
               1) exact ID mapping from resources/figure_paths
               2) existing valid relative path under work_dir
@@ -426,7 +474,7 @@ class TypesetterAgent(BaseAgent):
             return content
 
         def _resolve_target(raw_target: str) -> str:
-            target = raw_target.strip()
+            target = raw_target.strip().replace("\\", "/")
             if not target:
                 return target
             if target in id_to_rel_path:
@@ -439,13 +487,13 @@ class TypesetterAgent(BaseAgent):
 
             # Fallback: try basename in figures directory.
             basename = os.path.basename(target)
-            candidate = os.path.join("figures", basename)
+            candidate = f"figures/{basename}"
             if os.path.exists(os.path.join(work_dir, candidate)):
                 return self._strip_graphics_extension(candidate)
             # If model emits bare token without extension (e.g. {fig1}),
             # resolve against common graphics extensions under figures/.
             for ext in (".pdf", ".png", ".jpg", ".jpeg", ".svg", ".eps"):
-                ext_candidate = os.path.join("figures", f"{basename}{ext}")
+                ext_candidate = f"figures/{basename}{ext}"
                 if os.path.exists(os.path.join(work_dir, ext_candidate)):
                     return self._strip_graphics_extension(ext_candidate)
             return target
@@ -853,8 +901,8 @@ class TypesetterAgent(BaseAgent):
         for section_type in order:
             if section_type not in sections or not sections[section_type].strip():
                 continue
-            if section_type in ("abstract", "conclusion"):
-                # Abstract and conclusion are inlined into main.tex directly.
+            if section_type == "abstract":
+                # Abstract is inlined into main.tex directly.
                 continue
 
             content = sections[section_type].strip()
@@ -888,7 +936,7 @@ class TypesetterAgent(BaseAgent):
 
         # Write any remaining sections not in the order list (excluding abstract)
         for section_type, content in sections.items():
-            if section_type in ("abstract", "conclusion") or section_type in section_file_map:
+            if section_type == "abstract" or section_type in section_file_map:
                 continue
             if not content.strip():
                 continue
@@ -1627,15 +1675,7 @@ class TypesetterAgent(BaseAgent):
             if resource.status == "downloaded" and resource.local_path:
                 rel_path = os.path.relpath(resource.local_path, work_dir)
                 id_to_rel_path[str(resource.resource_id)] = self._strip_graphics_extension(rel_path)
-        for fig_id, file_path in figure_paths.items():
-            if not fig_id:
-                continue
-            filename = os.path.basename(file_path or "")
-            if not filename:
-                continue
-            candidate = os.path.join("figures", filename)
-            if os.path.exists(os.path.join(work_dir, candidate)):
-                id_to_rel_path[str(fig_id)] = self._strip_graphics_extension(candidate)
+        id_to_rel_path.update(self._build_figure_id_map(figure_paths, work_dir))
         
         # Create default template_config if not provided
         if template_config is None:
@@ -1711,15 +1751,8 @@ class TypesetterAgent(BaseAgent):
             if not abstract_inline:
                 raise ValueError("typesetter.inject_template missing abstract content in multi-file mode")
 
-            # Conclusion is also inlined into main.tex (do not use sections/conclusion.tex)
-            conclusion_inline = ""
-            if sections_dict.get("conclusion", "").strip():
-                conclusion_text = sections_dict["conclusion"].strip()
-                conclusion_text = self._strip_leading_section_command(conclusion_text)
-                conclusion_text = self._apply_citation_style(conclusion_text, template_config.citation_style)
-                conclusion_text = re.sub(r'(?<!\\)%', r'\\%', conclusion_text)
-                conclusion_title = section_titles.get("conclusion", "Conclusion") if section_titles else "Conclusion"
-                conclusion_inline = f"\\section{{{conclusion_title}}}\n\n{conclusion_text}"
+            # Conclusion is written as sections/conclusion.tex via
+            # _write_section_files and included via \input in body_input_text.
             
             # Inject into template
             if main_tex_path and os.path.exists(main_tex_path):
@@ -1731,7 +1764,7 @@ class TypesetterAgent(BaseAgent):
                 # but using \input commands instead of inline content
                 input_sections = {
                     "abstract": abstract_inline,
-                    "body": "\n\n".join([p for p in [body_input_text, conclusion_inline] if p.strip()]),
+                    "body": body_input_text,
                 }
                 compiled_tex = self._smart_inject_content(
                     template_content, input_sections, template_config, bib_entries
@@ -1759,7 +1792,7 @@ class TypesetterAgent(BaseAgent):
                 full_content = ""
                 if abstract_inline:
                     full_content = f"\\begin{{abstract}}\n{abstract_inline}\n\\end{{abstract}}\n\n"
-                full_content += "\n\n".join([p for p in [body_input_text, conclusion_inline] if p.strip()])
+                full_content += body_input_text
                 
                 bib_style = template_config.bib_style or "plain"
                 template = Template(MAIN_TEX_TEMPLATE)

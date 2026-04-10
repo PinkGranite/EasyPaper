@@ -533,10 +533,8 @@ def _format_figure_placement_guidance(section_plan: Any, figures: List[Any]) -> 
         raw_caption = fig.caption if hasattr(fig, "caption") else fig.get("caption", "")
         caption = normalize_caption(raw_caption)
         desc = fig.description if hasattr(fig, "description") else fig.get("description", "")
-        file_path = fig.file_path if hasattr(fig, "file_path") else fig.get("file_path", "")
         wide = fp.is_wide
 
-        filename = os.path.basename(file_path) if file_path else f"{fig_id.replace('fig:', '')}.pdf"
         env_name = "figure*" if wide else "figure"
         width = "\\\\textwidth" if wide else "0.9\\\\linewidth"
 
@@ -554,7 +552,7 @@ def _format_figure_placement_guidance(section_plan: Any, figures: List[Any]) -> 
         parts.append(f"  ```latex")
         parts.append(f"  \\\\begin{{{env_name}}}[htbp]")
         parts.append(f"  \\\\centering")
-        parts.append(f"  \\\\includegraphics[width={width}]{{figures/{filename}}}")
+        parts.append(f"  \\\\includegraphics[width={width}]{{{fig_id}}}")
         parts.append(f"  \\\\caption{{{caption}}}\\\\label{{{fig_id}}}")
         parts.append(f"  \\\\end{{{env_name}}}")
         parts.append(f"  ```\n")
