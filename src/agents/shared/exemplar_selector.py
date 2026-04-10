@@ -10,12 +10,56 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from ...config.schema import ExemplarConfig
 
 logger = logging.getLogger(__name__)
+
+_VENUE_ALIASES: Dict[str, List[str]] = {
+    "icml": ["international conference on machine learning"],
+    "neurips": [
+        "advances in neural information processing systems",
+        "neural information processing systems",
+        "nips",
+    ],
+    "iclr": ["international conference on learning representations"],
+    "cvpr": [
+        "ieee/cvf conference on computer vision and pattern recognition",
+        "computer vision and pattern recognition",
+        "ieee conference on computer vision and pattern recognition",
+    ],
+    "iccv": [
+        "ieee/cvf international conference on computer vision",
+        "international conference on computer vision",
+    ],
+    "eccv": ["european conference on computer vision"],
+    "acl": [
+        "annual meeting of the association for computational linguistics",
+        "association for computational linguistics",
+    ],
+    "emnlp": [
+        "conference on empirical methods in natural language processing",
+        "empirical methods in natural language processing",
+    ],
+    "naacl": [
+        "north american chapter of the association for computational linguistics",
+    ],
+    "aaai": [
+        "aaai conference on artificial intelligence",
+        "association for the advancement of artificial intelligence",
+    ],
+    "ijcai": ["international joint conference on artificial intelligence"],
+    "sigir": [
+        "international acm sigir conference",
+        "research and development in information retrieval",
+    ],
+    "kdd": ["knowledge discovery and data mining"],
+    "nature": ["nature"],
+    "science": ["science"],
+}
 
 
 def _strip_code_fence(raw: str) -> str:
@@ -30,12 +74,49 @@ def _strip_code_fence(raw: str) -> str:
     return text
 
 
+def _venue_matches(ref_venue: str, style_guide: str) -> bool:
+    """
+    Check if a reference venue matches the target style guide.
+    - **Description**:
+        - First tries substring match (original logic).
+        - Then checks alias table for abbreviation ↔ full name mappings.
+
+    - **Args**:
+        - `ref_venue` (str): The venue string from the reference.
+        - `style_guide` (str): Target venue abbreviation or name.
+
+    - **Returns**:
+        - `bool`: True if venue matches.
+    """
+    rv = ref_venue.lower().strip()
+    sg = style_guide.lower().strip()
+
+    if sg in rv or rv in sg:
+        return True
+
+    aliases = _VENUE_ALIASES.get(sg, [])
+    for alias in aliases:
+        if alias in rv or rv in alias:
+            return True
+
+    for canonical, alias_list in _VENUE_ALIASES.items():
+        if sg in alias_list or any(sg in a for a in alias_list):
+            if canonical in rv:
+                return True
+            for a in alias_list:
+                if a in rv or rv in a:
+                    return True
+
+    return False
+
+
 class ExemplarSelector:
     """
     Selects the best exemplar paper from core refs or external search.
     - **Description**:
         - Filters candidates by venue, recency, and docling availability.
         - Ranks remaining candidates by method/domain similarity via LLM.
+        - Falls back to external search when core refs don't qualify.
         - Returns the single best candidate dict, or None.
 
     - **Args**:
@@ -56,7 +137,7 @@ class ExemplarSelector:
         """
         Apply hard constraints to filter candidate references.
         - **Description**:
-            - Venue match: ref venue must case-insensitively contain style_guide.
+            - Venue match: uses alias-aware matching via _venue_matches.
               Skipped if style_guide is None/empty.
             - Recency: ref year must be within recency_years of current year.
               Skipped if ref has no year.
@@ -64,7 +145,7 @@ class ExemplarSelector:
 
         - **Args**:
             - `refs` (List[Dict]): Candidate reference dicts.
-            - `style_guide` (Optional[str]): Target venue (e.g., "nature").
+            - `style_guide` (Optional[str]): Target venue (e.g., "ICML").
             - `recency_years` (int): Maximum age in years.
 
         - **Returns**:
@@ -77,8 +158,8 @@ class ExemplarSelector:
                 continue
 
             if style_guide:
-                ref_venue = str(ref.get("venue", "")).lower()
-                if style_guide.lower() not in ref_venue:
+                ref_venue = str(ref.get("venue", ""))
+                if not _venue_matches(ref_venue, style_guide):
                     continue
 
             ref_year = ref.get("year")
@@ -115,7 +196,7 @@ class ExemplarSelector:
         summaries = []
         for c in candidates:
             summaries.append({
-                "ref_id": c.get("ref_id", ""),
+                "ref_id": c.get("ref_id", c.get("bibtex_key", "")),
                 "title": c.get("title", ""),
                 "venue": c.get("venue", ""),
                 "year": c.get("year"),
@@ -150,12 +231,102 @@ class ExemplarSelector:
                 rankings.sort(key=lambda x: float(x.get("score", 0)), reverse=True)
                 best_id = rankings[0].get("ref_id", "")
                 for c in candidates:
-                    if c.get("ref_id") == best_id:
+                    cid = c.get("ref_id", c.get("bibtex_key", ""))
+                    if cid == best_id:
                         return c
         except Exception as exc:
             logger.warning("ExemplarSelector LLM ranking failed: %s", exc)
 
         return candidates[0]
+
+    def _build_search_query(
+        self,
+        metadata: Any,
+        style_guide: Optional[str],
+    ) -> str:
+        """
+        Construct a search query for external exemplar search.
+        - **Description**:
+            - Prioritises venue + broad domain keywords for style matching.
+            - Falls back to method keywords when no style_guide is set.
+
+        - **Args**:
+            - `metadata` (Any): PaperMetaData for the target paper.
+            - `style_guide` (Optional[str]): Target venue abbreviation.
+
+        - **Returns**:
+            - `str`: Search query string.
+        """
+        title_words = re.sub(r"[^a-zA-Z0-9\s]", "", metadata.title).split()
+        domain_keywords = " ".join(title_words[:6])
+        method_snippet = metadata.method[:100].split(".")[0].strip()
+
+        if style_guide:
+            return f"{style_guide} {domain_keywords}"
+        return f"{domain_keywords} {method_snippet}"
+
+    async def _search_external(
+        self,
+        metadata: Any,
+        config: ExemplarConfig,
+        paper_search_config: Dict[str, Any],
+        style_guide: Optional[str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for exemplar candidates via PaperSearchTool.
+        - **Description**:
+            - Calls Semantic Scholar / arXiv for papers matching venue + domain.
+            - Filters results to those with downloadable PDFs.
+            - Applies venue matching when style_guide is set.
+
+        - **Args**:
+            - `metadata` (Any): PaperMetaData for the target paper.
+            - `config` (ExemplarConfig): Exemplar configuration.
+            - `paper_search_config` (Dict): Search API credentials and settings.
+            - `style_guide` (Optional[str]): Target venue abbreviation.
+
+        - **Returns**:
+            - `List[Dict]`: Filtered candidates with download URLs.
+        """
+        from .tools.paper_search import PaperSearchTool
+
+        tool = PaperSearchTool(
+            semantic_scholar_api_key=paper_search_config.get("semantic_scholar_api_key"),
+            timeout=paper_search_config.get("timeout", 10),
+        )
+
+        query = self._build_search_query(metadata, style_guide)
+        current_year = datetime.now().year
+        year_range = f"{current_year - config.recency_years}-{current_year}"
+
+        try:
+            result = await tool.execute(
+                query=query,
+                max_results=config.max_external_candidates,
+                year_range=year_range,
+            )
+        except Exception as exc:
+            logger.warning("ExemplarSelector external search failed: %s", exc)
+            return []
+
+        if not result.success:
+            return []
+
+        papers = (result.data or {}).get("papers", [])
+        candidates = []
+        for paper in papers:
+            has_pdf = bool(paper.get("open_access_pdf") or paper.get("arxiv_id"))
+            if not has_pdf:
+                continue
+
+            if style_guide:
+                venue = str(paper.get("venue", ""))
+                if not _venue_matches(venue, style_guide):
+                    continue
+
+            candidates.append(paper)
+
+        return candidates
 
     async def select(
         self,
@@ -169,13 +340,15 @@ class ExemplarSelector:
         - **Description**:
             - Applies hard constraints to core refs.
             - Ranks filtered candidates via LLM.
+            - Falls back to external search when no core ref qualifies
+              and paper_search_config is provided.
             - Returns best match or None.
 
         - **Args**:
             - `core_refs` (List[Dict]): User-provided core reference dicts.
             - `metadata` (Any): PaperMetaData for the target paper.
             - `config` (ExemplarConfig): Feature configuration.
-            - `paper_search_config` (Dict, optional): Search API config (for future external search).
+            - `paper_search_config` (Dict, optional): Search API config for external search.
 
         - **Returns**:
             - `Optional[Dict]`: Selected exemplar ref dict, or None.
@@ -193,5 +366,22 @@ class ExemplarSelector:
             )
             return await self._rank_candidates(candidates, metadata)
 
-        logger.info("ExemplarSelector: no core ref qualified, returning None")
-        return None
+        if not paper_search_config:
+            logger.info("ExemplarSelector: no core ref qualified, no search config, returning None")
+            return None
+
+        logger.info("ExemplarSelector: no core ref qualified, trying external search")
+        external = await self._search_external(
+            metadata, config, paper_search_config, style_guide,
+        )
+        if not external:
+            logger.info("ExemplarSelector: external search returned no candidates")
+            return None
+
+        best = await self._rank_candidates(external, metadata)
+        if best:
+            logger.info(
+                "ExemplarSelector: external exemplar selected: %s",
+                best.get("title", best.get("bibtex_key", "unknown")),
+            )
+        return best
