@@ -25,6 +25,7 @@ from ...config.schema import ModelConfig
 from ..base import BaseAgent
 from .router import create_typesetter_router
 from .models import ResourceInfo, BibEntry, CompilationResult, TemplateConfig, TemplateStructureProfile
+from ..shared.tex_path_bootstrap import ensure_tex_bin_on_path
 
 
 # Backend API URL for fetching resources
@@ -1967,7 +1968,12 @@ class TypesetterAgent(BaseAgent):
             - `dict`: Updated state with compilation_result
         """
         logger.info("typesetter.compile_latex start")
-        
+        if not ensure_tex_bin_on_path(logger):
+            logger.warning(
+                "typesetter.tex_path_bootstrap_failed "
+                "hint=install_MiKTeX_or_TeXLive_and_add_bin_to_PATH_or_run_scripts/check_toolchain.py"
+            )
+
         work_dir = state.get("work_dir")
         output_dir = state.get("output_dir")
         section_file_map = state.get("section_file_map")  # From inject_template multi-file mode
