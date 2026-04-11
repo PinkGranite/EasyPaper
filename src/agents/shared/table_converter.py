@@ -13,7 +13,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Any, TYPE_CHECKING
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..metadata_agent.models import TableSpec
@@ -888,6 +888,118 @@ def _estimate_row_width(body: str) -> int:
     return max_width
 
 
+def build_table_preview_document(
+    table_latex: str,
+    column_format: str = "double",
+    title: str = "Table Preview",
+) -> str:
+    """
+    Build a standalone LaTeX document for single-table visual preview.
+    - **Description**:
+        - Wraps one table LaTeX block into a minimal compile-ready document.
+        - Supports single/double-column preview mode via documentclass options.
+        - Preserves the original table environment content as-is.
+
+    - **Args**:
+        - `table_latex` (str): Converted LaTeX table environment.
+        - `column_format` (str): "single" or "double" layout preview mode.
+        - `title` (str): Preview document title.
+
+    - **Returns**:
+        - `preview_tex` (str): Standalone .tex source for table-only preview.
+    """
+    clean_table = _strip_code_fences((table_latex or "").strip())
+    if not clean_table:
+        clean_table = (
+            "\\begin{table}[htbp]\n"
+            "\\centering\n"
+            "\\caption{Table Preview}\n"
+            "\\label{tab:preview}\n"
+            "\\begin{tabular}{lc}\n"
+            "\\toprule\n"
+            "A & B \\\\\n"
+            "\\bottomrule\n"
+            "\\end{tabular}\n"
+            "\\end{table}"
+        )
+
+    if "\\begin{table" not in clean_table:
+        clean_table = (
+            "\\begin{table}[htbp]\n"
+            "\\centering\n"
+            f"{clean_table}\n"
+            "\\end{table}"
+        )
+
+    class_opts = "[twocolumn]" if column_format == "double" else ""
+    return (
+        f"\\documentclass{class_opts}{{article}}\n"
+        "\\usepackage[T1]{fontenc}\n"
+        "\\usepackage[utf8]{inputenc}\n"
+        "\\usepackage{booktabs}\n"
+        "\\usepackage{graphicx}\n"
+        "\\usepackage{adjustbox}\n"
+        "\\usepackage[margin=1in]{geometry}\n"
+        "\\begin{document}\n"
+        f"\\section*{{{title}}}\n"
+        f"{clean_table}\n"
+        "\\end{document}\n"
+    )
+
+
+def build_table_preview_documents(
+    tables: list,
+    converted_tables: Dict[str, str],
+    column_format: str = "double",
+) -> Dict[str, str]:
+    """
+    Build standalone table preview documents for converted metadata tables.
+    - **Description**:
+        - Creates one compile-ready LaTeX document per table ID.
+        - Uses converted table LaTeX when available.
+        - Falls back to a labeled placeholder table if conversion is missing.
+
+    - **Args**:
+        - `tables` (list): List of table specs (TableSpec-like objects).
+        - `converted_tables` (Dict[str, str]): Mapping table_id -> converted table LaTeX.
+        - `column_format` (str): "single" or "double" preview layout mode.
+
+    - **Returns**:
+        - `preview_docs` (Dict[str, str]): Mapping table_id -> standalone preview tex.
+    """
+    preview_docs: Dict[str, str] = {}
+    converted = converted_tables or {}
+
+    for table in tables or []:
+        table_id = getattr(table, "id", None) or ""
+        if not table_id:
+            continue
+
+        table_latex = converted.get(table_id, "")
+        if not table_latex:
+            caption = normalize_caption(getattr(table, "caption", "") or table_id)
+            table_latex = (
+                "\\begin{table}[htbp]\n"
+                "\\centering\n"
+                f"\\caption{{{caption}}}\n"
+                f"\\label{{{table_id}}}\n"
+                "\\begin{tabular}{lc}\n"
+                "\\toprule\n"
+                "Column & Value \\\\\n"
+                "\\bottomrule\n"
+                "\\end{tabular}\n"
+                "\\end{table}"
+            )
+
+        preview_docs[table_id] = build_table_preview_document(
+            table_latex=table_latex,
+            column_format=column_format,
+            title=f"Preview {table_id}",
+        )
+
+    return preview_docs
+
+
 def _read_table_content(
     table: "TableSpec",
     base_path: Optional[str] = None,
@@ -916,11 +1028,23 @@ def _read_table_content(
                 logger.warning(
                     "table_converter.file_not_found path=%s", file_path,
                 )
+                if table.content:
+                    logger.info(
+                        "table_converter.fallback_inline_content id=%s",
+                        getattr(table, "id", "unknown"),
+                    )
+                    return table.content
         except Exception as e:
             logger.error(
                 "table_converter.file_read_error path=%s error=%s",
                 file_path, str(e),
             )
+            if table.content:
+                logger.info(
+                    "table_converter.fallback_inline_after_error id=%s",
+                    getattr(table, "id", "unknown"),
+                )
+                return table.content
     else:
         return table.content
     return None
