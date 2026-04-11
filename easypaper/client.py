@@ -143,6 +143,37 @@ class EasyPaper:
                     pass
 
     # ------------------------------------------------------------------
+    # Public API — Metadata generation from folder
+    # ------------------------------------------------------------------
+
+    async def generate_metadata_from_folder(
+        self,
+        folder_path: str | Path,
+        **overrides: Any,
+    ) -> Any:
+        """
+        Scan a folder of research materials and synthesize PaperMetaData.
+
+        - **Args**:
+            - `folder_path` (str | Path): Path to the materials folder.
+            - `**overrides`: Fields to override (title, style_guide, etc.).
+
+        - **Returns**:
+            - `PaperMetaData`: The generated metadata object.
+        """
+        from src.agents.metadata_agent.metadata_generator import (
+            generate_metadata_from_folder as _gen,
+        )
+        client = getattr(self._metadata_agent, "client", None)
+        model = getattr(self._metadata_agent, "model_name", "")
+        return await _gen(
+            folder_path=str(folder_path),
+            llm_client=client,
+            model_name=model,
+            **overrides,
+        )
+
+    # ------------------------------------------------------------------
     # Public API — Docling (standalone PDF parsing)
     # ------------------------------------------------------------------
 

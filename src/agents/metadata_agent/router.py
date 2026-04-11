@@ -506,6 +506,57 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
         }
 
     # ------------------------------------------------------------------
+    # POST /metadata/generate-from-folder
+    # ------------------------------------------------------------------
+
+    @router.post("/generate-from-folder")
+    async def generate_metadata_from_folder(
+        folder_path: str,
+        title: Optional[str] = None,
+        style_guide: Optional[str] = None,
+        template_path: Optional[str] = None,
+        target_pages: Optional[int] = None,
+    ):
+        """
+        Scan a folder of research materials and generate PaperMetaData.
+
+        - **Args**:
+            - `folder_path` (str): Path to a local folder containing
+              research materials (PDFs, code, notes, bib, data, images).
+            - `title` (str, optional): Override for the paper title.
+            - `style_guide` (str, optional): Target venue (e.g. ICML).
+            - `template_path` (str, optional): Path to LaTeX template.
+            - `target_pages` (int, optional): Target page count.
+
+        - **Returns**:
+            - ``PaperMetaData`` as JSON.
+        """
+        from .metadata_generator import generate_metadata_from_folder as _gen
+
+        overrides = {}
+        if title:
+            overrides["title"] = title
+        if style_guide:
+            overrides["style_guide"] = style_guide
+        if template_path:
+            overrides["template_path"] = template_path
+        if target_pages:
+            overrides["target_pages"] = target_pages
+
+        try:
+            result = await _gen(
+                folder_path=folder_path,
+                llm_client=agent.client,
+                model_name=agent.model_name,
+                **overrides,
+            )
+            return result.model_dump()
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Metadata generation failed: {exc}")
+
+    # ------------------------------------------------------------------
     # Docling — standalone PDF parsing endpoints
     # ------------------------------------------------------------------
 
