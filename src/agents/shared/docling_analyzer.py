@@ -2,8 +2,9 @@
 Docling-based paper analysis: download and parse academic PDFs.
 - **Description**:
     - PaperDownloader: async download of open-access PDFs from URLs or arXiv.
-    - DoclingPaperAnalyzer: wraps Docling DocumentConverter to extract
-      structured sections, tables, figures, and references from PDF files.
+    - DoclingPaperAnalyzer: wraps Docling DocumentConverter (one instance
+      per analyzer, reused across parses) to extract structured sections,
+      tables, figures, and references from PDF files.
     - Both components are optional and gracefully degrade when Docling
       is not installed or PDFs are unavailable.
 """
@@ -169,6 +170,8 @@ class DoclingPaperAnalyzer:
         - Extracts structured sections, tables, figures, and references.
         - Docling is imported lazily; an ImportError is raised with a
           helpful message if the package is not installed.
+        - One ``DocumentConverter`` is built on first parse and reused for
+          subsequent ``parse`` calls on the same analyzer instance.
 
     - **Args**:
         - `config` (Any): DoclingConfig instance controlling pipeline options.
@@ -176,15 +179,25 @@ class DoclingPaperAnalyzer:
 
     def __init__(self, config: Any = None) -> None:
         self._config = config
+        self._converter: Any = None
 
-    def parse(self, pdf_path: Path) -> DoclingPaperResult:
+    def _ensure_converter(self) -> Any:
         """
-        Parse a PDF file and return structured content.
+        Lazily build and cache a Docling ``DocumentConverter`` for this instance.
+        - **Description**:
+            - Imports Docling, applies ``PdfPipelineOptions`` from ``self._config``,
+              constructs ``DocumentConverter`` once, then returns the cached
+              instance on later calls.
+
         - **Args**:
-            - `pdf_path` (Path): Path to the PDF file.
+            - None
+
         - **Returns**:
-            - `DoclingPaperResult`: Parsed content with sections, tables, etc.
+            - `Any`: The cached ``DocumentConverter`` instance.
         """
+        if self._converter is not None:
+            return self._converter
+
         try:
             from docling.document_converter import DocumentConverter, PdfFormatOption
             from docling.datamodel.base_models import InputFormat
@@ -208,11 +221,22 @@ class DoclingPaperAnalyzer:
             if hasattr(pipeline_options, "do_code_enrichment"):
                 pipeline_options.do_code_enrichment = False
 
-        converter = DocumentConverter(
+        self._converter = DocumentConverter(
             format_options={
                 InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
             }
         )
+        return self._converter
+
+    def parse(self, pdf_path: Path) -> DoclingPaperResult:
+        """
+        Parse a PDF file and return structured content.
+        - **Args**:
+            - `pdf_path` (Path): Path to the PDF file.
+        - **Returns**:
+            - `DoclingPaperResult`: Parsed content with sections, tables, etc.
+        """
+        converter = self._ensure_converter()
 
         try:
             conv_result = converter.convert(str(pdf_path))

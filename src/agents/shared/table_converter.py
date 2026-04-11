@@ -8,10 +8,12 @@ Table Converter - Convert any readable format to LaTeX tables
     - Post-validates LLM output for data fidelity
 """
 import csv
+import hashlib
 import io
 import logging
 import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, TYPE_CHECKING
 
@@ -888,6 +890,120 @@ def _estimate_row_width(body: str) -> int:
     return max_width
 
 
+def _escape_latex_text(text: str) -> str:
+    """
+    Escape plain text for safe insertion into LaTeX text commands.
+    - **Description**:
+        - Escapes common LaTeX special characters in user-provided text.
+        - Intended for metadata strings rendered in headings or prose.
+
+    - **Args**:
+        - `text` (str): Raw text.
+
+    - **Returns**:
+        - `escaped_text` (str): LaTeX-safe text.
+    """
+    raw = text or ""
+    replacements = {
+        "\\": r"\textbackslash{}",
+        "&": r"\&",
+        "%": r"\%",
+        "$": r"\$",
+        "#": r"\#",
+        "_": r"\_",
+        "{": r"\{",
+        "}": r"\}",
+        "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
+    }
+    return "".join(replacements.get(ch, ch) for ch in raw)
+
+
+def _parse_table_rows(content: str) -> List[List[str]]:
+    """
+    Parse raw table content into rows.
+    - **Description**:
+        - Supports Markdown pipe tables and CSV text.
+        - Skips Markdown separator rows like ``|---|---|``.
+        - Returns normalized trimmed cells.
+
+    - **Args**:
+        - `content` (str): Raw table content.
+
+    - **Returns**:
+        - `rows` (List[List[str]]): Parsed rows.
+    """
+    raw = (content or "").strip()
+    if not raw:
+        return []
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if lines and lines[0].startswith("|"):
+        rows: List[List[str]] = []
+        for line in lines:
+            body = line.strip("|").strip()
+            if re.match(r'^[\s\-:|]+$', body):
+                continue
+            rows.append([cell.strip() for cell in body.split("|")])
+        return rows
+
+    parsed_rows: List[List[str]] = []
+    for row in csv.reader(io.StringIO(raw)):
+        parsed_rows.append([cell.strip() for cell in row])
+    return parsed_rows
+
+
+def _build_table_latex_from_source(
+    table_id: str,
+    caption: str,
+    content: str,
+) -> str:
+    """
+    Build a deterministic LaTeX table from source content.
+    - **Description**:
+        - Converts parsed rows directly into a booktabs tabular.
+        - Preserves row/column structure without LLM conversion.
+        - Uses '-' for missing values.
+
+    - **Args**:
+        - `table_id` (str): Table label id.
+        - `caption` (str): Raw caption text.
+        - `content` (str): Raw table content.
+
+    - **Returns**:
+        - `table_latex` (str): Deterministic table LaTeX.
+    """
+    rows = _parse_table_rows(content)
+    if not rows:
+        raise ValueError(f"Cannot build table '{table_id}' from empty source content")
+
+    col_count = max(len(row) for row in rows)
+    normalized_rows: List[List[str]] = []
+    for row in rows:
+        padded = row + [""] * max(0, col_count - len(row))
+        normalized_rows.append([_escape_latex_text(cell or "-") for cell in padded])
+
+    header = normalized_rows[0]
+    data_rows = normalized_rows[1:]
+    col_spec = "l" + ("c" * (col_count - 1))
+    safe_caption = _escape_latex_text(normalize_caption(caption) or table_id)
+
+    lines = [
+        "\\begin{table}[htbp]",
+        "\\centering",
+        f"\\caption{{{safe_caption}}}",
+        f"\\label{{{table_id}}}",
+        f"\\begin{{tabular}}{{{col_spec}}}",
+        "\\toprule",
+        " & ".join(header) + " \\\\",
+        "\\midrule",
+    ]
+    for row in data_rows:
+        lines.append(" & ".join(row) + " \\\\")
+    lines.extend(["\\bottomrule", "\\end{tabular}", "\\end{table}"])
+    return "\n".join(lines)
+
+
 def build_table_preview_document(
     table_latex: str,
     column_format: str = "double",
@@ -932,6 +1048,7 @@ def build_table_preview_document(
         )
 
     class_opts = "[twocolumn]" if column_format == "double" else ""
+    safe_title = _escape_latex_text(title)
     return (
         f"\\documentclass{class_opts}{{article}}\n"
         "\\usepackage[T1]{fontenc}\n"
@@ -941,7 +1058,7 @@ def build_table_preview_document(
         "\\usepackage{adjustbox}\n"
         "\\usepackage[margin=1in]{geometry}\n"
         "\\begin{document}\n"
-        f"\\section*{{{title}}}\n"
+        f"\\section*{{{safe_title}}}\n"
         f"{clean_table}\n"
         "\\end{document}\n"
     )
@@ -951,6 +1068,8 @@ def build_table_preview_documents(
     tables: list,
     converted_tables: Dict[str, str],
     column_format: str = "double",
+    allow_placeholder: bool = False,
+    base_path: Optional[str] = None,
 ) -> Dict[str, str]:
     """
     Build standalone table preview documents for converted metadata tables.
@@ -963,6 +1082,8 @@ def build_table_preview_documents(
         - `tables` (list): List of table specs (TableSpec-like objects).
         - `converted_tables` (Dict[str, str]): Mapping table_id -> converted table LaTeX.
         - `column_format` (str): "single" or "double" preview layout mode.
+        - `allow_placeholder` (bool): Whether to allow placeholder table fallback.
+        - `base_path` (str, optional): Base path for relative `table.file_path` loading.
 
     - **Returns**:
         - `preview_docs` (Dict[str, str]): Mapping table_id -> standalone preview tex.
@@ -977,19 +1098,33 @@ def build_table_preview_documents(
 
         table_latex = converted.get(table_id, "")
         if not table_latex:
-            caption = normalize_caption(getattr(table, "caption", "") or table_id)
-            table_latex = (
-                "\\begin{table}[htbp]\n"
-                "\\centering\n"
-                f"\\caption{{{caption}}}\n"
-                f"\\label{{{table_id}}}\n"
-                "\\begin{tabular}{lc}\n"
-                "\\toprule\n"
-                "Column & Value \\\\\n"
-                "\\bottomrule\n"
-                "\\end{tabular}\n"
-                "\\end{table}"
-            )
+            source_content = _read_table_content(table, base_path=base_path) or ""
+            if source_content.strip():
+                table_latex = _build_table_latex_from_source(
+                    table_id=table_id,
+                    caption=getattr(table, "caption", "") or table_id,
+                    content=source_content,
+                )
+            elif allow_placeholder:
+                caption = _escape_latex_text(
+                    normalize_caption(getattr(table, "caption", "") or table_id),
+                )
+                table_latex = (
+                    "\\begin{table}[htbp]\n"
+                    "\\centering\n"
+                    f"\\caption{{{caption}}}\n"
+                    f"\\label{{{table_id}}}\n"
+                    "\\begin{tabular}{lc}\n"
+                    "\\toprule\n"
+                    "Column & Value \\\\\n"
+                    "\\bottomrule\n"
+                    "\\end{tabular}\n"
+                    "\\end{table}"
+                )
+            else:
+                raise ValueError(
+                    f"Missing converted table and source content for '{table_id}'",
+                )
 
         preview_docs[table_id] = build_table_preview_document(
             table_latex=table_latex,
@@ -998,6 +1133,221 @@ def build_table_preview_documents(
         )
 
     return preview_docs
+
+
+def _sanitize_table_preview_filename(table_id: str) -> str:
+    """
+    Convert a table id into a filesystem-safe filename stem.
+    - **Description**:
+        - Replaces unsupported filename characters with underscores.
+        - Preserves alphanumeric, dot, underscore, and dash characters.
+
+    - **Args**:
+        - `table_id` (str): Table identifier such as "tab:results".
+
+    - **Returns**:
+        - `safe_name` (str): Safe filename stem.
+    """
+    raw = (table_id or "").strip()
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]", "_", raw) or "table_preview"
+    suffix = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{cleaned}_{suffix}"
+
+
+def _extract_latex_warnings_from_log(log_content: str) -> List[str]:
+    """
+    Extract warning messages from LaTeX log content.
+    - **Description**:
+        - Collects classic LaTeX warning forms.
+        - De-duplicates while preserving message order.
+
+    - **Args**:
+        - `log_content` (str): Full log text.
+
+    - **Returns**:
+        - `warnings` (List[str]): Warning messages.
+    """
+    candidates: List[str] = []
+    patterns = [
+        r"LaTeX Warning:\s*(.*?)(?:\n|$)",
+        r"Warning:\s*(.*?)(?:\n|$)",
+    ]
+    for pattern in patterns:
+        for match in re.findall(pattern, log_content or ""):
+            msg = (match or "").strip()
+            if msg:
+                candidates.append(msg)
+
+    deduped: List[str] = []
+    seen = set()
+    for item in candidates:
+        if item not in seen:
+            seen.add(item)
+            deduped.append(item)
+    return deduped
+
+
+def _extract_latex_errors_from_log(log_content: str) -> List[str]:
+    """
+    Extract error messages from LaTeX log content.
+    - **Description**:
+        - Captures lines beginning with "!" as primary LaTeX errors.
+        - Also captures generic "Error:" lines.
+
+    - **Args**:
+        - `log_content` (str): Full log text.
+
+    - **Returns**:
+        - `errors` (List[str]): Error messages.
+    """
+    candidates: List[str] = []
+    for line in (log_content or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("!"):
+            msg = stripped[1:].strip()
+            if msg:
+                candidates.append(msg)
+        elif "Error:" in stripped:
+            msg = stripped.split("Error:", 1)[1].strip()
+            if msg:
+                candidates.append(msg)
+
+    deduped: List[str] = []
+    seen = set()
+    for item in candidates:
+        if item not in seen:
+            seen.add(item)
+            deduped.append(item)
+    return deduped
+
+
+def compile_table_preview_document(
+    table_id: str,
+    preview_tex: str,
+    output_dir: str,
+    max_passes: int = 2,
+    timeout_seconds: int = 60,
+) -> Dict[str, Any]:
+    """
+    Compile one standalone table preview document with pdflatex.
+    - **Description**:
+        - Writes preview tex into output_dir and runs pdflatex passes.
+        - Returns a structured result with artifact paths and diagnostics.
+        - Intended for table-only visual validation loops.
+
+    - **Args**:
+        - `table_id` (str): Table identifier.
+        - `preview_tex` (str): Standalone LaTeX source.
+        - `output_dir` (str): Directory for .tex/.pdf/.log artifacts.
+        - `max_passes` (int): Number of pdflatex passes.
+        - `timeout_seconds` (int): Timeout per pdflatex invocation.
+
+    - **Returns**:
+        - `result` (Dict[str, Any]): Compilation result details.
+    """
+    resolved_output_dir = os.path.abspath(output_dir)
+    os.makedirs(resolved_output_dir, exist_ok=True)
+    safe_name = _sanitize_table_preview_filename(table_id)
+    tex_filename = f"{safe_name}.tex"
+    tex_path = os.path.join(resolved_output_dir, tex_filename)
+    pdf_path = os.path.join(resolved_output_dir, f"{safe_name}.pdf")
+    log_path = os.path.join(resolved_output_dir, f"{safe_name}.log")
+
+    result: Dict[str, Any] = {
+        "table_id": table_id,
+        "success": False,
+        "tex_path": tex_path,
+        "pdf_path": pdf_path,
+        "log_path": log_path,
+        "warnings": [],
+        "errors": [],
+        "attempts": 0,
+    }
+
+    with open(tex_path, "w", encoding="utf-8") as f:
+        f.write(preview_tex or "")
+
+    try:
+        final_returncode = 0
+        passes = max(1, int(max_passes or 1))
+        for attempt in range(passes):
+            result["attempts"] = attempt + 1
+            proc = subprocess.run(
+                [
+                    "pdflatex",
+                    "-interaction=nonstopmode",
+                    "-output-directory",
+                    resolved_output_dir,
+                    tex_filename,
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds,
+                cwd=resolved_output_dir,
+            )
+            final_returncode = proc.returncode
+            if proc.returncode != 0:
+                break
+
+        log_content = ""
+        if os.path.exists(log_path):
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                log_content = f.read()
+            result["warnings"] = _extract_latex_warnings_from_log(log_content)
+            result["errors"] = _extract_latex_errors_from_log(log_content)
+
+        if final_returncode != 0 and not result["errors"]:
+            result["errors"].append("pdflatex exited with non-zero return code")
+
+        result["success"] = os.path.exists(pdf_path) and final_returncode == 0
+        return result
+    except subprocess.TimeoutExpired:
+        result["errors"].append("pdflatex timeout")
+        return result
+    except FileNotFoundError:
+        result["errors"].append("pdflatex not found")
+        return result
+    except Exception as e:
+        result["errors"].append(str(e))
+        return result
+
+
+def compile_table_preview_documents(
+    preview_docs: Dict[str, str],
+    output_dir: str,
+    max_passes: int = 2,
+    timeout_seconds: int = 60,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Compile multiple standalone table preview documents.
+    - **Description**:
+        - Runs table preview compilation per table id.
+        - Returns per-table structured outcomes for downstream checks.
+
+    - **Args**:
+        - `preview_docs` (Dict[str, str]): Table id to preview tex mapping.
+        - `output_dir` (str): Root output directory for artifacts.
+        - `max_passes` (int): Number of pdflatex passes per table.
+        - `timeout_seconds` (int): Timeout per pdflatex call.
+
+    - **Returns**:
+        - `results` (Dict[str, Dict[str, Any]]): Table id to result mapping.
+    """
+    results: Dict[str, Dict[str, Any]] = {}
+    os.makedirs(output_dir, exist_ok=True)
+
+    for table_id, preview_tex in (preview_docs or {}).items():
+        results[table_id] = compile_table_preview_document(
+            table_id=table_id,
+            preview_tex=preview_tex,
+            output_dir=output_dir,
+            max_passes=max_passes,
+            timeout_seconds=timeout_seconds,
+        )
+
+    return results
 
 
 def _read_table_content(

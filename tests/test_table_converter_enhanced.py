@@ -3,8 +3,31 @@ Tests for enhanced table converter: TableAnalyzer, enhanced prompt, TableValidat
 smart width decisions, and end-to-end integration.
 Covers Phases 1–5 of the Table Converter Enhancement TDD plan.
 """
-import pytest
+import json
+import shutil
 from dataclasses import dataclass
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BLIP_META_JSON = (
+    REPO_ROOT
+    / "experiments"
+    / "ai_track"
+    / "metadatas"
+    / "3f5b31c4f7350dc88002c121aecbdc82f86eb5bb"
+    / "meta.json"
+)
+
+
+@pytest.fixture(scope="module")
+def blip2_track_meta():
+    if not BLIP_META_JSON.is_file():
+        pytest.skip(f"Real fixture metadata not found: {BLIP_META_JSON}")
+    with open(BLIP_META_JSON, encoding="utf-8") as f:
+        return json.load(f)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Phase 1: TableAnalyzer — CSV/MD structural pre-processing
@@ -1078,3 +1101,162 @@ class TestCompilePdfAdjustboxIntegration:
         assert 'TemplateConfig(\n' not in source or 'column_format' in source, (
             "TemplateConfig must be constructed with column_format from template_guide"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Real BLIP-2 track metadata (meta.json) + ICML-style double-column pipeline
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestTableConverterRealBlip2MetadataJson:
+    """
+    End-to-end table converter checks using the committed ai_track meta.json
+    (markdown table bodies) and the same layout assumptions as ICML
+    (double-column previews). Optional: template zip path and pdflatex smoke.
+    """
+
+    def test_meta_records_icml_and_template_path(self, blip2_track_meta):
+        assert blip2_track_meta.get("style_guide") == "ICML"
+        tpl_rel = blip2_track_meta.get("template_path")
+        assert tpl_rel
+        tpl_abs = (REPO_ROOT / tpl_rel).resolve()
+        if not tpl_abs.is_file():
+            pytest.skip(f"Template archive not in workspace: {tpl_abs}")
+
+    def test_all_listed_tables_have_markdown_bodies(self, blip2_track_meta):
+        tables = blip2_track_meta.get("tables") or []
+        assert len(tables) >= 6
+        for t in tables:
+            assert t.get("id")
+            body = (t.get("content") or "").strip()
+            assert body.startswith("|"), t["id"]
+
+    def test_analyze_prompt_and_validate_stub_for_each_table(self, blip2_track_meta):
+        from src.agents.shared.table_converter import (
+            TableAnalyzer,
+            TableValidator,
+            _build_table_latex_from_source,
+            build_conversion_prompt,
+        )
+
+        column_format = "double"
+        for t in blip2_track_meta["tables"]:
+            content = t["content"].strip()
+            structure = TableAnalyzer.analyze(content)
+            assert structure.detected_format == "markdown", t["id"]
+            assert structure.col_count >= 2, t["id"]
+            assert structure.data_row_count >= 1, t["id"]
+
+            prompt, max_tokens = build_conversion_prompt(
+                label=t["id"],
+                caption=t.get("caption") or "",
+                content=content,
+                structure=structure,
+                column_format=column_format,
+                return_max_tokens=True,
+            )
+            assert t["id"] in prompt
+            assert str(structure.col_count) in prompt
+            assert str(structure.data_row_count) in prompt
+            assert max_tokens >= 1500
+
+            latex = _build_table_latex_from_source(
+                table_id=t["id"],
+                caption=t.get("caption") or "",
+                content=content,
+            )
+            result = TableValidator.validate(latex, structure, t["id"])
+            assert result.is_valid, (t["id"], result.errors, result.warnings)
+
+    def test_smart_promote_accepts_deterministic_latex_from_meta(self, blip2_track_meta):
+        from src.agents.shared.table_converter import (
+            _build_table_latex_from_source,
+            smart_promote_wide_tables,
+        )
+
+        for t in blip2_track_meta["tables"]:
+            content = t["content"].strip()
+            latex = _build_table_latex_from_source(
+                table_id=t["id"],
+                caption=t.get("caption") or "",
+                content=content,
+            )
+            promoted = smart_promote_wide_tables(latex)
+            assert "\\begin{table" in promoted
+            assert "\\end{table" in promoted
+
+    def test_build_preview_documents_roundtrip_metadata_dir(self, blip2_track_meta):
+        from src.agents.shared.table_converter import (
+            _escape_latex_text,
+            build_table_preview_documents,
+        )
+
+        meta_dir = str(BLIP_META_JSON.parent)
+        specs = [
+            SimpleNamespace(
+                id=t["id"],
+                caption=t.get("caption") or t["id"],
+                content=t.get("content"),
+                file_path=None,
+                auto_generate=False,
+                wide=False,
+            )
+            for t in blip2_track_meta["tables"]
+        ]
+        previews = build_table_preview_documents(
+            tables=specs,
+            converted_tables={},
+            column_format="double",
+            allow_placeholder=False,
+            base_path=meta_dir,
+        )
+        assert len(previews) == len(blip2_track_meta["tables"])
+        for tid, tex in previews.items():
+            assert tid.startswith("tab:")
+            assert "\\documentclass[twocolumn]{article}" in tex
+            assert _escape_latex_text(f"Preview {tid}") in tex
+            assert "\\usepackage{booktabs}" in tex
+            assert "\\label{" in tex
+
+    def test_pdflatex_compiles_each_table_preview(self, blip2_track_meta, tmp_path):
+        from src.agents.shared.table_converter import (
+            build_table_preview_documents,
+            compile_table_preview_document,
+        )
+
+        if not shutil.which("pdflatex"):
+            pytest.skip("pdflatex not on PATH")
+
+        meta_dir = str(BLIP_META_JSON.parent)
+        specs = [
+            SimpleNamespace(
+                id=t["id"],
+                caption=t.get("caption") or t["id"],
+                content=t.get("content"),
+                file_path=None,
+                auto_generate=False,
+                wide=False,
+            )
+            for t in blip2_track_meta["tables"]
+        ]
+        previews = build_table_preview_documents(
+            tables=specs,
+            converted_tables={},
+            column_format="double",
+            allow_placeholder=False,
+            base_path=meta_dir,
+        )
+        out_root = tmp_path / "table_preview_real_meta"
+        out_root.mkdir(parents=True, exist_ok=True)
+        failures = []
+        for tid, tex in previews.items():
+            res = compile_table_preview_document(
+                table_id=tid,
+                preview_tex=tex,
+                output_dir=str(out_root),
+                max_passes=2,
+                timeout_seconds=90,
+            )
+            if not res["success"]:
+                failures.append((tid, res.get("errors"), res.get("log_path")))
+        assert not failures, failures

@@ -238,7 +238,9 @@ class TestDoclingPaperAnalyzer:
         }):
             analyzer = DoclingPaperAnalyzer(config=None)
             result = analyzer.parse(Path("/fake/paper.pdf"))
+            analyzer.parse(Path("/fake/second.pdf"))
 
+        assert mock_converter_cls.call_count == 1
         assert isinstance(result, DoclingPaperResult)
         assert "Test abstract." in result.sections.get("abstract", "")
         assert "Test method." in result.sections.get("method", "")
