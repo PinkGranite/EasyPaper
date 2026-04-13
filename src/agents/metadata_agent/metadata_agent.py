@@ -32,7 +32,8 @@ import os
 import shutil
 import tempfile
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+import hashlib
 from functools import partial
 from typing import List, Dict, Any, Optional, Tuple, Set
 from pathlib import Path
@@ -305,6 +306,367 @@ class MetaDataAgent(ReActAgent):
         ".tex", ".bib", ".bst", ".cls", ".sty", ".bbl",
         ".png", ".jpg", ".jpeg", ".pdf", ".eps", ".svg", ".gif",
     }
+    _ANALYSIS_SUBDIRS = (
+        "analysis/planning",
+        "analysis/research_context",
+        "analysis/citations",
+        "analysis/structure",
+        "analysis/review",
+        "analysis/references",
+        "analysis/code_context",
+        "logs/traces",
+    )
+
+    @classmethod
+    def _ensure_export_directories(cls, paper_dir: Path) -> None:
+        """
+        Ensure export subdirectories exist under paper_dir.
+
+        - **Description**:
+            - Creates all standard analysis/log subdirectories used by
+              planning and generation artifact exports.
+
+        - **Args**:
+            - `paper_dir` (Path): Root output directory for one paper run.
+        """
+        for d_name in cls._ANALYSIS_SUBDIRS:
+            (paper_dir / d_name).mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _write_json_file(path: Path, payload: Any) -> None:
+        """
+        Write JSON content to file with UTF-8 encoding.
+
+        - **Description**:
+            - Serializes payload with pretty indentation and preserves
+              non-ASCII characters.
+
+        - **Args**:
+            - `path` (Path): Target JSON file path.
+            - `payload` (Any): JSON-serializable object.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def _export_plan_artifacts(
+        cls,
+        paper_dir: Path,
+        paper_plan: Optional["PaperPlan"] = None,
+        plan_review_summary: Optional[Dict[str, Any]] = None,
+        evidence_dag: Optional["EvidenceDAG"] = None,
+    ) -> None:
+        """
+        Export planning artifacts to the analysis/planning directory.
+
+        - **Description**:
+            - Persists paper plan, planner review summary, and evidence DAG
+              when available.
+
+        - **Args**:
+            - `paper_dir` (Path): Root output directory.
+            - `paper_plan` (PaperPlan, optional): Planned paper structure.
+            - `plan_review_summary` (Dict[str, Any], optional): Planner review summary.
+            - `evidence_dag` (EvidenceDAG, optional): Built evidence graph.
+        """
+        planning_dir = paper_dir / "analysis" / "planning"
+        planning_dir.mkdir(parents=True, exist_ok=True)
+        if paper_plan is not None:
+            (planning_dir / "paper_plan.json").write_text(
+                paper_plan.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
+        if plan_review_summary is not None:
+            cls._write_json_file(planning_dir / "plan_review.json", plan_review_summary)
+        if evidence_dag is not None:
+            cls._write_json_file(
+                planning_dir / "evidence_dag.json",
+                evidence_dag.to_serializable(),
+            )
+
+    @classmethod
+    def _export_generation_core_artifacts(
+        cls,
+        paper_dir: Path,
+        latex_content: str,
+        references_bibtex: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        """
+        Export root-level generation artifacts.
+
+        - **Description**:
+            - Ensures directory layout and writes root files required for
+              post-run inspection and reuse.
+
+        - **Args**:
+            - `paper_dir` (Path): Root output directory.
+            - `latex_content` (str): Assembled paper LaTeX content.
+            - `references_bibtex` (str): Full BibTeX content.
+            - `metadata` (Dict[str, Any]): Serialized metadata payload.
+        """
+        cls._ensure_export_directories(paper_dir)
+        (paper_dir / "main.tex").write_text(latex_content, encoding="utf-8")
+        (paper_dir / "references.bib").write_text(references_bibtex, encoding="utf-8")
+        cls._write_json_file(paper_dir / "metadata.json", metadata)
+
+    @staticmethod
+    def _write_text_file(path: Path, content: str) -> None:
+        """
+        Write UTF-8 text content to file.
+
+        - **Description**:
+            - Ensures parent directories exist before writing plain text output.
+
+        - **Args**:
+            - `path` (Path): Target output path.
+            - `content` (str): Text content to write.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    @staticmethod
+    def _build_structure_summary(
+        paper_plan: Optional["PaperPlan"],
+        generated_sections: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """
+        Build a compact structure summary for artifact export.
+
+        - **Description**:
+            - Aggregates section order/title and generation coverage into one
+              stable JSON payload for downstream inspection.
+
+        - **Args**:
+            - `paper_plan` (PaperPlan, optional): Planned section layout.
+            - `generated_sections` (Dict[str, str]): Final generated sections.
+
+        - **Returns**:
+            - `Dict[str, Any]`: Structure summary payload.
+        """
+        planned_sections: List[Dict[str, Any]] = []
+        if paper_plan is not None:
+            for section in paper_plan.sections:
+                planned_sections.append(
+                    {
+                        "section_type": section.section_type,
+                        "section_title": section.section_title,
+                        "paragraph_count": len(section.paragraphs or []),
+                        "figure_count": len(section.figures or []),
+                        "table_count": len(section.tables or []),
+                    },
+                )
+        generated_order = list(generated_sections.keys())
+        return {
+            "planned_sections": planned_sections,
+            "generated_section_order": generated_order,
+            "generated_section_count": len(generated_order),
+            "missing_from_generation": [
+                item["section_type"]
+                for item in planned_sections
+                if item["section_type"] not in generated_sections
+            ],
+        }
+
+    @classmethod
+    def _export_analysis_artifacts(
+        cls,
+        paper_dir: Path,
+        research_context: Optional[Dict[str, Any]],
+        code_context: Optional[Dict[str, Any]],
+        code_summary_markdown: Optional[str],
+        ref_pool_snapshot: Dict[str, Any],
+        citation_budget_usage: List[Dict[str, Any]],
+        paper_plan: Optional["PaperPlan"],
+        generated_sections: Dict[str, str],
+    ) -> None:
+        """
+        Export analysis artifacts to dedicated analysis subdirectories.
+
+        - **Description**:
+            - Writes non-empty JSON/Markdown payloads for research, citations,
+              structure, references, and code-context analysis.
+            - Emits placeholder payloads when source data is missing.
+
+        - **Args**:
+            - `paper_dir` (Path): Root output directory.
+            - `research_context` (Dict[str, Any], optional): Research context.
+            - `code_context` (Dict[str, Any], optional): Code context.
+            - `code_summary_markdown` (str, optional): Markdown summary for code context.
+            - `ref_pool_snapshot` (Dict[str, Any]): Reference pool snapshot.
+            - `citation_budget_usage` (List[Dict[str, Any]]): Citation usage summary.
+            - `paper_plan` (PaperPlan, optional): Planned structure.
+            - `generated_sections` (Dict[str, str]): Generated section contents.
+        """
+        cls._ensure_export_directories(paper_dir)
+
+        research_payload = dict(research_context or {})
+        if "summary" not in research_payload:
+            research_payload["summary"] = ""
+        if not research_context:
+            research_payload.setdefault("status", "unavailable")
+            research_payload.setdefault("reason", "research_context_missing")
+        cls._write_json_file(
+            paper_dir / "analysis" / "research_context" / "research_context.json",
+            research_payload,
+        )
+
+        citations_payload = {
+            "status": "ok" if citation_budget_usage else "empty",
+            "citation_budget_usage": citation_budget_usage or [],
+        }
+        cls._write_json_file(
+            paper_dir / "analysis" / "citations" / "citation_budget_usage.json",
+            citations_payload,
+        )
+
+        structure_payload = cls._build_structure_summary(
+            paper_plan=paper_plan,
+            generated_sections=generated_sections,
+        )
+        cls._write_json_file(
+            paper_dir / "analysis" / "structure" / "structure_summary.json",
+            structure_payload,
+        )
+
+        ref_payload = dict(ref_pool_snapshot or {})
+        ref_payload.setdefault("core_refs", [])
+        ref_payload.setdefault("discovered_refs", [])
+        cls._write_json_file(
+            paper_dir / "analysis" / "references" / "ref_pool_snapshot.json",
+            ref_payload,
+        )
+
+        code_payload = dict(code_context or {})
+        if not code_context:
+            code_payload["status"] = "unavailable"
+            code_payload["reason"] = "code_context_missing"
+        cls._write_json_file(
+            paper_dir / "analysis" / "code_context" / "code_context.json",
+            code_payload,
+        )
+        cls._write_text_file(
+            paper_dir / "analysis" / "code_context" / "code_summary.md",
+            code_summary_markdown or "# Code Summary\n\nNo code summary available.\n",
+        )
+
+    @classmethod
+    def _export_trace_artifacts(
+        cls,
+        paper_dir: Path,
+        prompt_traces: List[Dict[str, Any]],
+        usage_report: Dict[str, Any],
+        export_prompt_traces: bool,
+    ) -> None:
+        """
+        Export runtime traces and usage report files.
+
+        - **Description**:
+            - Persists prompt trace and usage telemetry into logs/traces with
+              stable filenames for downstream tooling.
+
+        - **Args**:
+            - `paper_dir` (Path): Root output directory.
+            - `prompt_traces` (List[Dict[str, Any]]): Prompt trace entries.
+            - `usage_report` (Dict[str, Any]): Usage tracker payload.
+            - `export_prompt_traces` (bool): Whether prompt traces are enabled.
+        """
+        cls._ensure_export_directories(paper_dir)
+        trace_items = prompt_traces if export_prompt_traces else []
+        cls._write_json_file(
+            paper_dir / "logs" / "traces" / "prompt_traces.json",
+            {
+                "status": "enabled" if export_prompt_traces else "disabled",
+                "count": len(trace_items),
+                "items": trace_items,
+            },
+        )
+        usage_payload = dict(usage_report or {})
+        usage_payload.setdefault("summary", {})
+        cls._write_json_file(
+            paper_dir / "logs" / "traces" / "usage_report.json",
+            usage_payload,
+        )
+
+    _MANIFEST_MAX_HASH_BYTES = 2 * 1024 * 1024
+
+    @classmethod
+    def _export_artifacts_manifest(
+        cls,
+        paper_dir: Path,
+        *,
+        paper_title: str,
+        errors: List[str],
+        review_iterations: int,
+        pdf_path: Optional[str],
+        total_words: int,
+    ) -> None:
+        """
+        Write artifacts_manifest.json summarizing all files under paper_dir.
+
+        - **Description**:
+            - Walks the output tree after other exports and session persistence,
+              recording path, size, and SHA-256 for smaller files.
+
+        - **Args**:
+            - `paper_dir` (Path): Root output directory.
+            - `paper_title` (str): Paper title for the run summary.
+            - `errors` (List[str]): Non-fatal errors collected during generation.
+            - `review_iterations` (int): Review loop iteration count.
+            - `pdf_path` (Optional[str]): Path to compiled PDF if any.
+            - `total_words` (int): Total word count across sections.
+        """
+        paper_dir = Path(paper_dir)
+        manifest_path = paper_dir / "artifacts_manifest.json"
+        file_entries: List[Dict[str, Any]] = []
+        for fpath in sorted(paper_dir.rglob("*")):
+            if not fpath.is_file():
+                continue
+            rel = fpath.relative_to(paper_dir).as_posix()
+            if rel == "artifacts_manifest.json":
+                continue
+            try:
+                size_b = fpath.stat().st_size
+            except OSError:
+                size_b = -1
+            entry: Dict[str, Any] = {
+                "path": rel,
+                "size_bytes": size_b,
+            }
+            if 0 <= size_b <= cls._MANIFEST_MAX_HASH_BYTES:
+                digest = hashlib.sha256()
+                with open(fpath, "rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                entry["sha256"] = digest.hexdigest()
+            else:
+                entry["sha256"] = None
+                if size_b > cls._MANIFEST_MAX_HASH_BYTES:
+                    entry["sha256_skipped_reason"] = "file_too_large_for_manifest_hash"
+                elif size_b < 0:
+                    entry["sha256_skipped_reason"] = "stat_failed"
+            file_entries.append(entry)
+
+        payload = {
+            "manifest_version": "1",
+            "generated_at": datetime.now(timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "paper_title": paper_title,
+            "run": {
+                "error_count": len(errors),
+                "errors_preview": list(errors[:10]),
+                "review_iterations": review_iterations,
+                "pdf_path": pdf_path,
+                "total_words": total_words,
+            },
+            "file_count": len(file_entries),
+            "files": file_entries,
+        }
+        cls._write_json_file(manifest_path, payload)
 
     @staticmethod
     async def _save_compilation_output(
@@ -1552,10 +1914,10 @@ class MetaDataAgent(ReActAgent):
                                 tbl.wide = True
 
                     if save_output and paper_dir:
-                        planning_dir = paper_dir / "analysis" / "planning"
-                        planning_dir.mkdir(parents=True, exist_ok=True)
-                        plan_path = planning_dir / "paper_plan.json"
-                        plan_path.write_text(paper_plan.model_dump_json(indent=2), encoding="utf-8")
+                        self._export_plan_artifacts(
+                            paper_dir=paper_dir,
+                            paper_plan=paper_plan,
+                        )
 
                     plan_review_obj = None
                     if self._planner and hasattr(self._planner, "get_last_plan_review_summary"):
@@ -1567,12 +1929,9 @@ class MetaDataAgent(ReActAgent):
                         plan_review_summary = plan_review_obj.model_dump(mode="json")
                         plan_review_iterations = list(plan_review_summary.get("iterations", []) or [])
                         if save_output and paper_dir:
-                            planning_dir = paper_dir / "analysis" / "planning"
-                            planning_dir.mkdir(parents=True, exist_ok=True)
-                            plan_review_path = planning_dir / "plan_review.json"
-                            plan_review_path.write_text(
-                                json.dumps(plan_review_summary, indent=2, ensure_ascii=False),
-                                encoding="utf-8",
+                            self._export_plan_artifacts(
+                                paper_dir=paper_dir,
+                                plan_review_summary=plan_review_summary,
                             )
 
                     # Phase 0b: Reference discovery
@@ -1675,11 +2034,9 @@ class MetaDataAgent(ReActAgent):
                         print(f"[MetaDataAgent] Generated {total_sp} sentence plans from DAG bindings")
 
                     if save_output and paper_dir:
-                        dag_path = paper_dir / "analysis" / "planning" / "evidence_dag.json"
-                        dag_path.parent.mkdir(parents=True, exist_ok=True)
-                        dag_path.write_text(
-                            json.dumps(evidence_dag.to_serializable(), indent=2, ensure_ascii=False),
-                            encoding="utf-8",
+                        self._export_plan_artifacts(
+                            paper_dir=paper_dir,
+                            evidence_dag=evidence_dag,
                         )
                 except Exception as e:
                     print(f"[MetaDataAgent] Warning: Evidence DAG construction failed: {e}")
@@ -2095,21 +2452,41 @@ class MetaDataAgent(ReActAgent):
             output_path = None
             if save_output and paper_dir:
                 output_path = str(paper_dir)
-                for d_name in ("analysis/planning", "analysis/research_context",
-                               "analysis/citations", "analysis/structure",
-                               "analysis/review", "analysis/references",
-                               "analysis/code_context", "logs/traces"):
-                    (paper_dir / d_name).mkdir(parents=True, exist_ok=True)
-
-                (paper_dir / "main.tex").write_text(latex_content, encoding="utf-8")
-                (paper_dir / "references.bib").write_text(ref_pool.to_bibtex(), encoding="utf-8")
-                (paper_dir / "metadata.json").write_text(
-                    json.dumps(metadata.model_dump(), indent=2, ensure_ascii=False), encoding="utf-8",
+                usage_report = usage_tracker.to_dict()
+                self._export_generation_core_artifacts(
+                    paper_dir=paper_dir,
+                    latex_content=latex_content,
+                    references_bibtex=ref_pool.to_bibtex(),
+                    metadata=metadata.model_dump(),
+                )
+                self._export_analysis_artifacts(
+                    paper_dir=paper_dir,
+                    research_context=research_context,
+                    code_context=code_context,
+                    code_summary_markdown=code_summary_markdown,
+                    ref_pool_snapshot=ref_pool.to_dict(),
+                    citation_budget_usage=citation_budget_usage,
+                    paper_plan=paper_plan,
+                    generated_sections=generated_sections,
+                )
+                self._export_trace_artifacts(
+                    paper_dir=paper_dir,
+                    prompt_traces=prompt_traces,
+                    usage_report=usage_report,
+                    export_prompt_traces=bool(metadata.export_prompt_traces),
                 )
                 memory.log("metadata", "final", "paper_assembled",
                            narrative=f"Paper assembled successfully with {total_words} total words.",
                            total_words=total_words, status="assembled")
                 memory.persist_all(paper_dir)
+                self._export_artifacts_manifest(
+                    paper_dir,
+                    paper_title=metadata.title,
+                    errors=list(errors),
+                    review_iterations=review_iterations,
+                    pdf_path=pdf_path,
+                    total_words=total_words,
+                )
 
             status = "ok" if not errors else ("partial" if len(errors) < len(sections_results) else "error")
             result = PaperGenerationResult(

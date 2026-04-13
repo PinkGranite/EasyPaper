@@ -923,13 +923,53 @@ class SessionMemory:
         reviews_dir = output_dir / "logs" / "review"
         reviews_dir.mkdir(parents=True, exist_ok=True)
         path = reviews_dir / "review_history.json"
-        iterations: list = [record.to_iteration_export() for record in self.review_history]
-        payload = {"iterations": iterations}
+        payload = self.build_review_history_payload()
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         # Backward compatibility: keep legacy flat path for downstream tools.
         legacy_path = output_dir / "review_history.json"
         legacy_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        logger.info("session_memory.persisted_reviews path=%s iterations=%d", path, len(iterations))
+        logger.info(
+            "session_memory.persisted_reviews path=%s iterations=%d",
+            path,
+            len(payload.get("iterations", [])),
+        )
+
+    def build_review_history_payload(self) -> Dict[str, Any]:
+        """
+        Build canonical review history payload.
+
+        - **Description**:
+            - Produces the single source payload used by all review-history
+              export targets to prevent content drift between paths.
+
+        - **Returns**:
+            - `Dict[str, Any]`: Review history payload with ``iterations`` list.
+        """
+        iterations: list = [record.to_iteration_export() for record in self.review_history]
+        return {"iterations": iterations}
+
+    def persist_analysis_review(self, output_dir: Path) -> None:
+        """
+        Persist review history to analysis/review directory.
+
+        - **Description**:
+            - Writes the same canonical review payload as ``persist_reviews``
+              into the analysis artifact tree.
+
+        - **Args**:
+            - `output_dir` (Path): Paper output directory.
+        """
+        output_dir = Path(output_dir)
+        analysis_dir = output_dir / "analysis" / "review"
+        analysis_dir.mkdir(parents=True, exist_ok=True)
+        payload = self.build_review_history_payload()
+        path = analysis_dir / "review_history.json"
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        logger.info(
+            "session_memory.persisted_analysis_review path=%s iterations=%d",
+            path,
+            len(payload.get("iterations", [])),
+        )
 
     def persist_readable_reviews(self, output_dir: Path) -> None:
         """
@@ -971,6 +1011,7 @@ class SessionMemory:
     def persist_all(self, output_dir: Path) -> None:
         """Persist both reviews and logs."""
         self.persist_reviews(output_dir)
+        self.persist_analysis_review(output_dir)
         self.persist_readable_reviews(output_dir)
         self.persist_logs(output_dir)
 
