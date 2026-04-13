@@ -108,6 +108,79 @@ class ReviewOrchestrator:
     # Main review orchestration loop
     # ------------------------------------------------------------------
 
+    def _compact_section_feedbacks(
+        self,
+        section_feedbacks: List[SectionFeedback],
+    ) -> List[SectionFeedback]:
+        """
+        Merge duplicate section feedback entries within one iteration.
+        - **Description**:
+            - Reviewer output may contain multiple feedback items for the same
+              section from different checkers/tasks.
+            - Applying all duplicates sequentially can trigger many redundant
+              revision calls and dramatically slow one review iteration.
+            - This compaction keeps one effective feedback per section by
+              reusing ConflictResolver merge semantics.
+
+        - **Args**:
+            - `section_feedbacks` (List[SectionFeedback]): Raw feedback list.
+
+        - **Returns**:
+            - `List[SectionFeedback]`: Compacted feedback list.
+        """
+        if not section_feedbacks:
+            return []
+
+        merged_by_key: Dict[Tuple[str, str], SectionFeedback] = {}
+        for sf in section_feedbacks:
+            section_type = str(getattr(sf, "section_type", "") or "")
+            if not section_type:
+                continue
+            action = str(getattr(sf, "action", "") or "ok")
+            key = (section_type, action)
+
+            existing = merged_by_key.get(key)
+            if existing is None:
+                merged_by_key[key] = sf
+                continue
+
+            # Merge only exact (section, action) duplicates to avoid losing
+            # distinct action intents in the same section.
+            existing.target_paragraphs = sorted(
+                list(set((existing.target_paragraphs or []) + (sf.target_paragraphs or [])))
+            )
+            if sf.paragraph_instructions:
+                existing.paragraph_instructions.update(sf.paragraph_instructions)
+            if sf.paragraph_feedbacks:
+                existing.paragraph_feedbacks.extend(sf.paragraph_feedbacks)
+            if sf.structural_actions:
+                existing.structural_actions = list(
+                    dict.fromkeys((existing.structural_actions or []) + (sf.structural_actions or []))
+                )
+            if sf.acceptance_criteria:
+                existing.acceptance_criteria = list(
+                    dict.fromkeys((existing.acceptance_criteria or []) + (sf.acceptance_criteria or []))
+                )
+            if sf.target_id and not existing.target_id:
+                existing.target_id = sf.target_id
+            if (
+                str(getattr(existing, "issue_type", "other") or "other").lower() == "other"
+                and str(getattr(sf, "issue_type", "other") or "other").lower() != "other"
+            ):
+                existing.issue_type = sf.issue_type
+            if abs(int(getattr(sf, "delta_words", 0) or 0)) > abs(
+                int(getattr(existing, "delta_words", 0) or 0)
+            ):
+                existing.delta_words = sf.delta_words
+            if sf.revision_prompt and sf.revision_prompt not in (existing.revision_prompt or ""):
+                existing.revision_prompt = (
+                    f"{existing.revision_prompt}\n\n{sf.revision_prompt}".strip()
+                    if existing.revision_prompt
+                    else sf.revision_prompt
+                )
+
+        return list(merged_by_key.values())
+
     async def _run_review_orchestration(
         self,
         generated_sections: Dict[str, str],
@@ -270,6 +343,16 @@ class ReviewOrchestrator:
                     })
                     iteration_revision_plan = await self._llm_plan_revision_tasks(review_result)
                     self._apply_revision_plan_to_feedbacks(review_result, iteration_revision_plan)
+                    raw_count = len(review_result.section_feedbacks or [])
+                    review_result.section_feedbacks = self._compact_section_feedbacks(
+                        review_result.section_feedbacks or []
+                    )
+                    compact_count = len(review_result.section_feedbacks or [])
+                    if compact_count < raw_count:
+                        print(
+                            "[ReviewLoop] Compacted section feedbacks "
+                            f"{raw_count} -> {compact_count}"
+                        )
                     print(
                         "[Reviewer] Result: "
                         f"passed={review_result.passed} "
@@ -328,7 +411,7 @@ class ReviewOrchestrator:
                 iteration_dir = paper_dir / f"iteration_{review_iterations:02d}"
                 iteration_dir.mkdir(parents=True, exist_ok=True)
                 print(f"[ReviewLoop] PDF output dir: {iteration_dir}")
-                figure_base_path = os.getcwd()
+                figure_base_path = getattr(metadata, "materials_root", None) or os.getcwd()
                 figure_paths = self.host._collect_figure_paths(metadata.figures, base_path=figure_base_path)
                 pdf_result_path, _, compile_errors, section_errors = await self.host._compile_pdf(
                     generated_sections=generated_sections,
@@ -505,6 +588,16 @@ class ReviewOrchestrator:
                 errors.append("VLM review skipped: PDF not compiled (missing template or output path)")
 
             # Apply revisions from VLM feedback and/or Typesetter LaTeX-fix feedback
+            raw_post_count = len(review_result.section_feedbacks or [])
+            review_result.section_feedbacks = self._compact_section_feedbacks(
+                review_result.section_feedbacks or []
+            )
+            compact_post_count = len(review_result.section_feedbacks or [])
+            if compact_post_count < raw_post_count:
+                print(
+                    "[ReviewLoop] Post-compile compacted section feedbacks "
+                    f"{raw_post_count} -> {compact_post_count}"
+                )
             post_compile_revised = await self.host._executor._apply_revisions(
                 review_result=review_result,
                 generated_sections=generated_sections,
@@ -742,7 +835,7 @@ class ReviewOrchestrator:
                 print("[MetaDataAgent] Final pass: content changed since last compile — recompiling")
                 final_dir = paper_dir / f"iteration_{review_iterations:02d}_final"
                 final_dir.mkdir(parents=True, exist_ok=True)
-                figure_base_path = os.getcwd()
+                figure_base_path = getattr(metadata, "materials_root", None) or os.getcwd()
                 figure_paths = self.host._collect_figure_paths(metadata.figures, base_path=figure_base_path)
                 final_pdf, _, final_errors, _ = await self.host._compile_pdf(
                     generated_sections=generated_sections,

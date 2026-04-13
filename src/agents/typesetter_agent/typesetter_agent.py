@@ -18,7 +18,7 @@ import zipfile
 import httpx
 import logging
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
 from fastapi import APIRouter
 from jinja2 import Template
 from ...config.schema import ModelConfig
@@ -1986,6 +1986,210 @@ class TypesetterAgent(BaseAgent):
         
         return result_paths
 
+    @staticmethod
+    def _strip_tex_comments(content: str) -> str:
+        """
+        Remove LaTeX line comments while preserving escaped percent signs.
+        - **Description**:
+            - Strips content after unescaped ``%`` on each line.
+            - Keeps ``\\%`` literal percent intact.
+
+        - **Args**:
+            - `content` (str): Raw LaTeX text.
+
+        - **Returns**:
+            - `str`: Comment-stripped LaTeX text.
+        """
+        cleaned_lines: List[str] = []
+        for line in (content or "").splitlines():
+            buf: List[str] = []
+            idx = 0
+            while idx < len(line):
+                ch = line[idx]
+                if ch == "%" and (idx == 0 or line[idx - 1] != "\\"):
+                    break
+                buf.append(ch)
+                idx += 1
+            cleaned_lines.append("".join(buf))
+        return "\n".join(cleaned_lines)
+
+    @staticmethod
+    def _extract_document_body(tex_src: str) -> str:
+        """
+        Extract text after ``\\begin{document}`` from full TeX source.
+        - **Args**:
+            - `tex_src` (str): Full ``main.tex`` source.
+        - **Returns**:
+            - `str`: Document body (or whole text if marker missing).
+        """
+        body_start = (tex_src or "").find(r"\begin{document}")
+        if body_start < 0:
+            return tex_src or ""
+        return tex_src[body_start + len(r"\begin{document}") :]
+
+    @staticmethod
+    def _resolve_include_path(
+        include_target: str,
+        base_dir: str,
+        work_dir: str,
+    ) -> Optional[str]:
+        """
+        Resolve ``\\input``/``\\include`` target into a readable ``.tex`` path.
+        - **Args**:
+            - `include_target` (str): Value inside braces.
+            - `base_dir` (str): Directory of current TeX file.
+            - `work_dir` (str): Compilation workspace root.
+        - **Returns**:
+            - `Optional[str]`: Absolute path if found, else ``None``.
+        """
+        target = (include_target or "").strip()
+        if not target:
+            return None
+
+        normalized = target.replace("/", os.sep).replace("\\", os.sep)
+        if os.path.isabs(normalized):
+            candidates = [normalized]
+        else:
+            candidates = [
+                os.path.join(base_dir, normalized),
+                os.path.join(work_dir, normalized),
+            ]
+
+        expanded: List[str] = []
+        for cand in candidates:
+            expanded.append(cand)
+            if not cand.lower().endswith(".tex"):
+                expanded.append(cand + ".tex")
+
+        for cand in expanded:
+            if os.path.isfile(cand):
+                return os.path.abspath(cand)
+        return None
+
+    @staticmethod
+    def _has_tex_command(content: str, command: str) -> bool:
+        """
+        Check whether a TeX command appears as a standalone command token.
+        - **Args**:
+            - `content` (str): TeX body text.
+            - `command` (str): Command name without leading backslash.
+        - **Returns**:
+            - `bool`: True if command token is present.
+        """
+        if not content or not command:
+            return False
+        pattern = rf"\\{re.escape(command)}(?![A-Za-z@])"
+        return re.search(pattern, content) is not None
+
+    def _expand_tex_includes_for_detection(
+        self,
+        content: str,
+        current_file: str,
+        work_dir: str,
+        visited: Set[str],
+    ) -> str:
+        """
+        Expand ``\\input`` / ``\\include`` recursively for package detection only.
+        - **Description**:
+            - Keeps the original build pipeline untouched.
+            - Expands textual content so command scanning can see section files.
+            - Skips missing files and include cycles with warnings.
+
+        - **Args**:
+            - `content` (str): TeX text to scan.
+            - `current_file` (str): Current file path for relative resolution.
+            - `work_dir` (str): Compilation workspace root.
+            - `visited` (Set[str]): Cycle guard set.
+
+        - **Returns**:
+            - `str`: Expanded TeX body used by package detection.
+        """
+        stripped = self._strip_tex_comments(content)
+        include_re = re.compile(r"\\(?:input|include)\{([^}]+)\}")
+        base_dir = os.path.dirname(current_file)
+
+        out_parts: List[str] = []
+        last_idx = 0
+        for match in include_re.finditer(stripped):
+            out_parts.append(stripped[last_idx: match.start()])
+            target = match.group(1).strip()
+            include_path = self._resolve_include_path(target, base_dir, work_dir)
+            if not include_path:
+                logger.warning(
+                    "typesetter.include_not_found target=%s base=%s",
+                    target,
+                    current_file,
+                )
+                last_idx = match.end()
+                continue
+
+            include_key = os.path.normcase(os.path.abspath(include_path))
+            if include_key in visited:
+                logger.warning("typesetter.include_cycle_skipped path=%s", include_path)
+                last_idx = match.end()
+                continue
+
+            visited.add(include_key)
+            try:
+                with open(include_path, "r", encoding="utf-8", errors="ignore") as f:
+                    include_src = f.read()
+                expanded = self._expand_tex_includes_for_detection(
+                    include_src,
+                    include_path,
+                    work_dir,
+                    visited,
+                )
+                out_parts.append("\n")
+                out_parts.append(expanded)
+                out_parts.append("\n")
+            except Exception as e:
+                logger.warning(
+                    "typesetter.include_read_failed path=%s error=%s",
+                    include_path,
+                    e,
+                )
+
+            last_idx = match.end()
+
+        out_parts.append(stripped[last_idx:])
+        return "".join(out_parts)
+
+    def _build_detection_body(
+        self,
+        tex_src: str,
+        main_tex: str,
+        work_dir: str,
+    ) -> str:
+        """
+        Build a detection body that includes recursively expanded section files.
+        - **Description**:
+            - Uses ``main.tex`` body as baseline.
+            - Expands ``\\input`` / ``\\include`` recursively.
+            - Falls back to comment-stripped main body on failure.
+
+        - **Args**:
+            - `tex_src` (str): Full main TeX source.
+            - `main_tex` (str): Path to ``main.tex``.
+            - `work_dir` (str): Compilation workspace root.
+
+        - **Returns**:
+            - `str`: Detection body used for missing-package analysis.
+        """
+        body = self._extract_document_body(tex_src)
+        try:
+            visited: Set[str] = {os.path.normcase(os.path.abspath(main_tex))}
+            expanded = self._expand_tex_includes_for_detection(
+                content=body,
+                current_file=main_tex,
+                work_dir=work_dir,
+                visited=visited,
+            )
+            if expanded.strip():
+                return expanded
+        except Exception as e:
+            logger.warning("typesetter.expand_includes_failed fallback=main_body error=%s", e)
+        return self._strip_tex_comments(body)
+
     async def compile_latex(self, state: TypesetterAgentState) -> Dict[str, Any]:
         """
         Compile LaTeX with self-healing
@@ -2034,17 +2238,39 @@ class TypesetterAgent(BaseAgent):
                 PreambleParser as _PreambleParser,
             )
             if os.path.exists(main_tex):
-                tex_src = open(main_tex, "r", encoding="utf-8").read()
+                with open(main_tex, "r", encoding="utf-8") as f:
+                    tex_src = f.read()
                 preamble = _PreambleParser.extract_preamble(tex_src)
-                body_start = tex_src.find(r"\begin{document}")
-                body = tex_src[body_start:] if body_start >= 0 else ""
-                auto_pkgs = _detect_missing(preamble, body)
-                if auto_pkgs:
+                loaded_pkgs = set(_PreambleParser.extract_packages(preamble))
+                detection_body = self._build_detection_body(tex_src, main_tex, work_dir)
+
+                detected_pkgs = _detect_missing(preamble, detection_body)
+                fallback_pkgs: List[str] = []
+
+                # Conservative fallback: inject only when the command is present
+                # but command detection/mapping may still miss due template variance.
+                if self._has_tex_command(detection_body, "adjustbox") and "adjustbox" not in loaded_pkgs:
+                    fallback_pkgs.append("adjustbox")
+                if self._has_tex_command(detection_body, "multirow") and "multirow" not in loaded_pkgs:
+                    fallback_pkgs.append("multirow")
+                if self._has_tex_command(detection_body, "checkmark") and "amssymb" not in loaded_pkgs:
+                    fallback_pkgs.append("amssymb")
+                if self._has_tex_command(detection_body, "texttimes") and "textcomp" not in loaded_pkgs:
+                    fallback_pkgs.append("textcomp")
+
+                final_pkgs: List[str] = []
+                for pkg in detected_pkgs + fallback_pkgs:
+                    if pkg not in loaded_pkgs and pkg not in final_pkgs:
+                        final_pkgs.append(pkg)
+
+                if final_pkgs:
                     logger.info(
-                        "typesetter.auto_inject_packages packages=%s",
-                        auto_pkgs,
+                        "typesetter.auto_inject_packages detected=%s fallback=%s final=%s",
+                        detected_pkgs,
+                        fallback_pkgs,
+                        final_pkgs,
                     )
-                    patched = _inject_missing(tex_src, auto_pkgs)
+                    patched = _inject_missing(tex_src, final_pkgs)
                     with open(main_tex, "w", encoding="utf-8") as f:
                         f.write(patched)
         except Exception as e:

@@ -420,6 +420,9 @@ COMMAND_TO_PACKAGE: Dict[str, str] = {
     "\\colorbox": "xcolor",
     # multirow
     "\\multirow": "multirow",
+    # symbols
+    "\\checkmark": "amssymb",
+    "\\texttimes": "textcomp",
     # natbib
     "\\citep": "natbib",
     "\\citet": "natbib",
