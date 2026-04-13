@@ -51,14 +51,17 @@ def validate_and_fix_refs(content: str, valid_labels: Set[str]) -> str:
     # The optional prefix captures "Figure~", "Table~", "Fig.~", "Tab.~", etc.
     pattern = (
         r'(?:(?:Figure|Table|Fig\.|Tab\.|Figures|Tables|Section|Sec\.)'
-        r'[~\s]*)?'
+        r'[~ \t]*)?'
         r'\\(?:c?ref)\{(?P<key>[^}]+)\}'
     )
 
     result = re.sub(pattern, _replace_ref, content)
 
-    # Clean up artifacts: double spaces, orphaned commas/conjunctions
-    result = re.sub(r',\s*,', ',', result)
-    result = re.sub(r'\s{2,}', ' ', result)
-    result = re.sub(r'\s+([.,;])', r'\1', result)
+    # Clean up inline spacing artifacts while preserving paragraph breaks.
+    result = re.sub(r',[ \t]*,', ',', result)
+    result = re.sub(r'[ \t]{2,}', ' ', result)
+    result = re.sub(r'[ \t]+([.,;])', r'\1', result)
+    result = re.sub(r'[ \t]+\n', '\n', result)
+    result = re.sub(r'\n[ \t]+', '\n', result)
+    result = re.sub(r'\n{3,}', '\n\n', result)
     return result

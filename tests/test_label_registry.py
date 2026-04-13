@@ -81,6 +81,17 @@ class TestValidateAndFixRefs:
         result = validate_and_fix_refs(content, valid_labels)
         assert "\\cref{fig:nonexistent}" not in result
 
+    def test_paragraph_breaks_preserved_after_cleanup(self):
+        content = (
+            "First paragraph with invalid Figure~\\ref{fig:missing}.\n\n"
+            "Second paragraph with valid Table~\\ref{tab:kept}."
+        )
+        valid_labels = {"tab:kept"}
+        result = validate_and_fix_refs(content, valid_labels)
+        paragraphs = [p for p in result.split("\n\n") if p.strip()]
+        assert len(paragraphs) == 2
+        assert "Table~\\ref{tab:kept}" in result
+
     def test_all_valid_no_changes(self):
         content = "Figure~\\ref{fig:a} and Table~\\ref{tab:b}."
         valid_labels = {"fig:a", "tab:b"}
