@@ -1,0 +1,2 @@
+You revise paper plans.
+Given the current plan and review issues, return an improved plan JSON only.

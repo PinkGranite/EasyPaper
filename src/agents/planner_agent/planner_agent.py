@@ -28,6 +28,10 @@ from .models import (
     TablePlacement,
     PaperType,
     NarrativeStyle,
+    PlanReviewIssue,
+    PlanReviewIteration,
+    PlanReviewSeverity,
+    PlanReviewSummary,
     SentencePlan,
     SentenceRole,
     DEFAULT_EMPIRICAL_SECTIONS,
@@ -224,6 +228,66 @@ IMPORTANT:
   - NEVER create a \\begin{{figure}} environment for a REFERENCE ONLY figure.
 Output valid JSON only."""
 
+# --- STEP 6: Plan Critic ---
+_STEP6_PLAN_CRITIC_SYSTEM_DEFAULT = """You are a paper-plan critic.
+Review the paper plan for structure quality, section coverage, coherence, and venue fit.
+Return JSON only."""
+STEP6_PLAN_CRITIC_SYSTEM = _prompt_loader.load(
+    "planner", "step6_plan_critic", default=_STEP6_PLAN_CRITIC_SYSTEM_DEFAULT
+)
+
+STEP6_PLAN_CRITIC_USER = """Review this paper plan and report issues.
+
+Rules:
+- Return JSON only.
+- Severity values: blocker, major, minor, soft.
+- Use soft for style preferences (for example, preferred introduction contribution summary style).
+- Do not promote style-only observations to blocker.
+
+Paper Plan JSON:
+{paper_plan_json}
+
+Output JSON:
+{{
+  "critique": "Short review summary",
+  "issues": [
+    {{
+      "issue_id": "intro-001",
+      "section_type": "introduction",
+      "paragraph_locator": "subsection:.../paragraph:...",
+      "category": "coverage|coherence|flow|venue_norm|citations|other",
+      "severity": "blocker|major|minor|soft",
+      "title": "Issue title",
+      "description": "What is missing or wrong",
+      "recommendation": "How to revise the plan",
+      "expected_plan_change": "Concrete change expected in the plan"
+    }}
+  ]
+}}"""
+
+
+# --- STEP 7: Plan Optimizer ---
+_STEP7_PLAN_OPTIMIZER_SYSTEM_DEFAULT = """You revise paper plans.
+Given the current plan and review issues, return an improved plan JSON only."""
+STEP7_PLAN_OPTIMIZER_SYSTEM = _prompt_loader.load(
+    "planner", "step7_plan_optimizer", default=_STEP7_PLAN_OPTIMIZER_SYSTEM_DEFAULT
+)
+
+STEP7_PLAN_OPTIMIZER_USER = """Revise the paper plan according to review issues.
+
+Constraints:
+- Keep the same top-level schema as PaperPlan.
+- Preserve existing valid content unless revision is needed.
+- For style recommendations, improve wording intent in key_point/mission instead of injecting rigid templates.
+- Return JSON only.
+
+Current plan:
+{paper_plan_json}
+
+Issues:
+{issues_json}
+"""
+
 
 # =========================================================================
 # Planner Agent
@@ -258,6 +322,9 @@ class PlannerAgent(BaseAgent):
         )
         self.vlm_service = vlm_service
         self._last_plan: Optional[PaperPlan] = None
+        self._last_plan_review_summary: Optional[PlanReviewSummary] = None
+        self.enable_plan_review: bool = True
+        self.plan_review_max_iterations: int = 2
         self._router = self._create_router()
 
         logger.info("PlannerAgent initialized (vlm=%s)", vlm_service is not None)
@@ -292,6 +359,17 @@ class PlannerAgent(BaseAgent):
     def _create_router(self) -> APIRouter:
         from .router import create_planner_router
         return create_planner_router(self)
+
+    def get_last_plan_review_summary(self) -> Optional[PlanReviewSummary]:
+        """
+        Return the latest plan-review summary.
+        - **Description**:
+            - Exposes the reviewer trace for outer orchestration layers.
+
+        - **Returns**:
+            - `PlanReviewSummary` or None: Most recent review summary.
+        """
+        return self._last_plan_review_summary
 
     @staticmethod
     def _normalize_section_type_name(section_type: str) -> str:
@@ -673,11 +751,246 @@ class PlannerAgent(BaseAgent):
         logger.error("planner.%s all_attempts_failed", label)
         return {}
 
+    @staticmethod
+    def _paper_plan_to_json(plan: PaperPlan) -> str:
+        """
+        Serialize a PaperPlan into readable JSON string.
+        - **Args**:
+            - `plan` (PaperPlan): Plan to serialize.
+
+        - **Returns**:
+            - `str`: JSON string.
+        """
+        return json.dumps(plan.model_dump(), ensure_ascii=False, indent=2)
+
+    @staticmethod
+    def _has_intro_contribution_summary_signal(plan: PaperPlan) -> bool:
+        """
+        Check whether introduction includes a contribution-summary intent.
+        - **Description**:
+            - Uses a soft keyword heuristic over mission/key_content/key_point.
+            - This is advisory only; absence maps to a soft signal.
+
+        - **Args**:
+            - `plan` (PaperPlan): Plan to inspect.
+
+        - **Returns**:
+            - `bool`: True when contribution-summary intent is detectable.
+        """
+        intro = plan.get_section("introduction")
+        if not intro:
+            return False
+        parts: List[str] = []
+        parts.append(intro.mission or "")
+        parts.extend([str(x) for x in (intro.key_content or [])])
+        for para in intro._all_paragraphs():
+            parts.append(para.key_point or "")
+            parts.extend([str(x) for x in (para.supporting_points or [])])
+        text = " ".join(parts).lower()
+        return ("contribut" in text) and (
+            ("summary" in text) or ("list" in text) or ("core" in text) or ("key" in text)
+        )
+
+    async def _criticize_plan(self, plan: PaperPlan, iteration: int) -> PlanReviewIteration:
+        """
+        Run one critic pass and normalize issues.
+        - **Args**:
+            - `plan` (PaperPlan): Current plan.
+            - `iteration` (int): Iteration index starting from 1.
+
+        - **Returns**:
+            - `PlanReviewIteration`: Normalized review result.
+        """
+        critique = ""
+        issues: List[PlanReviewIssue] = []
+        try:
+            prompt = STEP6_PLAN_CRITIC_USER.format(
+                paper_plan_json=self._paper_plan_to_json(plan),
+            )
+            payload = await self._llm_json_call(
+                STEP6_PLAN_CRITIC_SYSTEM,
+                prompt,
+                "step6_plan_critic",
+                max_retries=1,
+                temperature=0.2,
+            )
+            critique = str(payload.get("critique", "")).strip()
+            raw_issues = payload.get("issues", [])
+            if isinstance(raw_issues, list):
+                for idx, item in enumerate(raw_issues):
+                    if not isinstance(item, dict):
+                        continue
+                    issue_data = dict(item)
+                    if not issue_data.get("issue_id"):
+                        issue_data["issue_id"] = f"iter-{iteration}-issue-{idx + 1}"
+                    issue_data.setdefault("severity", "minor")
+                    try:
+                        issues.append(PlanReviewIssue.model_validate(issue_data))
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.warning("planner.step6_plan_critic error: %s", e)
+            issues.append(
+                PlanReviewIssue(
+                    issue_id=f"iter-{iteration}-critic-failure",
+                    category="review_runtime",
+                    severity=PlanReviewSeverity.MAJOR,
+                    title="Plan critic runtime failure",
+                    description=f"Critic invocation failed: {e}",
+                    recommendation=(
+                        "Retry plan review and validate critic response before accepting plan."
+                    ),
+                    expected_plan_change=(
+                        "No direct plan patch required; review pass must succeed first."
+                    ),
+                ),
+            )
+
+        # Soft venue-style signal: advisory only, not a blocker.
+        if not self._has_intro_contribution_summary_signal(plan):
+            issues.append(
+                PlanReviewIssue(
+                    issue_id=f"iter-{iteration}-intro-soft-signal",
+                    section_type="introduction",
+                    category="venue_norm",
+                    severity=PlanReviewSeverity.SOFT,
+                    title="Introduction contribution-summary signal",
+                    description=(
+                        "Introduction does not clearly expose a contribution-summary "
+                        "intent near its closing flow."
+                    ),
+                    recommendation=(
+                        "Refine mission/key_point in the closing introduction paragraph "
+                        "to summarize core contributions."
+                    ),
+                    expected_plan_change=(
+                        "Update introduction final paragraph key_point or supporting_points "
+                        "with concise contribution-summary intent."
+                    ),
+                ),
+            )
+
+        return PlanReviewIteration(
+            iteration=iteration,
+            critique=critique,
+            issues=issues,
+            changed=False,
+        )
+
+    async def _optimize_plan(
+        self,
+        plan: PaperPlan,
+        issues: List[PlanReviewIssue],
+        iteration: int,
+    ) -> PaperPlan:
+        """
+        Run one optimizer pass and return revised plan.
+        - **Args**:
+            - `plan` (PaperPlan): Current plan.
+            - `issues` (List[PlanReviewIssue]): Issues to resolve.
+            - `iteration` (int): Iteration index.
+
+        - **Returns**:
+            - `PaperPlan`: Revised plan; falls back to input on failure.
+        """
+        try:
+            prompt = STEP7_PLAN_OPTIMIZER_USER.format(
+                paper_plan_json=self._paper_plan_to_json(plan),
+                issues_json=json.dumps(
+                    [issue.model_dump() for issue in issues],
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+            response = await self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": STEP7_PLAN_OPTIMIZER_SYSTEM},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=5000,
+            )
+            raw = response.choices[0].message.content or ""
+            parsed = self._safe_load_json(raw, expected=dict)
+            if not parsed:
+                logger.warning("planner.step7_plan_optimizer invalid_json iteration=%d", iteration)
+                return plan
+            if "plan" in parsed and isinstance(parsed["plan"], dict):
+                parsed = parsed["plan"]
+            return PaperPlan.model_validate(parsed)
+        except Exception as e:
+            logger.warning("planner.step7_plan_optimizer error iteration=%d: %s", iteration, e)
+            return plan
+
+    async def _review_and_refine_plan(
+        self,
+        plan: PaperPlan,
+        max_iterations: int = 2,
+        enabled: bool = True,
+    ) -> tuple[PaperPlan, PlanReviewSummary]:
+        """
+        Run iterative critic-optimizer refinement over a plan.
+        - **Args**:
+            - `plan` (PaperPlan): Initial plan from planning steps.
+            - `max_iterations` (int): Max critic rounds.
+            - `enabled` (bool): Whether to run review loop.
+
+        - **Returns**:
+            - `tuple[PaperPlan, PlanReviewSummary]`: Final plan and review summary.
+        """
+        summary = PlanReviewSummary(
+            enabled=enabled,
+            max_iterations=max(0, int(max_iterations)),
+            iterations=[],
+            final_status="not_run",
+        )
+        if not enabled or max_iterations <= 0:
+            summary.final_status = "skipped"
+            return plan, summary
+
+        current_plan = plan
+        for iteration in range(1, max_iterations + 1):
+            review_iter = await self._criticize_plan(current_plan, iteration)
+            summary.iterations.append(review_iter)
+
+            if not review_iter.issues:
+                summary.final_status = "passed"
+                break
+
+            blocking_issues = [issue for issue in review_iter.issues if issue.is_blocking]
+            if not blocking_issues:
+                summary.final_status = "pass_with_suggestions"
+                break
+
+            revised_plan = await self._optimize_plan(
+                current_plan,
+                blocking_issues,
+                iteration,
+            )
+            changed = revised_plan.model_dump() != current_plan.model_dump()
+            summary.iterations[-1].changed = changed
+            if not changed:
+                summary.final_status = "needs_revision"
+                break
+            current_plan = revised_plan
+        else:
+            summary.final_status = "needs_revision" if summary.has_blocking_issues else "passed"
+
+        if summary.final_status == "not_run":
+            summary.final_status = "needs_revision" if summary.has_blocking_issues else "passed"
+        return current_plan, summary
+
     # -----------------------------------------------------------------
     # Main entry point — multi-step planning
     # -----------------------------------------------------------------
 
-    async def create_plan(self, request: PlanRequest) -> PaperPlan:
+    async def create_plan(
+        self,
+        request: PlanRequest,
+        review_enabled: Optional[bool] = None,
+        review_max_iterations: Optional[int] = None,
+    ) -> PaperPlan:
         """
         Create a paper plan from metadata using a multi-step approach.
 
@@ -690,6 +1003,8 @@ class PlannerAgent(BaseAgent):
 
         - **Args**:
           - `request` (PlanRequest): Planning request with metadata.
+          - `review_enabled` (bool, optional): Per-request plan-review switch.
+          - `review_max_iterations` (int, optional): Per-request review max rounds.
 
         - **Returns**:
           - `PaperPlan`: Complete paragraph-level paper plan.
@@ -1047,6 +1362,20 @@ class PlannerAgent(BaseAgent):
             "planner.plan_created sections=%d sentences=%d",
             len(paper_plan.sections), paper_plan.get_total_sentences(),
         )
+        effective_review_enabled = (
+            self.enable_plan_review if review_enabled is None else bool(review_enabled)
+        )
+        effective_review_max_iterations = (
+            self.plan_review_max_iterations
+            if review_max_iterations is None
+            else max(0, int(review_max_iterations))
+        )
+        paper_plan, review_summary = await self._review_and_refine_plan(
+            paper_plan,
+            max_iterations=effective_review_max_iterations,
+            enabled=effective_review_enabled,
+        )
+        self._last_plan_review_summary = review_summary
         self._last_plan = paper_plan
         return paper_plan
 
