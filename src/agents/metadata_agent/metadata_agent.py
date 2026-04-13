@@ -1231,6 +1231,8 @@ class MetaDataAgent(ReActAgent):
         research_context: Optional[Dict[str, Any]] = None
         code_context: Optional[Dict[str, Any]] = None
         code_summary_markdown: Optional[str] = None
+        plan_review_summary: Optional[Dict[str, Any]] = None
+        plan_review_iterations: List[Dict[str, Any]] = []
         evidence_dag: Optional[EvidenceDAG] = None
         docling_temp_dir: Optional[Path] = None
         docling_cfg = (
@@ -1265,6 +1267,8 @@ class MetaDataAgent(ReActAgent):
                 target_pages=target_pages,
                 artifacts_prefix=artifacts_prefix,
                 ref_pool_snapshot=ref_pool.to_dict(),
+                plan_review=plan_review_summary,
+                plan_review_iterations=plan_review_iterations,
             )
 
         if metadata.figures:
@@ -1307,6 +1311,8 @@ class MetaDataAgent(ReActAgent):
                             errors=[msg], ref_pool_snapshot=ref_pool.to_dict(),
                             template_path=template_path, target_pages=target_pages,
                             artifacts_prefix=artifacts_prefix, paper_dir=paper_dir_str,
+                            plan_review=plan_review_summary,
+                            plan_review_iterations=plan_review_iterations,
                         )
                     if on_error == CodeRepoOnError.STRICT:
                         return PlanResult(
@@ -1314,6 +1320,8 @@ class MetaDataAgent(ReActAgent):
                             errors=[msg], ref_pool_snapshot=ref_pool.to_dict(),
                             template_path=template_path, target_pages=target_pages,
                             artifacts_prefix=artifacts_prefix, paper_dir=paper_dir_str,
+                            plan_review=plan_review_summary,
+                            plan_review_iterations=plan_review_iterations,
                         )
                     errors.append(msg)
                     code_context = None
@@ -1453,6 +1461,17 @@ class MetaDataAgent(ReActAgent):
                     else None
                 )
                 rc_enabled = rc_cfg.enabled if rc_cfg else False
+                planner_review_enabled = (
+                    bool(getattr(self.tools_config, "planner_plan_review_enabled", True))
+                    if self.tools_config else True
+                )
+                planner_review_max_iterations = max(
+                    0,
+                    int(
+                        getattr(self.tools_config, "planner_plan_review_max_iterations", 2)
+                        if self.tools_config else 2
+                    ),
+                )
 
                 # Phase 0-core + 0-ctx: core ref analysis, landscape search, unified research context (pre-plan)
                 if rc_enabled:
@@ -1511,6 +1530,8 @@ class MetaDataAgent(ReActAgent):
                     metadata=metadata, target_pages=target_pages,
                     style_guide=metadata.style_guide, research_context=research_context,
                     code_context=code_context,
+                    planner_review_enabled=planner_review_enabled,
+                    planner_review_max_iterations=planner_review_max_iterations,
                 )
                 if paper_plan:
                     if self.tools_config and not getattr(
@@ -1535,6 +1556,24 @@ class MetaDataAgent(ReActAgent):
                         planning_dir.mkdir(parents=True, exist_ok=True)
                         plan_path = planning_dir / "paper_plan.json"
                         plan_path.write_text(paper_plan.model_dump_json(indent=2), encoding="utf-8")
+
+                    plan_review_obj = None
+                    if self._planner and hasattr(self._planner, "get_last_plan_review_summary"):
+                        try:
+                            plan_review_obj = self._planner.get_last_plan_review_summary()
+                        except Exception as e:
+                            print(f"[MetaDataAgent] Warning: failed to collect plan review summary: {e}")
+                    if plan_review_obj is not None:
+                        plan_review_summary = plan_review_obj.model_dump(mode="json")
+                        plan_review_iterations = list(plan_review_summary.get("iterations", []) or [])
+                        if save_output and paper_dir:
+                            planning_dir = paper_dir / "analysis" / "planning"
+                            planning_dir.mkdir(parents=True, exist_ok=True)
+                            plan_review_path = planning_dir / "plan_review.json"
+                            plan_review_path.write_text(
+                                json.dumps(plan_review_summary, indent=2, ensure_ascii=False),
+                                encoding="utf-8",
+                            )
 
                     # Phase 0b: Reference discovery
                     print("[MetaDataAgent] Phase 0b: Discovering references...")
@@ -1665,6 +1704,8 @@ class MetaDataAgent(ReActAgent):
                             ref_pool_snapshot=ref_pool.to_dict(),
                             template_path=template_path, target_pages=target_pages,
                             artifacts_prefix=artifacts_prefix, paper_dir=paper_dir_str,
+                            plan_review=plan_review_summary,
+                            plan_review_iterations=plan_review_iterations,
                         )
                     if on_error == CodeRepoOnError.STRICT:
                         return PlanResult(
@@ -1673,6 +1714,8 @@ class MetaDataAgent(ReActAgent):
                             ref_pool_snapshot=ref_pool.to_dict(),
                             template_path=template_path, target_pages=target_pages,
                             artifacts_prefix=artifacts_prefix, paper_dir=paper_dir_str,
+                            plan_review=plan_review_summary,
+                            plan_review_iterations=plan_review_iterations,
                         )
                     errors.append(msg)
                     code_context = None
@@ -1704,6 +1747,8 @@ class MetaDataAgent(ReActAgent):
                 exemplar_analysis=exemplar_analysis_dict,
                 artifacts_prefix=artifacts_prefix,
                 paper_dir=paper_dir_str,
+                plan_review=plan_review_summary,
+                plan_review_iterations=plan_review_iterations,
             )
 
         except Exception as e:
@@ -1714,6 +1759,8 @@ class MetaDataAgent(ReActAgent):
                 errors=[str(e)], ref_pool_snapshot=ref_pool.to_dict(),
                 template_path=template_path, target_pages=target_pages,
                 artifacts_prefix=artifacts_prefix, paper_dir=paper_dir_str,
+                plan_review=plan_review_summary,
+                plan_review_iterations=plan_review_iterations,
             )
         finally:
             # Docling temp file cleanup
@@ -4313,6 +4360,8 @@ class MetaDataAgent(ReActAgent):
         style_guide: Optional[str],
         research_context: Optional[Dict[str, Any]] = None,
         code_context: Optional[Dict[str, Any]] = None,
+        planner_review_enabled: Optional[bool] = None,
+        planner_review_max_iterations: Optional[int] = None,
     ) -> Optional[PaperPlan]:
         """Delegation stub — see orchestrator.py."""
         return await self._orchestrator._create_paper_plan(
@@ -4321,6 +4370,8 @@ class MetaDataAgent(ReActAgent):
             style_guide=style_guide,
             research_context=research_context,
             code_context=code_context,
+            planner_review_enabled=planner_review_enabled,
+            planner_review_max_iterations=planner_review_max_iterations,
         )
     
     # =========================================================================

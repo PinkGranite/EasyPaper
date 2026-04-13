@@ -113,6 +113,8 @@ class ToolsConfig(BaseModel):
     )
     max_react_iterations: int = 3
     planner_structure_signals_enabled: bool = True
+    planner_plan_review_enabled: bool = True
+    planner_plan_review_max_iterations: int = 2
     writer_structure_contract_enabled: bool = True
     review_structure_gate_enabled: bool = True
     structure_gate_min_paragraph_threshold: int = 5

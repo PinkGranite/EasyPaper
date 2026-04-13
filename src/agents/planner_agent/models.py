@@ -30,6 +30,128 @@ class NarrativeStyle(str, Enum):
     COMPREHENSIVE = "comprehensive"
 
 
+class PlanReviewSeverity(str, Enum):
+    """
+    Severity levels for plan-review findings.
+    - **Description**:
+        - `blocker`: Must be fixed before moving to generation.
+        - `major`: Important issue that likely requires revision.
+        - `minor`: Nice-to-fix quality issue.
+        - `soft`: Soft signal only, should not hard-fail planning.
+    """
+    BLOCKER = "blocker"
+    MAJOR = "major"
+    MINOR = "minor"
+    SOFT = "soft"
+
+
+class PlanReviewIssue(BaseModel):
+    """
+    A single issue identified during plan review.
+    - **Description**:
+        - Captures what is wrong, where it is, and what to change.
+        - Supports both hard issues and soft structural signals.
+    """
+    issue_id: str
+    section_type: str = ""
+    paragraph_locator: str = ""
+    category: str = "structure"
+    severity: PlanReviewSeverity = PlanReviewSeverity.MINOR
+    title: str = ""
+    description: str = ""
+    recommendation: str = ""
+    expected_plan_change: str = ""
+
+    @property
+    def is_blocking(self) -> bool:
+        """
+        Whether this issue should block generation.
+        - **Description**:
+            - Only `blocker` and `major` are treated as blocking.
+            - `soft` stays advisory by design.
+
+        - **Returns**:
+            - `bool`: True when this issue blocks progress.
+        """
+        return self.severity in {PlanReviewSeverity.BLOCKER, PlanReviewSeverity.MAJOR}
+
+
+class PlanReviewIteration(BaseModel):
+    """
+    One review-optimization iteration record.
+    - **Description**:
+        - Stores the critic feedback, extracted issues, and applied actions
+          for a single iteration.
+    """
+    iteration: int
+    critique: str = ""
+    issues: List[PlanReviewIssue] = Field(default_factory=list)
+    actions_applied: List[str] = Field(default_factory=list)
+    changed: bool = False
+
+
+class PlanReviewSummary(BaseModel):
+    """
+    Aggregate plan-review trace across iterations.
+    - **Description**:
+        - Summarizes whether review was enabled, how many rounds were used,
+          and what issues remain.
+    """
+    enabled: bool = False
+    max_iterations: int = 0
+    iterations: List[PlanReviewIteration] = Field(default_factory=list)
+    final_status: str = "not_run"
+    notes: str = ""
+
+    def _latest_issues(self) -> List[PlanReviewIssue]:
+        """
+        Return issues from the latest review snapshot.
+        - **Returns**:
+            - `List[PlanReviewIssue]`: Issues in the latest iteration.
+        """
+        if not self.iterations:
+            return []
+        return self.iterations[-1].issues
+
+    @property
+    def blocking_issue_count(self) -> int:
+        """
+        Count blocking issues in the latest review snapshot.
+        - **Returns**:
+            - `int`: Number of blocking issues.
+        """
+        return sum(1 for issue in self._latest_issues() if issue.is_blocking)
+
+    @property
+    def soft_signal_count(self) -> int:
+        """
+        Count soft-signal issues in the latest review snapshot.
+        - **Returns**:
+            - `int`: Number of soft-only signals.
+        """
+        return sum(
+            1 for issue in self._latest_issues() if issue.severity == PlanReviewSeverity.SOFT
+        )
+
+    @property
+    def has_blocking_issues(self) -> bool:
+        """
+        Whether any blocking issues remain.
+        - **Returns**:
+            - `bool`: True when blocking issues exist.
+        """
+        return self.blocking_issue_count > 0
+
+    @property
+    def requires_revision(self) -> bool:
+        """
+        Whether plan should continue iterating before generation.
+        - **Returns**:
+            - `bool`: True when blocking issues still exist.
+        """
+        return self.has_blocking_issues
+
+
 # =========================================================================
 # Sentence-level models
 # =========================================================================

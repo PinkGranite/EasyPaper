@@ -474,6 +474,8 @@ class PlanResult(BaseModel):
         - `target_pages` (int, optional): Target page count.
         - `artifacts_prefix` (str): Storage prefix for artifacts.
         - `paper_dir` (str, optional): Output directory path.
+        - `plan_review` (Dict[str, Any], optional): Planner review summary.
+        - `plan_review_iterations` (List[Dict[str, Any]]): Per-iteration review traces.
     """
     paper_plan: Dict[str, Any]
     evidence_dag: Optional[Dict[str, Any]] = None
@@ -489,6 +491,8 @@ class PlanResult(BaseModel):
     exemplar_analysis: Optional[Dict[str, Any]] = None
     artifacts_prefix: str = ""
     paper_dir: Optional[str] = None
+    plan_review: Optional[Dict[str, Any]] = None
+    plan_review_iterations: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class SectionBlueprint(BaseModel):

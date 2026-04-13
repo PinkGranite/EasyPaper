@@ -1184,6 +1184,8 @@ class ReviewOrchestrator:
         style_guide: Optional[str],
         research_context: Optional[Dict[str, Any]] = None,
         code_context: Optional[Dict[str, Any]] = None,
+        planner_review_enabled: Optional[bool] = None,
+        planner_review_max_iterations: Optional[int] = None,
     ) -> Optional[PaperPlan]:
         """
         Create a paper plan by calling the Planner Agent.
@@ -1246,7 +1248,11 @@ class ReviewOrchestrator:
                 style_guide=style_guide,
             )
 
-            paper_plan = await self.host._planner.create_plan(plan_request)
+            paper_plan = await self.host._planner.create_plan(
+                plan_request,
+                review_enabled=planner_review_enabled,
+                review_max_iterations=planner_review_max_iterations,
+            )
             return paper_plan
 
         except Exception as e:
