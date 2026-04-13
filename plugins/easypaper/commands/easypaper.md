@@ -18,7 +18,23 @@ Run the EasyPaper end-to-end paper generation workflow with guided setup and met
 
 ### Phase 2: Paper Generation
 
-3. **Use the `paper-from-metadata` skill** which handles:
+3. **Determine metadata source** — ask user which applies:
+   - **(A) Complete metadata file / JSON** → proceed to step 4.
+   - **(B) Research materials folder** (code, data, images, notes, PDFs) → use `generate_metadata_from_folder` first:
+     ```python
+     metadata = await ep.generate_metadata_from_folder(
+         str(Path("path/to/materials").resolve()),
+         max_figures=12, max_tables=12,
+         vision_enrich_figures=True,
+     )
+     result = await ep.generate(metadata, compile_pdf=True)
+     ```
+     Key options: `max_figures`, `max_tables`, `vision_enrich_figures` (default True),
+     `vision_model`, `max_vision_figures`.
+     See `skills/paper-from-metadata/SKILL.md` § "Alternative: Generate Metadata from a Materials Folder" for full parameter table and cost-control guidance.
+   - **(C) No metadata yet** → collect interactively (step 4).
+
+4. **Use the `paper-from-metadata` skill** which handles:
    - **Check for existing metadata**: Ask user if they have complete metadata file/JSON
    - **Collect metadata if needed**: If missing or incomplete, interactively collect all required fields:
      - Required: `title`, `idea_hypothesis`, `method`, `data`, `experiments`, `references`

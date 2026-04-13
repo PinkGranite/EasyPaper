@@ -72,28 +72,48 @@ class PDFExtractor(BaseExtractor):
         self._client = llm_client
         self._model = model_name
 
-    def extract(self, file_path: str) -> List[ExtractedFragment]:
+    def extract(self, file_path: str, *, materials_root: str | None = None) -> List[ExtractedFragment]:
         """Sync fallback — returns empty when no LLM client is available."""
         if self._client is None:
             return []
         import asyncio
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.extract_async(file_path))
+            return asyncio.run(
+                self.extract_async(file_path, materials_root=materials_root)
+            )
         return []
 
-    async def extract_async(self, file_path: str) -> List[ExtractedFragment]:
+    @staticmethod
+    def _relative_source_path(file_path: str, materials_root: Optional[str]) -> str:
+        """POSIX path relative to *materials_root*, or basename if outside root."""
+        p = Path(file_path).resolve()
+        if materials_root:
+            root = Path(materials_root).resolve()
+            try:
+                return p.relative_to(root).as_posix()
+            except ValueError:
+                pass
+        return p.name
+
+    async def extract_async(
+        self,
+        file_path: str,
+        *,
+        materials_root: Optional[str] = None,
+    ) -> List[ExtractedFragment]:
         """
         Extract fragments from a PDF using LLM understanding.
 
         - **Args**:
             - `file_path` (str): Path to the PDF file.
+            - `materials_root` (str, optional): Scan root for relative ``source_file``.
 
         - **Returns**:
             - `List[ExtractedFragment]`: Extracted fragments.
         """
-        rel = Path(file_path).name
+        rel = self._relative_source_path(file_path, materials_root)
         text = _extract_pdf_text(file_path)
         if not text.strip():
             return []

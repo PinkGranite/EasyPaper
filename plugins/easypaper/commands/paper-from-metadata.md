@@ -2,6 +2,17 @@ Generate a paper directly from metadata using EasyPaper Python SDK.
 
 ## Execution contract
 
+0. **Optional pre-step — generate metadata from a materials folder**:
+   If the user has a folder of research materials instead of a `metadata.json`, run:
+   ```python
+   metadata = await ep.generate_metadata_from_folder(
+       folder_path, max_figures=12, max_tables=12,
+       vision_enrich_figures=True,
+   )
+   ```
+   Then skip step 1 and go directly to step 2 with the returned `PaperMetaData`.
+   See `skills/paper-from-metadata/SKILL.md` § "Alternative: Generate Metadata from a Materials Folder" for the full parameter table, cost-control, and path-handling notes.
+
 1. **Recommended**: Have the user prepare a `metadata.json` (see `examples/meta.json` for schema), then load and run:
    - Parse request: `request = PaperGenerationRequest.model_validate_json_file("metadata.json")`
    - Build SDK inputs: `metadata = request.to_metadata()` and `options = request.to_generate_options()`

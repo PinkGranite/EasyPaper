@@ -157,3 +157,42 @@ class TestMetadataSynthesizer:
         assert isinstance(result, PaperMetaData)
         # Fallback should concatenate fragments by field
         assert result.idea_hypothesis != "" or result.method != ""
+
+    @pytest.mark.asyncio
+    async def test_figures_tables_get_section_and_target_pages(self, sample_fragments):
+        """Heuristic enrichment fills section and page budget when the LLM JSON is minimal."""
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_llm_response(LLM_SYNTH_RESPONSE)
+        )
+        synth = MetadataSynthesizer(llm_client=mock_client, model_name="test")
+
+        result = await synth.synthesize(sample_fragments)
+
+        assert result.target_pages is not None and result.target_pages > 0
+        for fig in result.figures:
+            assert fig.section
+        for tab in result.tables:
+            assert tab.section
+
+    @pytest.mark.asyncio
+    async def test_style_guide_heuristic_from_path(self, sample_fragments):
+        """Venue token in any fragment path is mapped to a canonical style_guide."""
+        frags = list(sample_fragments) + [
+            ExtractedFragment(
+                source_file="templates/neurips_2024.tex",
+                file_category=FileCategory.TEXT,
+                content="% style",
+                metadata_field=None,
+                confidence=0.5,
+            ),
+        ]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
+            return_value=_mock_llm_response(LLM_SYNTH_RESPONSE)
+        )
+        synth = MetadataSynthesizer(llm_client=mock_client, model_name="test")
+
+        result = await synth.synthesize(frags)
+
+        assert result.style_guide == "NeurIPS"

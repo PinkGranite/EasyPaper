@@ -7,6 +7,8 @@ import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
+from PIL import Image
+
 from src.agents.metadata_agent.models import PaperMetaData
 from src.agents.metadata_agent.metadata_generator import generate_metadata_from_folder
 
@@ -71,9 +73,26 @@ class TestGenerateMetadataFromFolder:
             folder_path=str(research_folder),
             llm_client=mock_client,
             model_name="test-model",
+            vision_enrich_figures=False,
         )
 
         assert isinstance(result, PaperMetaData)
+        assert result.materials_root == str(research_folder.resolve())
+
+    @pytest.mark.asyncio
+    async def test_max_figures_rule_fallback_when_trim_and_no_llm(self, tmp_path: Path):
+        """With caps exceeded and no LLM client, heuristic rule_fallback selects up to cap."""
+        (tmp_path / "notes.md").write_text("# Hypothesis\nWe study X.\n", encoding="utf-8")
+        for name in ("zzz.png", "summary_chart.png", "main_overview.png"):
+            (tmp_path / name).write_bytes(b"\x89PNG" + b"\x00" * 50)
+        result = await generate_metadata_from_folder(
+            str(tmp_path),
+            llm_client=None,
+            model_name="",
+            max_figures=1,
+        )
+        assert len(result.figures) == 1
+        assert result.materials_root == str(tmp_path.resolve())
 
     @pytest.mark.asyncio
     async def test_five_fields_populated(self, research_folder: Path):
@@ -86,6 +105,7 @@ class TestGenerateMetadataFromFolder:
             folder_path=str(research_folder),
             llm_client=mock_client,
             model_name="test-model",
+            vision_enrich_figures=False,
         )
 
         assert result.idea_hypothesis != ""
@@ -104,6 +124,7 @@ class TestGenerateMetadataFromFolder:
             folder_path=str(research_folder),
             llm_client=mock_client,
             model_name="test-model",
+            vision_enrich_figures=False,
         )
 
         assert len(result.references) >= 1
@@ -120,10 +141,11 @@ class TestGenerateMetadataFromFolder:
             folder_path=str(research_folder),
             llm_client=mock_client,
             model_name="test-model",
+            vision_enrich_figures=False,
         )
 
         assert len(result.figures) >= 1
-        assert any("architecture" in fig.id for fig in result.figures)
+        assert any("architecture" in (fig.file_path or "").lower() for fig in result.figures)
 
     @pytest.mark.asyncio
     async def test_tables_from_csv(self, research_folder: Path):
@@ -136,6 +158,7 @@ class TestGenerateMetadataFromFolder:
             folder_path=str(research_folder),
             llm_client=mock_client,
             model_name="test-model",
+            vision_enrich_figures=False,
         )
 
         assert len(result.tables) >= 1
@@ -153,6 +176,7 @@ class TestGenerateMetadataFromFolder:
             model_name="test-model",
             title="My Custom Title",
             style_guide="NeurIPS",
+            vision_enrich_figures=False,
         )
 
         assert result.title == "My Custom Title"
@@ -166,4 +190,42 @@ class TestGenerateMetadataFromFolder:
                 folder_path="/nonexistent/path",
                 llm_client=mock_client,
                 model_name="test",
+                vision_enrich_figures=False,
             )
+
+    @pytest.mark.asyncio
+    async def test_vision_enrichment_runs_after_synthesis(self, tmp_path: Path):
+        """Second LLM call uses multimodal path to replace figure description."""
+        (tmp_path / "notes.md").write_text("# Hypothesis\nWe study agents.\n", encoding="utf-8")
+        Image.new("RGB", (24, 16), color=(30, 60, 90)).save(tmp_path / "viz.png")
+
+        vision_text = (
+            "The figure is a synthetic flat color field used as a pipeline test image."
+        )
+
+        synth_resp = _mock_llm_response(LLM_SYNTH_RESPONSE)
+        vis_choice = MagicMock()
+        vis_choice.message.content = vision_text
+        vis_resp = MagicMock()
+        vis_resp.choices = [vis_choice]
+        vis_resp.usage = MagicMock(
+            prompt_tokens=100, completion_tokens=40, total_tokens=140
+        )
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create = AsyncMock(
+            side_effect=[synth_resp, vis_resp],
+        )
+
+        result = await generate_metadata_from_folder(
+            folder_path=str(tmp_path),
+            llm_client=mock_client,
+            model_name="test-model",
+            vision_enrich_figures=True,
+            max_vision_figures=1,
+            vision_cache_dir=str(tmp_path / "vision_cache"),
+        )
+
+        assert len(result.figures) >= 1
+        assert vision_text in (result.figures[0].description or "")
+        assert mock_client.chat.completions.create.await_count >= 2

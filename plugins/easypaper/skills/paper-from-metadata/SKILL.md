@@ -268,6 +268,68 @@ The metadata should match the structure in `examples/meta.json`, but with **abso
 }
 ```
 
+## Alternative: Generate Metadata from a Materials Folder
+
+When the user has a **folder of research materials** (code, data, PDFs, images, notes, BibTeX) instead of a ready-made `metadata.json`, EasyPaper can scan the folder and synthesize `PaperMetaData` automatically.
+
+### When to use
+
+- User says "I have a project folder / experiment directory" instead of providing structured metadata.
+- Folder typically contains a mix of `.py`, `.csv`, `.json`, `.md`, `.tex`, `.bib`, `.png`, `.pdf`, etc.
+
+### Quick path
+
+```python
+from easypaper import EasyPaper
+from pathlib import Path
+
+ep = EasyPaper(config_path=str(Path("configs/openrouter.yaml").resolve()))
+
+# Step 1: Scan folder → PaperMetaData (with prose, figures, tables, venue inference)
+metadata = await ep.generate_metadata_from_folder(
+    str(Path("path/to/materials").resolve()),
+    max_figures=12,           # hard cap; LLM picks best subset if exceeded
+    max_tables=12,
+    vision_enrich_figures=True,  # default True; uses vision model per figure
+    # vision_model="gpt-4o",   # defaults to the config model
+    # max_vision_figures=8,     # optional: cap vision API calls
+)
+
+# Step 2: Generate paper from the synthesized metadata
+result = await ep.generate(metadata, compile_pdf=True)
+```
+
+### What the pipeline does
+
+1. **Scan & classify** — `FolderScanner` walks the directory, classifies files by extension (IMAGE, PDF, BIB, TEXT, CODE, DATA, CONFIG).
+2. **Extract fragments** — Each file type has a dedicated extractor (`ImageExtractor`, `DataExtractor`, `PDFExtractor` with LLM, etc.) producing `ExtractedFragment` objects. All paths stored as **POSIX relative to `materials_root`**.
+3. **Synthesize prose** — `MetadataSynthesizer` (one LLM call) merges fragments into the five prose fields (`idea_hypothesis`, `method`, `data`, `experiments`) plus `title`, and infers `style_guide`, `target_pages`, and per-asset `section` placement.
+4. **Deduplicate & curate** — Figures and tables are deduped by path; if count exceeds `max_figures` / `max_tables`, an LLM curator selects the minimal supporting subset (rule-based fallback if no LLM).
+5. **Vision enrichment** — For each retained figure (after curation), a vision model receives a downscaled JPEG and writes 2–4 sentence `description` prose, replacing the raw `"Image file: …"` placeholder. Results are **cached by content hash** on disk (`~/.cache/easypaper/figure_vision/` or `EASYPAPER_CACHE_DIR`).
+
+### Key parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_figures` | `None` (no cap) | Hard upper bound on figure count |
+| `max_tables` | `None` (no cap) | Hard upper bound on table count |
+| `vision_enrich_figures` | `True` | Run vision model on each retained figure |
+| `vision_model` | same as `model_name` | Multimodal model id (e.g. `gpt-4o`) |
+| `max_vision_figures` | `None` (all) | Max vision API calls |
+| `max_vision_long_edge` | `896` | Downscale longest image edge before JPEG encode |
+| `vision_cache_dir` | auto | Disk cache for vision descriptions |
+
+### Path handling difference
+
+Unlike hand-written metadata (where all paths must be **absolute**), the folder pipeline sets `metadata.materials_root` to the folder's absolute path and stores `figures[].file_path` / `tables[].file_path` as **relative POSIX paths**. Downstream generation resolves them via `materials_root`. **Do not manually convert these to absolute paths.**
+
+### Cost control
+
+- Vision runs **only on figures that survived curation** — not on every image in the folder.
+- Use `max_vision_figures` to hard-cap the number of vision API calls.
+- Cached descriptions (keyed by file content SHA-256) prevent repeated billing across runs.
+- `vision_enrich_figures=False` disables vision entirely (useful for tests or non-multimodal models).
+
 ## Best Practices
 
 - **Progressive disclosure**: Start with required fields, then optional, then advanced

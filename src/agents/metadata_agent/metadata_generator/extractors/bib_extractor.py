@@ -19,7 +19,7 @@ class BibExtractor(BaseExtractor):
     Pure rule-based -- no LLM calls.
     """
 
-    def extract(self, file_path: str) -> List[ExtractedFragment]:
+    def extract(self, file_path: str, *, materials_root: str | None = None) -> List[ExtractedFragment]:
         text = Path(file_path).read_text(encoding="utf-8", errors="ignore").strip()
         if not text:
             return []
