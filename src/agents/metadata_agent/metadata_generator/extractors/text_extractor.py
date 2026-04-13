@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from ..models import ExtractedFragment, FileCategory
 from .base import BaseExtractor
@@ -21,7 +21,7 @@ class TextExtractor(BaseExtractor):
     Splits by headings/sections where possible.
     """
 
-    def extract(self, file_path: str) -> List[ExtractedFragment]:
+    def extract(self, file_path: str, *, materials_root: Optional[str] = None) -> List[ExtractedFragment]:
         p = Path(file_path)
         text = p.read_text(encoding="utf-8", errors="ignore").strip()
         if not text:

@@ -2980,7 +2980,7 @@ class MetaDataAgent(ReActAgent):
             List of error messages (empty if all valid)
         """
         errors = []
-        base_path = os.getcwd()
+        base_path = getattr(metadata, "materials_root", None) or os.getcwd()
         
         # Validate figure file paths
         for fig in metadata.figures:
@@ -3030,7 +3030,7 @@ class MetaDataAgent(ReActAgent):
 
         LATEX_OK = {".pdf", ".png", ".jpg", ".jpeg", ".eps"}
         converted = 0
-        base_path = os.getcwd()
+        base_path = getattr(metadata, "materials_root", None) or os.getcwd()
 
         for fig in metadata.figures:
             if fig.auto_generate or not fig.file_path:

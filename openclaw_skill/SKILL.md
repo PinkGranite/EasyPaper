@@ -146,6 +146,35 @@ async def main():
 asyncio.run(main())
 ```
 
+### Generate metadata from a materials folder
+
+When the user has a folder of research materials (code, data, images, PDFs, notes, BibTeX) instead of a pre-written `metadata.json`, EasyPaper can scan the folder and synthesize `PaperMetaData` automatically:
+
+```python
+import asyncio
+from pathlib import Path
+from easypaper import EasyPaper
+
+async def main():
+    ep = EasyPaper(config_path=str(Path("configs/openrouter.yaml").resolve()))
+
+    metadata = await ep.generate_metadata_from_folder(
+        str(Path("path/to/materials").resolve()),
+        max_figures=12,
+        max_tables=12,
+        vision_enrich_figures=True,  # use vision model to describe each figure
+    )
+
+    result = await ep.generate(metadata, compile_pdf=True)
+    print(f"Status: {result.status}")
+
+asyncio.run(main())
+```
+
+The pipeline scans files, extracts fragments, synthesizes prose (`idea_hypothesis`, `method`, `data`, `experiments`), infers `style_guide` / `target_pages` / per-asset `section`, deduplicates and curates figures/tables under the specified caps, and (optionally) enriches figure descriptions via a vision model with disk caching.
+
+For the full parameter reference and cost-control guidance, see `plugins/easypaper/skills/paper-from-metadata/SKILL.md` § "Alternative: Generate Metadata from a Materials Folder".
+
 ## Key Reference Files
 
 When working with EasyPaper, refer to these files in the repository:

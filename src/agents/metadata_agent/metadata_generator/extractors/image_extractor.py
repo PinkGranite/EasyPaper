@@ -3,10 +3,11 @@ Image file extractor: discover image files and produce FigureSpec-compatible fra
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from ..models import ExtractedFragment, FileCategory
 from .base import BaseExtractor
@@ -20,7 +21,7 @@ class ImageExtractor(BaseExtractor):
     with auto-generated figure ids and placeholder captions.
     """
 
-    def extract(self, file_path: str) -> List[ExtractedFragment]:
+    def extract(self, file_path: str, *, materials_root: Optional[str] = None) -> List[ExtractedFragment]:
         """Extract from a single known image file."""
         return self._make_fragment(Path(file_path))
 
@@ -51,7 +52,8 @@ class ImageExtractor(BaseExtractor):
     ) -> List[ExtractedFragment]:
         rel = path.relative_to(root).as_posix() if root else path.name
         stem = path.stem
-        fig_id = "fig:" + re.sub(r"[^a-z0-9_]", "_", stem.lower())
+        digest = hashlib.sha256(rel.lower().encode("utf-8")).hexdigest()[:12]
+        fig_id = f"fig:h{digest}"
         caption = stem.replace("_", " ").replace("-", " ").title()
 
         return [

@@ -182,6 +182,8 @@ class PaperMetaData(BaseModel):
     # Figures and tables (optional)
     figures: List[FigureSpec] = Field(default_factory=list)  # Optional figures
     tables: List[TableSpec] = Field(default_factory=list)    # Optional tables
+    # Root folder for resolving relative figure/table paths in downstream generation
+    materials_root: Optional[str] = None
     code_repository: Optional[CodeRepositorySpec] = None
     export_prompt_traces: bool = False
 
