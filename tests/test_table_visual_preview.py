@@ -8,11 +8,37 @@ from pathlib import Path
 import pytest
 
 
+def _fallback_meta_tables() -> list:
+    """
+    Return a small inline BLIP-2-style table fixture when external experiment
+    metadata is absent from CI.
+    """
+    return [
+        {
+            "id": "tab:zero_shot_overview",
+            "caption": "Zero-shot evaluation overview.",
+            "section": "Experiments",
+            "file_path": "tables/tab_1.md",
+            "content": "\n".join(
+                [
+                    "| Model | Params | VQAv2 | NoCaps | Flickr TR@1 |",
+                    "| --- | ---: | ---: | ---: | ---: |",
+                    "| Flamingo | 10.2B | 56.3 | - | - |",
+                    "| BLIP-2 | 188M | 65.0 | 121.6 | 97.6 |",
+                ],
+            ),
+        },
+    ]
+
+
 def _load_meta_tables() -> list:
     """
     Load the metadata tables from the BLIP-2 sample meta file.
     - **Description**:
-        - Reads the sample metadata JSON used by the user scenario.
+        - Reads the sample metadata JSON used by the user scenario when it is
+          present in the workspace.
+        - Falls back to an inline representative table so unit tests do not
+          depend on external experiment artifacts.
         - Returns the list under the "tables" key.
 
     - **Args**:
@@ -40,8 +66,10 @@ def _load_meta_tables() -> list:
         / "meta.json"
     )
     meta_path = primary_path if primary_path.exists() else fallback_path
+    if not meta_path.exists():
+        return _fallback_meta_tables()
     payload = json.loads(meta_path.read_text(encoding="utf-8"))
-    return payload.get("tables", [])
+    return payload.get("tables", []) or _fallback_meta_tables()
 
 
 def test_read_table_content_falls_back_to_inline_when_file_missing(tmp_path):
