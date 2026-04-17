@@ -1363,10 +1363,12 @@ class PlannerAgent(BaseAgent):
             len(paper_plan.sections), paper_plan.get_total_sentences(),
         )
         effective_review_enabled = (
-            self.enable_plan_review if review_enabled is None else bool(review_enabled)
+            bool(getattr(self, "enable_plan_review", False))
+            if review_enabled is None
+            else bool(review_enabled)
         )
         effective_review_max_iterations = (
-            self.plan_review_max_iterations
+            int(getattr(self, "plan_review_max_iterations", 2))
             if review_max_iterations is None
             else max(0, int(review_max_iterations))
         )
