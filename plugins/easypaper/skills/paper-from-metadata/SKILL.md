@@ -270,6 +270,11 @@ The metadata should match the structure in `examples/meta.json`, but with **abso
 
 ## Alternative: Generate Metadata from a Materials Folder
 
+> **Choosing between SDK one-shot and Claude-driven interactive build:**
+> If you want Claude Code to walk the folder with its own tools and co-author the metadata in conversation (with cross-skill help from `paperhub-*`, `pdf`, `exa-search`, `sequential-thinking`), use the dedicated `interactive-metadata-build` skill (slash command `/easypaper-metadata-build`) instead. The interactive skill produces the same `PaperMetaData` JSON shape, so this skill consumes its output without changes.
+>
+> The section below describes the **SDK one-shot path**: a single Python call that does everything autonomously, no user dialogue. Best for batch / CI / regression eval.
+
 When the user has a **folder of research materials** (code, data, PDFs, images, notes, BibTeX) instead of a ready-made `metadata.json`, EasyPaper can scan the folder and synthesize `PaperMetaData` automatically.
 
 ### When to use

@@ -115,3 +115,69 @@ The plugin collects metadata following the structure in `examples/meta.json`:
 - `/easypaper` - Main command: guided workflow from setup to paper generation
 - `/setup` - Set up environment manually
 - `/paper-from-metadata` - Generate paper directly from existing metadata JSON
+- `/paper-section` - Generate or rewrite a single paper section
+- `/metadata-build` - Claude-driven interactive build of `PaperMetaData` from a research-materials folder (cold / warm-start / refine modes); complements the SDK one-shot `generate_metadata_from_folder`
+
+## Manual Install (without Claude Code marketplace)
+
+If you cloned this repo directly and want to install the skills and slash commands
+without using the marketplace flow, two convenience scripts are provided. Both
+scripts copy (or symlink) every skill under `plugins/easypaper/skills/` and every
+slash command under `plugins/easypaper/commands/` into the chosen target.
+
+### Targets
+
+- `--global` / `-Global` → `$HOME/.claude/{skills,commands}/` (user-level, all projects)
+- `--project` / `-Project` → `$(pwd)/.claude/{skills,commands}/` (current project only)
+- `--project=<path>` / `-ProjectPath <path>` → `<path>/.claude/{skills,commands}/`
+
+### Bash (macOS / Linux / Git Bash / WSL)
+
+```bash
+# Preview what would be installed (no target needed)
+bash scripts/install_plugin.sh --list
+
+# Install to user-level
+bash scripts/install_plugin.sh --global
+
+# Install to current project
+bash scripts/install_plugin.sh --project
+
+# Install to a specific project, using symlinks so future repo updates flow through
+bash scripts/install_plugin.sh --project=/path/to/research --symlink
+
+# See exactly what would happen, no writes
+bash scripts/install_plugin.sh --global --dry-run
+
+# Clean removal
+bash scripts/install_plugin.sh --global --uninstall -y
+```
+
+### PowerShell (Windows)
+
+```powershell
+# Preview
+powershell -ExecutionPolicy Bypass -File scripts\install_plugin.ps1 -List
+
+# User-level install
+powershell -ExecutionPolicy Bypass -File scripts\install_plugin.ps1 -Global
+
+# Current project
+powershell -ExecutionPolicy Bypass -File scripts\install_plugin.ps1 -Project
+
+# Specific project with symlinks (requires Developer Mode or admin)
+powershell -ExecutionPolicy Bypass -File scripts\install_plugin.ps1 -ProjectPath D:\research -Symlink
+
+# Dry-run
+powershell -ExecutionPolicy Bypass -File scripts\install_plugin.ps1 -Global -DryRun
+
+# Uninstall
+powershell -ExecutionPolicy Bypass -File scripts\install_plugin.ps1 -Global -Uninstall -Yes
+```
+
+### Modes
+
+- `--copy` / default (PowerShell: omit `-Symlink`) — copies files. Safest cross-platform.
+- `--symlink` / `-Symlink` — creates symlinks so updates from this repo flow into your Claude Code install automatically. On Windows this requires Developer Mode or running PowerShell as Administrator.
+
+After install, restart Claude Code (or rescan plugins) so the new skills and commands are picked up.

@@ -20,7 +20,7 @@ Run the EasyPaper end-to-end paper generation workflow with guided setup and met
 
 3. **Determine metadata source** — ask user which applies:
    - **(A) Complete metadata file / JSON** → proceed to step 4.
-   - **(B) Research materials folder** (code, data, images, notes, PDFs) → use `generate_metadata_from_folder` first:
+   - **(B) Research materials folder, one-shot SDK pipeline** (code, data, images, notes, PDFs) → use `generate_metadata_from_folder` first:
      ```python
      metadata = await ep.generate_metadata_from_folder(
          str(Path("path/to/materials").resolve()),
@@ -32,6 +32,7 @@ Run the EasyPaper end-to-end paper generation workflow with guided setup and met
      Key options: `max_figures`, `max_tables`, `vision_enrich_figures` (default True),
      `vision_model`, `max_vision_figures`.
      See `skills/paper-from-metadata/SKILL.md` § "Alternative: Generate Metadata from a Materials Folder" for full parameter table and cost-control guidance.
+   - **(B-interactive) Research materials folder, Claude-driven interactive build** → recommend `/easypaper-metadata-build` (or invoke the `interactive-metadata-build` skill directly). Claude walks the folder with its own Read/Glob/Grep tools, asks the user to confirm each field, and saves a `PaperMetaData` JSON that this command can then consume in path (A). Use this when the folder is non-typical, when the user wants to be in the loop, or when other skills (`paperhub-*`, `pdf`, `exa-search`, `sequential-thinking`) should help interpret the materials.
    - **(C) No metadata yet** → collect interactively (step 4).
 
 4. **Use the `paper-from-metadata` skill** which handles:

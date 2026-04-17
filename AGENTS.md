@@ -54,10 +54,11 @@ Optional fields include `style_guide`, `target_pages`, `template_path`, `compile
 - Backend YAML skills remain under `skills/` and are loaded by Python service config.
 - Claude/OpenCode skill prompts live under `plugins/easypaper/skills/*/SKILL.md`.
 - Main skills:
-  - `paper-from-metadata`: Unified skill for metadata collection and paper generation
-  - `setup-environment`: Automatic environment setup (Python, LaTeX)
-  - `venue-selection`: Venue-specific formatting
-  - `academic-writing-rules`: Academic writing conventions
+ - `paper-from-metadata`: Unified skill for metadata collection and paper generation
+ - `interactive-metadata-build`: Claude-driven, conversational build of `PaperMetaData` from a research-materials folder (slash command `/easypaper-metadata-build`); complementary to the SDK one-shot `generate_metadata_from_folder` path
+ - `setup-environment`: Automatic environment setup (Python, LaTeX)
+ - `venue-selection`: Venue-specific formatting
+ - `academic-writing-rules`: Academic writing conventions
 
 ## Validation Checklist
 
