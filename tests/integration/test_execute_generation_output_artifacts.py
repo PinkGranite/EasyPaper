@@ -5,13 +5,15 @@ Integration tests for execute_generation output artifacts.
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from src.agents.metadata_agent.metadata_agent import MetaDataAgent
-from src.agents.metadata_agent.models import PaperMetaData, PlanResult, SectionResult
+from src.agents.metadata_agent.models import FigureSpec, PaperMetaData, PlanResult, SectionResult
 from src.agents.planner_agent.models import PaperPlan, SectionPlan
 from src.agents.shared.reference_pool import ReferencePool
 from src.agents.shared.session_memory import ReviewRecord
@@ -403,3 +405,64 @@ async def test_execute_generation_prompt_traces_enabled_exports_items(
     assert payload.get("status") == "enabled"
     assert payload.get("count", 0) >= 1
     assert isinstance(payload.get("items"), list)
+
+
+@pytest.mark.integration
+async def test_execute_generation_does_not_regenerate_materialized_auto_generated_figure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    materials_root = tmp_path / "materials"
+    materials_root.mkdir()
+    (materials_root / "generated_fig.png").write_bytes(b"generated")
+
+    metadata = PaperMetaData(
+        title="Execute Generation Figure Re-entry Test",
+        idea_hypothesis="Ensure materialized figures are not regenerated.",
+        method="Use mocked section generation.",
+        data="No external data required.",
+        experiments="Run execute_generation once.",
+        references=[],
+        materials_root=str(materials_root),
+        figures=[
+            FigureSpec(
+                id="fig:generated",
+                caption="Existing generated figure",
+                file_path="generated_fig.png",
+                auto_generate=False,
+                generation_prompt="Should not be reused.",
+            )
+        ],
+    )
+    agent = _build_agent()
+    plan = PaperPlan(
+        title=metadata.title,
+        sections=[
+            SectionPlan(section_type="abstract", section_title="Abstract"),
+            SectionPlan(section_type="introduction", section_title="Introduction"),
+            SectionPlan(section_type="method", section_title="Method"),
+        ],
+    )
+    ref_pool = ReferencePool(metadata.references)
+    plan_result = PlanResult(
+        paper_plan=plan.model_dump(),
+        ref_pool_snapshot=ref_pool.to_dict(),
+        metadata_input=metadata.model_dump(),
+        paper_dir=str(tmp_path / "paper"),
+    )
+    _patch_generation_flow(agent, monkeypatch)
+
+    monkeypatch.setattr(
+        "src.agents.metadata_agent.figure_generation._load_academic_dreamer_generate",
+        lambda: pytest.fail("AcademicDreamer should not load for resolved figure assets"),
+    )
+
+    result = await agent.execute_generation(
+        plan_result=plan_result,
+        enable_review=False,
+        compile_pdf=False,
+        save_output=False,
+        output_dir=str(tmp_path / "paper"),
+    )
+
+    assert result.status == "ok"
