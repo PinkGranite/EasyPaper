@@ -1621,11 +1621,14 @@ class MetaDataAgent(ReActAgent):
         print(f"[MetaDataAgent] Reference pool initialized: {ref_pool.summary()}")
 
         if metadata.figures:
+            openrouter_api_key = getattr(getattr(self, "client", None), "_client", None)
+            openrouter_api_key = getattr(openrouter_api_key, "api_key", None)
             try:
                 await preprocess_generated_figures(
                     metadata,
                     output_dir=output_dir,
                     results_dir=self.results_dir,
+                    openrouter_api_key=openrouter_api_key,
                 )
             except Exception as e:
                 msg = f"Figure preprocessing failed: {e}"
@@ -2286,10 +2289,13 @@ class MetaDataAgent(ReActAgent):
         try:
             if metadata.figures:
                 run_output_dir = str(paper_dir) if paper_dir else output_dir
+                openrouter_api_key = getattr(getattr(self, "client", None), "_client", None)
+                openrouter_api_key = getattr(openrouter_api_key, "api_key", None)
                 await preprocess_generated_figures(
                     metadata,
                     output_dir=run_output_dir,
                     results_dir=self.results_dir,
+                    openrouter_api_key=openrouter_api_key,
                 )
 
             # Phase 1: Introduction

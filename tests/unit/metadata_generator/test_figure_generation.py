@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 import sys
 import types
 from pathlib import Path
@@ -32,7 +33,14 @@ def _get_preprocess_fn(module: object):
     )
 
 
-async def _call_preprocess(fn, *, metadata: PaperMetaData, output_dir: str, results_dir: str):
+async def _call_preprocess(
+    fn,
+    *,
+    metadata: PaperMetaData,
+    output_dir: str,
+    results_dir: str,
+    openrouter_api_key: str | None = None,
+):
     sig = inspect.signature(fn)
     kwargs = {}
 
@@ -42,6 +50,8 @@ async def _call_preprocess(fn, *, metadata: PaperMetaData, output_dir: str, resu
         kwargs["output_dir"] = output_dir
     if "results_dir" in sig.parameters:
         kwargs["results_dir"] = results_dir
+    if "openrouter_api_key" in sig.parameters and openrouter_api_key is not None:
+        kwargs["openrouter_api_key"] = openrouter_api_key
 
     if "metadata" not in kwargs:
         result = fn(metadata, **kwargs)
@@ -189,7 +199,7 @@ async def test_missing_generated_figure_uses_output_dir_fallback_and_materialize
             out_path = tmp_path / "generated_figures" / "dreamer-output.png"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(b"fake generated image")
-        return _DreamerResult(str(out_path))
+        return {"output_paths": {"png": str(out_path)}}
 
     monkeypatch.setitem(
         sys.modules,
@@ -233,3 +243,59 @@ async def test_missing_generated_figure_uses_output_dir_fallback_and_materialize
     assert figure.file_path
     materialized_path = Path(metadata.materials_root) / figure.file_path
     assert materialized_path.is_file()
+
+
+@pytest.mark.asyncio
+async def test_preprocess_temporarily_bridges_openrouter_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module = _load_figure_generation_module()
+    preprocess = _get_preprocess_fn(module)
+
+    captured: dict[str, str | None] = {"seen": None}
+
+    async def _generate_academic_illustration(*args: object, **kwargs: object) -> _DreamerResult:
+        captured["seen"] = os.environ.get("OPENROUTER_API_KEY")
+        output_dir = Path(str(kwargs["output_dir"]))
+        out_path = output_dir / "dreamer-output.png"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(b"fake generated image")
+        return {"output_paths": {"png": str(out_path)}}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "academic_dreamer",
+        types.SimpleNamespace(generate_academic_illustration=_generate_academic_illustration),
+    )
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    metadata = PaperMetaData(
+        title="Bridge API key",
+        idea_hypothesis="Validate automatic key bridging.",
+        method="Run figure generation with a configured key.",
+        data="No external data required.",
+        experiments="Expect the generator to see the bridged key.",
+        references=[],
+        figures=[
+            FigureSpec(
+                id="fig:bridge",
+                caption="Generated figure.",
+                auto_generate=True,
+                generation_prompt="Create an architecture diagram.",
+                style="icml",
+                target_type="architecture_diagram",
+            ),
+        ],
+    )
+
+    await _call_preprocess(
+        preprocess,
+        metadata=metadata,
+        output_dir=str(tmp_path / "paper"),
+        results_dir=str(tmp_path / "results"),
+        openrouter_api_key="test-openrouter-key",
+    )
+
+    assert captured["seen"] == "test-openrouter-key"
+    assert os.environ.get("OPENROUTER_API_KEY") is None

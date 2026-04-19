@@ -6,6 +6,7 @@ import inspect
 import os
 import re
 import shutil
+from contextlib import contextmanager
 from hashlib import sha1
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -292,6 +293,26 @@ def _load_academic_dreamer_generate() -> Callable[..., Awaitable[dict[str, Any]]
     return generate_academic_illustration
 
 
+@contextmanager
+def _temporary_env(**updates: str | None):
+    """Temporarily set environment variables for Dreamer invocation."""
+    original: dict[str, str | None] = {}
+    try:
+        for key, value in updates.items():
+            original[key] = os.environ.get(key)
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        yield
+    finally:
+        for key, value in original.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def _select_generated_output_path(result: dict[str, Any]) -> Path:
     output_paths = result.get("output_paths")
     if isinstance(output_paths, dict):
@@ -324,6 +345,7 @@ async def preprocess_generated_figures(
     *,
     output_dir: str | None,
     results_dir: str | Path | None,
+    openrouter_api_key: str | None = None,
     generator: Callable[..., Awaitable[dict[str, Any]]] | None = None,
 ) -> list[FigureSpec]:
     """Resolve/generate auto-generated figures into ordinary file-backed assets."""
@@ -361,14 +383,15 @@ async def preprocess_generated_figures(
         if generator_fn is None:
             generator_fn = _load_academic_dreamer_generate()
 
-        result = await _maybe_await(
-            generator_fn(
-                idea=request["idea"],
-                style=request["style"],
-                target_type=request["target_type"],
-                output_dir=generated_dir,
+        with _temporary_env(OPENROUTER_API_KEY=openrouter_api_key):
+            result = await _maybe_await(
+                generator_fn(
+                    idea=request["idea"],
+                    style=request["style"],
+                    target_type=request["target_type"],
+                    output_dir=generated_dir,
+                )
             )
-        )
         if not isinstance(result, dict):
             raise FigureGenerationError(
                 f"AcademicDreamer returned an unexpected response for figure {fig.id!r}."
