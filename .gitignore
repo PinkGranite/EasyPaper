@@ -60,3 +60,4 @@ progress_report/
 .worktrees/
 experiments/
 .claude/
+.omx/
