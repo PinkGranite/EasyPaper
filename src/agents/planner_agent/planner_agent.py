@@ -3256,6 +3256,9 @@ Guidelines:
 - Order paragraphs logically to fulfill the section mission.
 - Assign figures/tables to the most relevant paragraph.
 - approx_sentences: typically 3-6 for body paragraphs.
+- For AI-targeted venues (CVPR, NeurIPS, ICML, ICLR, AAAI, etc.), consider ending
+  the Introduction with a summary paragraph (role="conclusion") that highlights the
+  main contributions and provides a roadmap to the paper structure.
 Output valid JSON only."""
 
         data = await self._llm_json_call(
@@ -3360,6 +3363,9 @@ Guidelines:
 - Each paragraph should have a single clear key_point.
 - Build on previous subsections' key_points for narrative continuity.
 - subsection_key_points will be passed to subsequent subsections as context.
+- For AI-targeted venues (CVPR, NeurIPS, ICML, ICLR, AAAI, etc.), consider ending
+  the Introduction with a summary paragraph (role="conclusion") that highlights the
+  main contributions and provides a roadmap to the paper structure.
 Output valid JSON only."""
 
             data = await self._llm_json_call(
