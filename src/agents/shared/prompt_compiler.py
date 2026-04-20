@@ -1339,18 +1339,20 @@ Write a conclusion that synthesizes the paper's contributions and findings.
         for contrib in key_contributions:
             prompt += f"- {contrib}\n"
 
-        if plan_guidance:
-            prompt += f"\n## Writing Structure (from Planner)\n{plan_guidance}\n"
-
         prompt += """
 ## Conclusion Structure
-1. Summary of contributions (1 paragraph)
-2. Key findings and their significance (1 paragraph)
-3. Limitations (brief, 2-3 sentences)
-4. Future work (2-3 sentences)
+Write a **single cohesive paragraph** that flows through these four elements:
+
+1. **Contributions & Findings**: Summarize the main contributions and key findings in a flowing narrative (3-4 sentences)
+2. **Limitations**: Briefly acknowledge limitations in 1-2 sentences, integrated naturally
+3. **Future Work**: Point to future directions in 1-2 sentences, integrated naturally
+4. **Impact**: End with broader impact or significance (1 sentence)
+
+**Critical**: This must be ONE paragraph, not multiple paragraphs. The four elements above should flow naturally as a single narrative.
 
 ## Hard Constraints (Highest Priority)
 - If any instruction conflicts with this block, follow this block.
+- Write as a SINGLE PARAGRAPH — do NOT break into multiple paragraphs
 - Do NOT include any citations (\\cite{{...}}) in the conclusion.
 - Do NOT include any cross-references: NO \\ref{{...}}, NO Figure~\\ref{{...}},
   NO Table~\\ref{{...}}, NO Section~\\ref{{...}}. The conclusion must stand
@@ -1363,9 +1365,10 @@ Write a conclusion that synthesizes the paper's contributions and findings.
 - Do NOT reference any figures, tables, or sections by number or label
 - Be concise but comprehensive
 - End on a forward-looking note
+- Write exactly ONE paragraph
+
+**Note**: Planner-based writing guidance is intentionally omitted for Conclusion to ensure a single paragraph is always produced.
 """
-        if plan_writing_guidance:
-            prompt += f"\n## Writing Guidance (IMPORTANT - follow strictly)\n{plan_writing_guidance}\n"
     else:
         prompt = f"""Synthesize content for the {section_type} section based on:
 
