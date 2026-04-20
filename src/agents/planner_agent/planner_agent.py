@@ -1276,6 +1276,7 @@ class PlannerAgent(BaseAgent):
                     section=section,
                     subsection_structure=structure_decision,
                     reference_keys=reference_keys,
+                    contributions=plan_data.contributions,
                 )
                 section.sectioning_recommended = True
                 sub_summary = ", ".join(s.title for s in section.subsections)
@@ -1297,6 +1298,7 @@ class PlannerAgent(BaseAgent):
                     word_budget=section_words,
                     reference_keys=reference_keys,
                     prior_key_points=prior_key_points,
+                    contributions=plan_data.contributions,
                 )
                 prior_sections_summary += (
                     f"{section.section_type}: {len(section.paragraphs)} paras, flat; "
@@ -3205,6 +3207,7 @@ Output valid JSON only."""
         word_budget: int,
         reference_keys: List[str],
         prior_key_points: str,
+        contributions: List[str],
     ) -> List[ParagraphPlan]:
         """
         Generate flat paragraph plans for a section without subsections.
@@ -3217,6 +3220,7 @@ Output valid JSON only."""
             - `word_budget` (int): Approximate word budget for this section.
             - `reference_keys` (List[str]): Available reference keys for citation.
             - `prior_key_points` (str): Key points from earlier sections (cumulative).
+            - `contributions` (List[str]): Paper's key contributions for contribution summary.
 
         - **Returns**:
             - `List[ParagraphPlan]`: Ordered list of paragraph plans.
@@ -3235,6 +3239,7 @@ Output valid JSON only."""
 **Assigned tables**: {tables_str}
 **Available references**: {", ".join(reference_keys[:20]) if reference_keys else "None"}
 **Prior sections key points**: {prior_key_points or "None (first section)"}
+**Paper contributions**: {json.dumps(contributions) if contributions else "None"}
 
 Output JSON:
 {{
@@ -3258,7 +3263,8 @@ Guidelines:
 - approx_sentences: typically 3-6 for body paragraphs.
 - For AI-targeted venues (CVPR, NeurIPS, ICML, ICLR, AAAI, etc.), consider ending
   the Introduction with a summary paragraph (role="conclusion") that highlights the
-  main contributions and provides a roadmap to the paper structure.
+  main contributions as bullet points (e.g., "• We propose...") and provides a
+  roadmap to the paper structure.
 Output valid JSON only."""
 
         data = await self._llm_json_call(
@@ -3287,6 +3293,7 @@ Output valid JSON only."""
         section: SectionPlan,
         subsection_structure: Dict[str, Any],
         reference_keys: List[str],
+        contributions: List[str],
     ) -> List[SubSectionPlan]:
         """
         Generate paragraph plans for each subsection sequentially with cumulative context.
@@ -3344,6 +3351,7 @@ Output valid JSON only."""
 **Transition from previous subsection**: {transition or "N/A (first subsection)"}
 **Key points from previous subsections**:
 {cumulative_str}
+**Paper contributions**: {json.dumps(contributions) if contributions else "None"}
 
 Output JSON:
 {{
@@ -3365,7 +3373,8 @@ Guidelines:
 - subsection_key_points will be passed to subsequent subsections as context.
 - For AI-targeted venues (CVPR, NeurIPS, ICML, ICLR, AAAI, etc.), consider ending
   the Introduction with a summary paragraph (role="conclusion") that highlights the
-  main contributions and provides a roadmap to the paper structure.
+  main contributions as bullet points (e.g., "• We propose...") and provides a
+  roadmap to the paper structure.
 Output valid JSON only."""
 
             data = await self._llm_json_call(
