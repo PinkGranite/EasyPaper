@@ -30,22 +30,25 @@ class LLMDAGBuilder:
     producing matches that supplement the heuristic DAG builder.
     """
 
-    def __init__(self, llm_client: Any):
+    def __init__(self, llm_client: Any, model_name: Optional[str] = None):
         """
-        Initialize with an LLM client.
+        Initialize with an LLM client and model name.
 
         - **Args**:
             - `llm_client`: Chat completions client (e.g., OpenAI-compatible).
               Must have `chat.completions.create` method.
+            - `model_name` (str, optional): Model name to use for LLM calls.
+              If not provided, must be passed to ``find_claim_evidence_matches``.
         """
         self._llm = llm_client
+        self._model_name = model_name
 
     async def find_claim_evidence_matches(
         self,
         claims: List[Dict[str, Any]],
         evidence: List[Dict[str, Any]],
         paper_topic: str,
-        model_name: str = "moonshot-v1-8k",
+        model_name: Optional[str] = None,
         temperature: float = 0.3,
     ) -> List[ClaimEvidenceMatch]:
         """
@@ -55,7 +58,8 @@ class LLMDAGBuilder:
             - `claims`: List of claim nodes with statement, section_scope, priority
             - `evidence`: List of evidence nodes with content, source_path, node_type
             - `paper_topic`: The research topic for contextual relevance
-            - `model_name`: Model to use for LLM calls
+            - `model_name`: Model to use for LLM calls. If not provided, uses the
+              model from the LLM client passed at construction time.
             - `temperature`: Temperature for LLM sampling
 
         - **Returns**:
@@ -118,19 +122,29 @@ Only include matches with confidence >= 0.5. Format:
     async def _call_llm(
         self,
         prompt: str,
-        model_name: str,
+        model_name: Optional[str],
         temperature: float,
     ) -> str:
         """
         Make an LLM call and return the response text.
+
+        - **Args**:
+            - `model_name`: Model name. If None, uses the model from the LLM client
+              passed at construction time.
         """
         system_prompt = """You are a research assistant that matches evidence to claims in academic papers.
 Be precise and only match evidence that genuinely supports the claim.
 Output valid JSON only."""
 
+        model = model_name or self._model_name
+        if not model:
+            raise ValueError(
+                "model_name must be passed to __init__ or to find_claim_evidence_matches"
+            )
+
         try:
             response = await self._llm.chat.completions.create(
-                model=model_name,
+                model=model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": prompt},
