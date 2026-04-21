@@ -113,6 +113,7 @@ from ..reviewer_agent.models import (
     FeedbackLevel,
 )
 from .models import FigureSpec, TableSpec, StructuralAction, SpaceEstimate
+from .figure_generation import preprocess_generated_figures
 from .orchestrator import ReviewOrchestrator
 from .revision_executor import RevisionExecutor
 from .conflict_resolver import ConflictResolver, LATEX_ERROR_FIXES as _CR_LATEX_ERROR_FIXES
@@ -1619,6 +1620,32 @@ class MetaDataAgent(ReActAgent):
         )
         print(f"[MetaDataAgent] Reference pool initialized: {ref_pool.summary()}")
 
+        if metadata.figures:
+            openrouter_api_key = getattr(getattr(self, "client", None), "_client", None)
+            openrouter_api_key = getattr(openrouter_api_key, "api_key", None)
+            try:
+                await preprocess_generated_figures(
+                    metadata,
+                    output_dir=output_dir,
+                    results_dir=self.results_dir,
+                    openrouter_api_key=openrouter_api_key,
+                )
+            except Exception as e:
+                msg = f"Figure preprocessing failed: {e}"
+                print(f"[MetaDataAgent] {msg}")
+                await emitter.error(message=msg, phase="prepare_plan")
+                return PlanResult(
+                    paper_plan={},
+                    metadata_input=metadata.model_dump(),
+                    errors=[msg],
+                    template_path=template_path,
+                    target_pages=target_pages,
+                    artifacts_prefix=artifacts_prefix,
+                    ref_pool_snapshot=ref_pool.to_dict(),
+                    plan_review=plan_review_summary,
+                    plan_review_iterations=plan_review_iterations,
+                )
+
         validation_errors = self._validate_file_paths(metadata)
         if validation_errors:
             return PlanResult(
@@ -2260,6 +2287,17 @@ class MetaDataAgent(ReActAgent):
             return section_type.replace("_", " ").title()
 
         try:
+            if metadata.figures:
+                run_output_dir = str(paper_dir) if paper_dir else output_dir
+                openrouter_api_key = getattr(getattr(self, "client", None), "_client", None)
+                openrouter_api_key = getattr(openrouter_api_key, "api_key", None)
+                await preprocess_generated_figures(
+                    metadata,
+                    output_dir=run_output_dir,
+                    results_dir=self.results_dir,
+                    openrouter_api_key=openrouter_api_key,
+                )
+
             # Phase 1: Introduction
             print("[MetaDataAgent] Phase 1: Generating Introduction...")
             update_usage_tracker_context(agent="WriterAgent", phase="introduction")

@@ -552,6 +552,7 @@ class TestPlanFlatParagraphs:
             word_budget=800,
             reference_keys=["ref1", "ref2"],
             prior_key_points="",
+            contributions=[],
         )
         assert len(paragraphs) == 3
         assert all(isinstance(p, ParagraphPlan) for p in paragraphs)
@@ -580,6 +581,7 @@ class TestPlanFlatParagraphs:
             word_budget=1000,
             reference_keys=["ref1"],
             prior_key_points="introduction covered background and gap",
+            contributions=[],
         )
 
         prompt = captured_prompts[0]
@@ -674,6 +676,7 @@ class TestPlanSubsectionParagraphs:
             section=section,
             subsection_structure=subsection_structure,
             reference_keys=["ref1", "ref2"],
+            contributions=[],
         )
 
         assert len(result) == 3
@@ -722,6 +725,7 @@ class TestPlanSubsectionParagraphs:
             section=section,
             subsection_structure=subsection_structure,
             reference_keys=[],
+            contributions=[],
         )
 
         assert "Transitioning from A to B" in captured_prompts[1]
@@ -762,6 +766,7 @@ class TestPlanSubsectionParagraphs:
             section=section,
             subsection_structure=subsection_structure,
             reference_keys=[],
+            contributions=[],
         )
 
         assert result[0].mission == "Evaluate on VQA benchmarks."

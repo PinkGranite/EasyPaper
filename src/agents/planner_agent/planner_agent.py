@@ -211,10 +211,22 @@ Output JSON:
   "writing_guidance": "Specific guidance for the writer"
 }}
 
+VENUE-SPECIFIC INTRODUCTION STRUCTURE (AI-targeted venues: CVPR, NeurIPS, ICML, ICLR, AAAI, etc.):
+For these venues, the Introduction MUST follow this narrative arc regardless of word budget:
+1. Context/Motivation (topic role): What is the broad field and why does it matter
+2. Gap/Problem (evidence role): What are the limitations of current approaches; identify the specific gap
+3. Our Approach (evidence role): What do we propose to address the gap
+4. Contribution Summary (conclusion role): Explicitly list contributions as bullet points
+   (e.g., "• We propose...", "• We demonstrate...") and provide a brief roadmap
+
+The number of paragraphs is determined by the content scope, NOT by word budget.
+If you have more content to cover, use more paragraphs. If less, use fewer.
+Each paragraph should be a cohesive unit of 3-8 sentences.
+
 IMPORTANT:
-- Plan enough paragraphs to fill ~{section_words} words. Each paragraph is ~150-250 words.
+- Word budget is a SOFT guideline, not a target. Content structure determines paragraph count.
 - Each paragraph should have 3-8 sentences.
-- For narrative sections (introduction, discussion), plan **4-8 cohesive paragraphs**
+- For narrative sections (introduction, discussion), plan **3-5 cohesive paragraphs**
   with substantial depth each, rather than 10+ short fragmented paragraphs.
   An academic paragraph should develop a complete idea, not a single bullet point.
 - Use sectioning_recommended sparingly; prefer false for narrative sections
@@ -1276,6 +1288,7 @@ class PlannerAgent(BaseAgent):
                     section=section,
                     subsection_structure=structure_decision,
                     reference_keys=reference_keys,
+                    contributions=contributions,
                 )
                 section.sectioning_recommended = True
                 sub_summary = ", ".join(s.title for s in section.subsections)
@@ -1297,6 +1310,8 @@ class PlannerAgent(BaseAgent):
                     word_budget=section_words,
                     reference_keys=reference_keys,
                     prior_key_points=prior_key_points,
+                    contributions=contributions,
+                    venue=style_guide,
                 )
                 prior_sections_summary += (
                     f"{section.section_type}: {len(section.paragraphs)} paras, flat; "
@@ -3205,6 +3220,8 @@ Output valid JSON only."""
         word_budget: int,
         reference_keys: List[str],
         prior_key_points: str,
+        contributions: List[str],
+        venue: str = "DEFAULT",
     ) -> List[ParagraphPlan]:
         """
         Generate flat paragraph plans for a section without subsections.
@@ -3217,25 +3234,56 @@ Output valid JSON only."""
             - `word_budget` (int): Approximate word budget for this section.
             - `reference_keys` (List[str]): Available reference keys for citation.
             - `prior_key_points` (str): Key points from earlier sections (cumulative).
+            - `contributions` (List[str]): Paper's key contributions for contribution summary.
+            - `venue` (str): Venue/style_guide for venue-specific guidance.
 
         - **Returns**:
             - `List[ParagraphPlan]`: Ordered list of paragraph plans.
         """
         figures_str = ", ".join(f.figure_id for f in section.figures) if section.figures else "None"
         tables_str = ", ".join(t.table_id for t in section.tables) if section.tables else "None"
-        approx_paragraphs = max(1, word_budget // WORDS_PER_PARAGRAPH)
+
+        # Determine if this is an AI-targeted venue
+        is_ai_venue = any(v in venue.upper() for v in ["CVPR", "NEURIPS", "ICML", "ICLR", "AAAI", "NeurIPS"])
+
+        # Build venue-specific narrative arc guidance
+        narrative_guidance = ""
+        if is_ai_venue and section.section_type == "introduction":
+            narrative_guidance = """
+VENUE-SPECIFIC STRUCTURE (AI-targeted venue):
+Introduction MUST follow this 4-paragraph narrative arc:
+1. Context (topic role): Establish the general research area and its importance.
+   Start broad, then narrow to specific problem context.
+2. Gap/Limitation (evidence/analysis role): Identify limitations in prior work
+   or important problems that remain unsolved. Be specific about what existing methods fail at.
+3. Our Approach (evidence role): Introduce your method/solution. Explain the key
+   technical innovations without diving into implementation details.
+4. Contributions (conclusion role): Explicitly list main contributions as bullet
+   points (e.g., "• We propose a novel...") and provide a brief roadmap to the paper.
+The contribution paragraph MUST be role="conclusion" with supporting_points listing
+each bullet contribution.
+"""
+        elif is_ai_venue:
+            narrative_guidance = """
+VENUE-SPECIFIC GUIDANCE (AI-targeted venue):
+When generating paragraphs, ensure:
+- Topic sentences clearly state the main point.
+- Evidence paragraphs cite specific prior work with limitations.
+- Transitions smoothly connect to next content.
+"""
 
         prompt = f"""Generate a paragraph plan for this section:
 
 **Section**: {section.section_title} ({section.section_type})
 **Mission**: {section.mission}
 **Key content points**: {json.dumps(section.key_content)}
-**Word budget**: ~{word_budget} words (~{approx_paragraphs} paragraphs)
+**Word budget**: ~{word_budget} words
 **Assigned figures**: {figures_str}
 **Assigned tables**: {tables_str}
 **Available references**: {", ".join(reference_keys[:20]) if reference_keys else "None"}
 **Prior sections key points**: {prior_key_points or "None (first section)"}
-
+**Paper contributions**: {json.dumps(contributions) if contributions else "None"}
+{narrative_guidance}
 Output JSON:
 {{
   "paragraphs": [
@@ -3284,6 +3332,7 @@ Output valid JSON only."""
         section: SectionPlan,
         subsection_structure: Dict[str, Any],
         reference_keys: List[str],
+        contributions: List[str],
     ) -> List[SubSectionPlan]:
         """
         Generate paragraph plans for each subsection sequentially with cumulative context.
@@ -3341,6 +3390,7 @@ Output valid JSON only."""
 **Transition from previous subsection**: {transition or "N/A (first subsection)"}
 **Key points from previous subsections**:
 {cumulative_str}
+**Paper contributions**: {json.dumps(contributions) if contributions else "None"}
 
 Output JSON:
 {{
@@ -3360,6 +3410,10 @@ Guidelines:
 - Each paragraph should have a single clear key_point.
 - Build on previous subsections' key_points for narrative continuity.
 - subsection_key_points will be passed to subsequent subsections as context.
+- For AI-targeted venues (CVPR, NeurIPS, ICML, ICLR, AAAI, etc.), the Introduction
+  must end with a dedicated contribution summary paragraph (role="conclusion")
+  that explicitly lists the main contributions as bullet points (e.g., "• We propose...",
+  "• We demonstrate...") and provides a brief roadmap to the paper structure.
 Output valid JSON only."""
 
             data = await self._llm_json_call(

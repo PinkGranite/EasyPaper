@@ -91,7 +91,9 @@ class FigureSpec(BaseModel):
         - `file_path` (str, optional): Path to figure file (PDF, PNG, JPEG)
         - `wide` (bool): If True, use figure* for double-column spanning
         - `auto_generate` (bool): Mark for future auto-generation
-        - `generation_prompt` (str, optional): Prompt for image generation (future)
+        - `generation_prompt` (str, optional): Dreamer idea/prompt. Explicit value wins.
+        - `style` (str, optional): Dreamer style or venue hint. Explicit value wins.
+        - `target_type` (str, optional): Dreamer target figure type. Explicit value wins.
     """
     id: str                              # LaTeX label: "fig:architecture"
     caption: str                         # Figure caption
@@ -106,7 +108,9 @@ class FigureSpec(BaseModel):
     
     # Future: auto-generation
     auto_generate: bool = False          # Mark for future auto-generation
-    generation_prompt: Optional[str] = None  # Prompt for image generation
+    generation_prompt: Optional[str] = None  # Dreamer idea/prompt; explicit value wins
+    style: Optional[str] = None              # Dreamer style/venue; explicit value wins
+    target_type: Optional[str] = None        # Dreamer target type; explicit value wins
 
 
 class TableSpec(BaseModel):

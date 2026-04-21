@@ -102,3 +102,28 @@ class TestMetaJsonParsing:
         )
         assert metadata.title == raw["title"]
         assert len(metadata.figures) == len(raw["figures"])
+
+    def test_figure_generation_fields_round_trip(self):
+        figure = FigureSpec(
+            id="fig:dreamer",
+            caption="Generated figure",
+            auto_generate=True,
+            generation_prompt="Show the system pipeline.",
+            style="ICML-style diagram",
+            target_type="flowchart",
+        )
+
+        metadata = PaperMetaData(
+            title="Generated Figure Test",
+            idea_hypothesis="Test metadata parsing.",
+            method="Use a deterministic parser.",
+            data="Synthetic",
+            experiments="Unit test only.",
+            figures=[figure],
+        )
+
+        payload = metadata.model_dump()
+
+        assert payload["figures"][0]["generation_prompt"] == "Show the system pipeline."
+        assert payload["figures"][0]["style"] == "ICML-style diagram"
+        assert payload["figures"][0]["target_type"] == "flowchart"

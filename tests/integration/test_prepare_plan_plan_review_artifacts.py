@@ -5,13 +5,15 @@ Integration test for prepare_plan plan-review artifacts.
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
 from src.agents.metadata_agent.metadata_agent import MetaDataAgent
-from src.agents.metadata_agent.models import PaperMetaData
+from src.agents.metadata_agent.models import FigureSpec, PaperMetaData
 from src.agents.planner_agent.models import (
     PaperPlan,
     ParagraphPlan,
@@ -216,3 +218,69 @@ async def test_prepare_plan_save_output_false_does_not_write_artifacts(
     assert not (tmp_path / "analysis" / "planning" / "paper_plan.json").exists()
     assert not (tmp_path / "analysis" / "planning" / "plan_review.json").exists()
     assert not (tmp_path / "analysis" / "planning" / "evidence_dag.json").exists()
+
+
+@pytest.mark.integration
+async def test_prepare_plan_regenerates_broken_auto_generated_figure_before_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    metadata = PaperMetaData(
+        title="Prepare Plan Figure Preprocess Test",
+        idea_hypothesis="Verify preprocessing runs before path validation.",
+        method="Use a mocked AcademicDreamer response.",
+        data="No external data required.",
+        experiments="Plan only.",
+        references=[],
+        figures=[
+            FigureSpec(
+                id="fig:generated",
+                caption="Architecture overview",
+                file_path="missing.png",
+                auto_generate=True,
+                generation_prompt="Illustrate the architecture.",
+                style="cvpr",
+            )
+        ],
+    )
+
+    async def _fake_generate(**kwargs: object) -> dict:
+        output_dir = Path(str(kwargs["output_dir"]))
+        generated = output_dir / "raw.png"
+        generated.parent.mkdir(parents=True, exist_ok=True)
+        generated.write_bytes(b"generated")
+        return {"output_paths": {"png": str(generated)}, "approved": True}
+
+    monkeypatch.setattr(
+        "src.agents.metadata_agent.figure_generation._load_academic_dreamer_generate",
+        lambda: _fake_generate,
+    )
+
+    model = ModelConfig(
+        model_name="stub-model",
+        api_key="stub-key",
+        base_url="http://127.0.0.1:9",
+    )
+    agent = MetaDataAgent(
+        model,
+        tools_config=ToolsConfig(enabled=False, available_tools=[]),
+    )
+
+    result = await agent.prepare_plan(
+        metadata=metadata,
+        template_path=None,
+        target_pages=None,
+        enable_planning=False,
+        enable_exemplar=False,
+        save_output=False,
+        output_dir=str(tmp_path / "paper"),
+    )
+
+    assert result.errors == []
+    prepared = PaperMetaData(**result.metadata_input)
+    assert prepared.materials_root == str((tmp_path / "paper").resolve())
+    assert prepared.figures[0].auto_generate is False
+    assert prepared.figures[0].file_path is not None
+    assert (
+        Path(prepared.materials_root) / prepared.figures[0].file_path
+    ).is_file()
