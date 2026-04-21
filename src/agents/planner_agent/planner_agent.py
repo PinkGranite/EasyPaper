@@ -446,7 +446,6 @@ class PlannerAgent(BaseAgent):
                     },
                 ],
                 temperature=0.3,
-                max_tokens=300,
             )
             return response.choices[0].message.content or candidates
         except Exception as e:
@@ -921,7 +920,6 @@ class PlannerAgent(BaseAgent):
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.2,
-                max_tokens=5000,
             )
             raw = response.choices[0].message.content or ""
             parsed = self._safe_load_json(raw, expected=dict)
@@ -2471,7 +2469,6 @@ class PlannerAgent(BaseAgent):
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,
-                max_tokens=200,
             )
             raw = response.choices[0].message.content or ""
             data = self._safe_load_json(raw, expected=dict)
@@ -2544,7 +2541,6 @@ class PlannerAgent(BaseAgent):
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,
-                max_tokens=500,
             )
             raw = response.choices[0].message.content or ""
             evaluations = self._safe_load_json(raw, expected=list)
@@ -2637,7 +2633,6 @@ class PlannerAgent(BaseAgent):
                     {"role": "user", "content": user_prompt},
                 ],
                 temperature=0.1,
-                max_tokens=800,
             )
             raw = response.choices[0].message.content or ""
             scores_data = self._safe_load_json(raw, expected=list)
@@ -2768,7 +2763,6 @@ class PlannerAgent(BaseAgent):
         for attempt in range(1, max_attempts + 1):
             try:
                 temperature = max(0.1, 0.4 - 0.1 * attempt)
-                max_tokens = 1400 + 200 * (attempt - 1)
 
                 response = await self.client.chat.completions.create(
                     model=self.model_name,
@@ -2777,7 +2771,6 @@ class PlannerAgent(BaseAgent):
                         {"role": "user", "content": prompt},
                     ],
                     temperature=temperature,
-                    max_tokens=max_tokens,
                 )
                 raw = response.choices[0].message.content or ""
                 llm_raw_outputs.append(raw)
@@ -2803,7 +2796,6 @@ class PlannerAgent(BaseAgent):
                         },
                     ],
                     temperature=0.0,
-                    max_tokens=max_tokens,
                 )
                 repaired_raw = repair_resp.choices[0].message.content or ""
                 llm_raw_outputs.append(f"[repair_attempt_{attempt}] {repaired_raw}")

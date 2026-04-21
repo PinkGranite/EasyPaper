@@ -2029,7 +2029,7 @@ class MetaDataAgent(ReActAgent):
             # Phase 0d.5: Build Evidence DAG
             if paper_plan:
                 try:
-                    dag_builder = DAGBuilder(llm_client=self.client)
+                    dag_builder = DAGBuilder(llm_client=self.client, model_name=self.model_name)
                     evidence_dag = await dag_builder.build(
                         code_context=code_context,
                         research_context=research_context,

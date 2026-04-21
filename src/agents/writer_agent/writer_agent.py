@@ -333,7 +333,6 @@ class WriterAgent(ReActAgent):
                     model=self.model_name,
                     messages=messages,
                     temperature=0.35,
-                    max_tokens=4000,
                 )
                 revised_content = response.choices[0].message.content or ""
                 revised_content = self._clean_latex_output(revised_content)
@@ -389,7 +388,6 @@ class WriterAgent(ReActAgent):
                 messages=messages,
                 tool_names=tool_names,
                 temperature=0.7,
-                max_tokens=4000,
             )
             generated_content = self._clean_latex_output(generated_content)
         except Exception as e:
@@ -524,7 +522,6 @@ class WriterAgent(ReActAgent):
                 model=self.model_name,
                 messages=messages,
                 temperature=0.5,  # Lower temperature for revision
-                max_tokens=4000,
             )
             
             revised_content = response.choices[0].message.content
@@ -909,7 +906,6 @@ class WriterAgent(ReActAgent):
                     model=self.model_name,
                     messages=messages,
                     temperature=0.7,
-                    max_tokens=4000,
                 )
                 raw = response.choices[0].message.content or ""
                 latex_content = raw.strip()
@@ -1001,7 +997,6 @@ class WriterAgent(ReActAgent):
                 model=self.model_name,
                 messages=messages,
                 temperature=0.5,
-                max_tokens=4000,
             )
             raw = response.choices[0].message.content or ""
             latex_content = raw.strip()
@@ -1073,7 +1068,6 @@ class WriterAgent(ReActAgent):
                     model=self.model_name,
                     messages=messages,
                     temperature=0.7,
-                    max_tokens=4000,
                 )
                 raw = response.choices[0].message.content or ""
                 latex_content = raw.strip()
@@ -1136,7 +1130,6 @@ class WriterAgent(ReActAgent):
                 model=self.model_name,
                 messages=messages,
                 temperature=0.3,
-                max_tokens=4000,
             )
             raw = response.choices[0].message.content or ""
             raw = raw.strip()

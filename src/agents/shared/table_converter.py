@@ -1456,13 +1456,13 @@ async def convert_table_to_latex(
     )
 
     # Phase 2: Build enhanced prompt
-    prompt, max_tokens = build_conversion_prompt(
+    prompt = build_conversion_prompt(
         label=table.id,
         caption=table.caption,
         content=content,
         structure=structure,
         column_format=column_format,
-        return_max_tokens=True,
+        return_max_tokens=False,
     )
 
     try:
@@ -1479,7 +1479,6 @@ async def convert_table_to_latex(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=max_tokens,
         )
 
         latex_content = response.choices[0].message.content.strip()

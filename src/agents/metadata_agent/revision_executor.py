@@ -164,7 +164,6 @@ class RevisionExecutor:
                     },
                 ],
                 temperature=0.1,
-                max_tokens=600,
             )
             raw = response.choices[0].message.content or ""
             cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip())

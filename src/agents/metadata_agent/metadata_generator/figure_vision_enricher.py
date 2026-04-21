@@ -148,7 +148,6 @@ async def _vision_one_figure(
         model=model,
         messages=messages,
         temperature=0.2,
-        max_tokens=400,
     )
     raw = (response.choices[0].message.content or "").strip()
     if raw.startswith("```"):

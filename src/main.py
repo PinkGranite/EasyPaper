@@ -35,7 +35,6 @@ async def _validate_chat_connection(
                 {"role": "system", "content": "Return exactly: ok"},
                 {"role": "user", "content": "connectivity check"},
             ],
-            max_tokens=2,
             temperature=0,
         )
         print(f"[StartupCheck] OK: {label} ({model_name})")

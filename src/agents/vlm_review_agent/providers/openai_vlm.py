@@ -6,7 +6,7 @@ OpenAI VLM Provider
 """
 import json
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from ...shared.llm_client import LLMClient
 
@@ -31,23 +31,23 @@ class OpenAIVLM(VLMProvider):
         api_key: str,
         model: str = "gpt-4o",
         base_url: Optional[str] = None,
-        max_tokens: int = 2000,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.1,
         **kwargs
     ):
         """
         Initialize OpenAI VLM provider
-        
+
         Args:
             api_key: OpenAI API key
             model: Model name (gpt-4o, gpt-4-vision-preview, etc.)
             base_url: Optional custom base URL (for compatible APIs)
-            max_tokens: Maximum tokens in response
+            max_tokens: Maximum tokens in response (None = unlimited)
             temperature: Sampling temperature (low for consistent analysis)
             **kwargs: Additional options
         """
         super().__init__(api_key=api_key, model=model, **kwargs)
-        
+
         self.max_tokens = max_tokens
         self.temperature = temperature
         
@@ -107,12 +107,15 @@ class OpenAIVLM(VLMProvider):
             ]
             
             # Call API
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
-            )
+            call_kwargs: Dict[str, Any] = {
+                "model": self.model,
+                "messages": messages,
+                "temperature": self.temperature,
+            }
+            if self.max_tokens is not None:
+                call_kwargs["max_tokens"] = self.max_tokens
+
+            response = await self.client.chat.completions.create(**call_kwargs)
             
             # Extract response
             content = response.choices[0].message.content

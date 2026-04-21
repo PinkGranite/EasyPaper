@@ -1057,7 +1057,6 @@ class ReviewOrchestrator:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,
-                max_tokens=500,
             )
             raw = response.choices[0].message.content or ""
             raw = raw.strip()
@@ -1293,7 +1292,6 @@ class ReviewOrchestrator:
                     {"role": "user", "content": json.dumps({"tasks": task_payload}, ensure_ascii=False)},
                 ],
                 temperature=0.2,
-                max_tokens=1800,
             )
             raw = response.choices[0].message.content or ""
             cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip())
@@ -1437,7 +1435,6 @@ class ReviewOrchestrator:
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
                 temperature=0.2,
-                max_tokens=1200,
             )
             raw = response.choices[0].message.content or ""
             cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip())

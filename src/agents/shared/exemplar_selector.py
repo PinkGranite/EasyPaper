@@ -221,7 +221,6 @@ class ExemplarSelector:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
-                max_tokens=800,
             )
             raw = resp.choices[0].message.content or ""
             cleaned = _strip_code_fence(raw)

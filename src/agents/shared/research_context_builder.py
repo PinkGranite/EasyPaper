@@ -160,7 +160,6 @@ class ResearchContextBuilder:
                     {"role": "user", "content": user_msg},
                 ],
                 temperature=0.25,
-                max_tokens=1600,
             )
             raw = response.choices[0].message.content or ""
             context = _safe_load_json(raw, expected=dict)
