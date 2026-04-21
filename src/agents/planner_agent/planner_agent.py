@@ -754,7 +754,7 @@ class PlannerAgent(BaseAgent):
                     logger.info("planner.%s ok (attempt=%d)", label, attempt)
                     return parsed
                 logger.warning(
-                    "planner.%s json_parse_failed attempt=%d", label, attempt,
+                    "planner.%s json_parse_failed attempt=%d raw=%r", label, attempt, text,
                 )
             except Exception as e:
                 logger.warning(
