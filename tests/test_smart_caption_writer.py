@@ -270,6 +270,36 @@ class TestCompileCorePrompt:
         )
         assert "FLOAT" in result or "float" in result.lower()
 
+    def test_includes_figure_reference_briefs(self):
+        from src.agents.shared.prompt_compiler import compile_core_prompt
+        from src.agents.planner_agent.models import FigureUsagePlan, ParagraphPlan
+
+        para = ParagraphPlan(
+            key_point="Mechanism ablation clarifies the main driver.",
+            approx_sentences=3,
+            figures_to_reference=["fig:overview"],
+            figure_usages=[
+                FigureUsagePlan(
+                    figure_id="fig:overview",
+                    rhetorical_role="analyze",
+                    what_it_shows="Relative mechanism contributions to polarization.",
+                    supported_claim="Amplification dominates the effect hierarchy.",
+                    must_appear=True,
+                    caption="Mechanism Decomposition",
+                ),
+            ],
+        )
+        result = compile_core_prompt(
+            paragraph_plan=para,
+            section_type="result",
+            section_title="Results",
+        )
+        assert "Figure Reference Briefs" in result
+        assert "Amplification dominates the effect hierarchy." in result
+        assert "Mechanism Decomposition" in result
+        assert "directly supports this paragraph's local claim" in result
+        assert "rhetorical role: analyze" in result
+
     def test_includes_evidence_snippets(self):
         from src.agents.shared.prompt_compiler import compile_core_prompt
 
@@ -291,6 +321,26 @@ class TestCompileCorePrompt:
             section_title="Method",
         )
         assert "Q-Former" in result
+
+    def test_append_paragraph_entry_lists_figure_usage_summary(self):
+        from src.agents.shared.prompt_compiler import _append_paragraph_entry
+        from src.agents.planner_agent.models import FigureUsagePlan, ParagraphPlan
+
+        lines = []
+        para = ParagraphPlan(
+            key_point="Analyze the key figure.",
+            figure_usages=[
+                FigureUsagePlan(
+                    figure_id="fig:key",
+                    rhetorical_role="analyze",
+                    what_it_shows="Polarization trajectory split.",
+                ),
+            ],
+        )
+        _append_paragraph_entry(lines, para, 1)
+        rendered = "\n".join(lines)
+        assert "Figure usage: fig:key (analyze)" in rendered
+        assert "Polarization trajectory split." in rendered
 
 
 # ============================= FEATURE 3 STAGE 2 ===========================
@@ -425,6 +475,21 @@ class TestInjectFloatRefs:
         latex = "Plain text without markers."
         result = inject_float_refs(latex, [], [])
         assert result == latex
+
+    def test_repairs_dangling_figure_reference_slot(self):
+        from src.agents.shared.table_converter import inject_float_refs
+
+        latex = "Our initial visualizations in demonstrate how the mechanism shifts behavior."
+        result = inject_float_refs(latex, ["fig:arch"], [])
+        assert "Figure~\\ref{fig:arch}" in result
+        assert "in demonstrate" not in result
+
+    def test_appends_missing_table_reference_when_writer_drops_marker(self):
+        from src.agents.shared.table_converter import inject_float_refs
+
+        latex = "The quantitative comparison supports the main claim"
+        result = inject_float_refs(latex, [], ["tab:results"])
+        assert result.endswith("See Table~\\ref{tab:results}.")
 
     def test_cleans_orphan_markers(self):
         from src.agents.shared.table_converter import inject_float_refs

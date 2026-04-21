@@ -216,7 +216,6 @@ class LogicChecker(FeedbackChecker):
                     {"role": "user", "content": user_content},
                 ],
                 temperature=0.2,
-                max_tokens=2000,
             )
             raw_output = response.choices[0].message.content or ""
             result = self._parse_llm_response(raw_output)

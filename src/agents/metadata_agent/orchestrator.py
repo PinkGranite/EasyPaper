@@ -407,7 +407,7 @@ class ReviewOrchestrator:
             # Compile PDF and run VLM review if enabled
             compile_succeeded = False
             last_compiled_fingerprint = self.host._executor._get_sections_fingerprint(generated_sections)
-            if compile_pdf and template_path and paper_dir:
+            if compile_pdf and paper_dir:
                 iteration_dir = paper_dir / f"iteration_{review_iterations:02d}"
                 iteration_dir.mkdir(parents=True, exist_ok=True)
                 print(f"[ReviewLoop] PDF output dir: {iteration_dir}")
@@ -722,6 +722,24 @@ class ReviewOrchestrator:
                 actions_taken = sorted(
                     reviewer_revised_sections | post_compile_revised
                 )
+                # Outer review remains authoritative for paper-level acceptance.
+                # Local mini-review receipts are merged here only so lifecycle
+                # tracking can distinguish local repair from unresolved escalation.
+                local_responses = (
+                    memory.consume_local_writer_responses()
+                    if memory is not None else {
+                        "writer_response_section": [],
+                        "writer_response_paragraph": [],
+                    }
+                )
+                iteration_writer_response_section = (
+                    list(local_responses.get("writer_response_section", []))
+                    + iteration_writer_response_section
+                )
+                iteration_writer_response_paragraph = (
+                    list(local_responses.get("writer_response_paragraph", []))
+                    + iteration_writer_response_paragraph
+                )
                 lifecycle_result = memory.update_issue_lifecycle(
                     iteration=review_iterations,
                     hierarchical_feedbacks=[
@@ -829,7 +847,7 @@ class ReviewOrchestrator:
         # =====================================================================
         # Final compilation pass
         # =====================================================================
-        if compile_pdf and template_path and paper_dir:
+        if compile_pdf and paper_dir:
             final_fp = self.host._executor._get_sections_fingerprint(generated_sections)
             if final_fp != last_compiled_fingerprint:
                 print("[MetaDataAgent] Final pass: content changed since last compile — recompiling")
@@ -1057,7 +1075,6 @@ class ReviewOrchestrator:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,
-                max_tokens=500,
             )
             raw = response.choices[0].message.content or ""
             raw = raw.strip()
@@ -1293,7 +1310,6 @@ class ReviewOrchestrator:
                     {"role": "user", "content": json.dumps({"tasks": task_payload}, ensure_ascii=False)},
                 ],
                 temperature=0.2,
-                max_tokens=1800,
             )
             raw = response.choices[0].message.content or ""
             cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip())
@@ -1437,7 +1453,6 @@ class ReviewOrchestrator:
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 ],
                 temperature=0.2,
-                max_tokens=1200,
             )
             raw = response.choices[0].message.content or ""
             cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip())

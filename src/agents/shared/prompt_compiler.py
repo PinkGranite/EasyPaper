@@ -394,6 +394,7 @@ def _append_paragraph_entry(lines: list, para: Any, idx: int) -> None:
     supporting = getattr(para, "supporting_points", [])
     refs = getattr(para, "references_to_cite", [])
     fig_refs = getattr(para, "figures_to_reference", [])
+    figure_usages = getattr(para, "figure_usages", [])
     tbl_refs = getattr(para, "tables_to_reference", [])
 
     lines.append(f"**Paragraph {idx}** (role: {role}, ~{sents} sentences):")
@@ -405,9 +406,74 @@ def _append_paragraph_entry(lines: list, para: Any, idx: int) -> None:
         lines.append(f"  - Cite: {', '.join(refs)}")
     if fig_refs:
         lines.append(f"  - Reference figures: {', '.join(fig_refs)}")
+    if figure_usages:
+        for usage in figure_usages:
+            fig_id = getattr(usage, "figure_id", "")
+            role = getattr(usage, "rhetorical_role", "reference")
+            summary = getattr(usage, "what_it_shows", "") or getattr(usage, "supported_claim", "")
+            if fig_id:
+                line = f"  - Figure usage: {fig_id} ({role})"
+                if summary:
+                    line += f" — {summary}"
+                lines.append(line)
     if tbl_refs:
         lines.append(f"  - Reference tables: {', '.join(tbl_refs)}")
     lines.append("")
+
+
+def _format_figure_reference_briefs(paragraph_plan: Any) -> str:
+    """Render paragraph-owned figure semantics for prompt consumption."""
+    usages = getattr(paragraph_plan, "figure_usages", []) or []
+    if not usages:
+        return ""
+
+    lines = ["\n### Figure Reference Briefs"]
+    lines.append(
+        "- Reference a figure only when it directly supports this paragraph's local claim."
+    )
+    lines.append(
+        "- Multiple references are allowed only when they serve distinct paragraph-level rhetorical roles."
+    )
+    lines.append(
+        "- Place the figure reference at the sentence where the figure provides evidence, not as a generic aside."
+    )
+    for usage in usages:
+        fig_id = getattr(usage, "figure_id", "")
+        if not fig_id:
+            continue
+        mode = getattr(usage, "mode", "reference")
+        rhetorical_role = getattr(usage, "rhetorical_role", "reference")
+        semantic_role = getattr(usage, "semantic_role", "")
+        what_it_shows = getattr(usage, "what_it_shows", "")
+        supported_claim = getattr(usage, "supported_claim", "")
+        caption = getattr(usage, "caption", "")
+        caption_guidance = getattr(usage, "caption_guidance", "")
+        must_appear = getattr(usage, "must_appear", False)
+
+        lines.append(f"- **{fig_id}**")
+        lines.append(f"  - mode: {mode}")
+        lines.append(f"  - rhetorical role: {rhetorical_role}")
+        if rhetorical_role == "introduce":
+            lines.append("  - usage rule: introduce the figure where it first becomes relevant to the section.")
+        elif rhetorical_role == "analyze":
+            lines.append("  - usage rule: cite the figure when reading evidence or trends from it.")
+        elif rhetorical_role == "compare":
+            lines.append("  - usage rule: cite the figure when contrasting it against another claim or figure.")
+        elif rhetorical_role == "support":
+            lines.append("  - usage rule: cite the figure where it directly supports the paragraph's main statement.")
+        if semantic_role:
+            lines.append(f"  - semantic role: {semantic_role}")
+        if caption:
+            lines.append(f"  - caption: {caption}")
+        if what_it_shows:
+            lines.append(f"  - what it shows: {what_it_shows}")
+        if supported_claim:
+            lines.append(f"  - supported claim: {supported_claim}")
+        if caption_guidance:
+            lines.append(f"  - caption guidance: {caption_guidance}")
+        if must_appear:
+            lines.append("  - required: this figure must be referenced in this paragraph")
+    return "\n".join(lines)
 
 
 def _format_structure_quality_contract(section_type: str, section_plan: Any) -> str:
@@ -1481,6 +1547,7 @@ def compile_paragraph_prompt(
     approx_sentences = getattr(paragraph_plan, "effective_sentence_count", 5)
     refs_to_cite = getattr(paragraph_plan, "references_to_cite", [])
     figs_to_ref = getattr(paragraph_plan, "figures_to_reference", [])
+    figure_usage_briefs = _format_figure_reference_briefs(paragraph_plan)
     tables_to_ref = getattr(paragraph_plan, "tables_to_reference", [])
 
     prompt_parts: List[str] = []
@@ -1522,6 +1589,8 @@ def compile_paragraph_prompt(
         prompt_parts.append(f"\n**Must cite**: {', '.join(refs_to_cite)}")
     if figs_to_ref:
         prompt_parts.append(f"**Reference figures**: {', '.join(figs_to_ref)}")
+    if figure_usage_briefs:
+        prompt_parts.append(figure_usage_briefs)
     if tables_to_ref:
         prompt_parts.append(f"**Reference tables**: {', '.join(tables_to_ref)}")
 
@@ -1601,6 +1670,7 @@ def compile_core_prompt(
     approx_sentences = getattr(paragraph_plan, "effective_sentence_count",
                                getattr(paragraph_plan, "approx_sentences", 5))
     figs_to_ref = getattr(paragraph_plan, "figures_to_reference", [])
+    figure_usage_briefs = _format_figure_reference_briefs(paragraph_plan)
     tables_to_ref = getattr(paragraph_plan, "tables_to_reference", [])
 
     parts: List[str] = []
@@ -1634,6 +1704,9 @@ def compile_core_prompt(
         for i, snippet in enumerate(evidence_snippets):
             truncated = _truncate_text(snippet, 400)
             parts.append(f"{i + 1}. {truncated}")
+
+    if figure_usage_briefs:
+        parts.append(figure_usage_briefs)
 
     if section_context:
         parts.append(

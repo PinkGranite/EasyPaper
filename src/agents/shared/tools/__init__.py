@@ -122,7 +122,6 @@ def _inject_llm_refine(memory, reviewer) -> None:
                     },
                 ],
                 temperature=0.3,
-                max_tokens=300,
             )
             return response.choices[0].message.content or ""
 

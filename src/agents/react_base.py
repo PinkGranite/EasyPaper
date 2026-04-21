@@ -80,7 +80,7 @@ class ReActAgent(BaseAgent):
         tool_names: Optional[List[str]] = None,
         max_iterations: Optional[int] = None,
         temperature: float = 0.7,
-        max_tokens: int = 4000,
+        max_tokens: Optional[int] = None,
         model_name: Optional[str] = None,
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """
@@ -100,7 +100,7 @@ class ReActAgent(BaseAgent):
             - `max_iterations` (int, optional): Maximum ReAct loop iterations.
               Defaults to config value or 5.
             - `temperature` (float): LLM temperature. Default 0.7.
-            - `max_tokens` (int): Max tokens for LLM response. Default 4000.
+            - `max_tokens` (int, optional): Max tokens for LLM response. None = unlimited.
             - `model_name` (str, optional): Override model name.
 
         - **Returns**:
@@ -133,13 +133,16 @@ class ReActAgent(BaseAgent):
             print(f"[ReActAgent] ── Iteration {iteration}/{max_iter} ──")
 
             try:
-                response = await self.client.chat.completions.create(
-                    model=model,
-                    messages=working_messages,
-                    tools=openai_tools,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
+                call_kwargs: Dict[str, Any] = {
+                    "model": model,
+                    "messages": working_messages,
+                    "tools": openai_tools,
+                    "temperature": temperature,
+                }
+                if max_tokens is not None:
+                    call_kwargs["max_tokens"] = max_tokens
+
+                response = await self.client.chat.completions.create(**call_kwargs)
                 llm_elapsed = time.time() - iter_start
                 print(f"[ReActAgent]   LLM responded in {llm_elapsed:.1f}s")
             except Exception as e:
@@ -228,7 +231,7 @@ class ReActAgent(BaseAgent):
         self,
         messages: List[Dict[str, Any]],
         temperature: float = 0.7,
-        max_tokens: int = 4000,
+        max_tokens: Optional[int] = None,
         model_name: Optional[str] = None,
     ) -> Tuple[str, List[Dict[str, Any]]]:
         """
@@ -241,7 +244,7 @@ class ReActAgent(BaseAgent):
         - **Args**:
             - `messages` (List[dict]): Conversation messages.
             - `temperature` (float): LLM temperature.
-            - `max_tokens` (int): Max tokens.
+            - `max_tokens` (int, optional): Max tokens. None = unlimited.
             - `model_name` (str, optional): Override model name.
 
         - **Returns**:
@@ -249,12 +252,15 @@ class ReActAgent(BaseAgent):
         """
         model = model_name or self.model_name
         try:
-            response = await self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+            call_kwargs: Dict[str, Any] = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+            }
+            if max_tokens is not None:
+                call_kwargs["max_tokens"] = max_tokens
+
+            response = await self.client.chat.completions.create(**call_kwargs)
             content = response.choices[0].message.content or ""
             return content, messages + [{"role": "assistant", "content": content}]
         except Exception as e:

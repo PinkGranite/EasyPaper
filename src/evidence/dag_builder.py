@@ -106,15 +106,18 @@ class DAGBuilder:
           Must have `chat.completions.create` method.
     """
 
-    def __init__(self, llm_client: Optional[Any] = None):
+    def __init__(self, llm_client: Optional[Any] = None, model_name: Optional[str] = None):
         """
-        Initialize DAGBuilder with optional LLM client.
+        Initialize DAGBuilder with optional LLM client and model name.
 
         - **Args**:
             - `llm_client` (Any, optional): Chat completions client for LLM-based
               semantic matching. If not provided, only heuristic matching is used.
+            - `model_name` (str, optional): Model name for LLM-based matching.
+              Required when ``llm_client`` is provided.
         """
         self._llm = llm_client
+        self._model_name = model_name
 
     async def build(
         self,
@@ -174,7 +177,7 @@ class DAGBuilder:
         try:
             from .llm_dag_builder import LLMDAGBuilder
 
-            llm_builder = LLMDAGBuilder(self._llm)
+            llm_builder = LLMDAGBuilder(self._llm, model_name=self._model_name)
 
             # Get paper topic from research context
             paper_topic = research_context.get("research_area", "")

@@ -197,7 +197,6 @@ class CoreRefAnalyzer:
                     {"role": "user", "content": user1},
                 ],
                 temperature=0.2,
-                max_tokens=2500,
             )
             raw = resp.choices[0].message.content or ""
             parsed = _safe_load_json(raw, expected=dict)
@@ -249,7 +248,6 @@ class CoreRefAnalyzer:
                         {"role": "user", "content": user2},
                     ],
                     temperature=0.2,
-                    max_tokens=1200,
                 )
                 raw2 = resp2.choices[0].message.content or ""
                 p2 = _safe_load_json(raw2, expected=dict)

@@ -253,7 +253,6 @@ class ReviewerAgent(BaseAgent):
                     },
                 ],
                 temperature=0.3,
-                max_tokens=300,
             )
             return response.choices[0].message.content or "No answer generated."
         except Exception as e:

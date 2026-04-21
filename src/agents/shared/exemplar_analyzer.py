@@ -182,7 +182,6 @@ class ExemplarAnalyzer:
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,
-            max_tokens=2000,
         )
         raw = resp.choices[0].message.content or ""
         parsed = _safe_parse_json(raw)

@@ -6,7 +6,7 @@ Claude VLM Provider
 """
 import json
 import logging
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from .base import VLMProvider
 from ..models import VLMResponse
@@ -28,22 +28,22 @@ class ClaudeVLM(VLMProvider):
         self,
         api_key: str,
         model: str = "claude-3-5-sonnet-20241022",
-        max_tokens: int = 2000,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.1,
         **kwargs
     ):
         """
         Initialize Claude VLM provider
-        
+
         Args:
             api_key: Anthropic API key
             model: Model name
-            max_tokens: Maximum tokens in response
+            max_tokens: Maximum tokens in response (None = unlimited)
             temperature: Sampling temperature
             **kwargs: Additional options
         """
         super().__init__(api_key=api_key, model=model, **kwargs)
-        
+
         self.max_tokens = max_tokens
         self.temperature = temperature
         
@@ -81,10 +81,9 @@ class ClaudeVLM(VLMProvider):
             media_type = self.get_image_media_type(image_data)
             
             # Build message with image
-            message = await self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                messages=[
+            message_kwargs: Dict[str, Any] = {
+                "model": self.model,
+                "messages": [
                     {
                         "role": "user",
                         "content": [
@@ -103,7 +102,11 @@ class ClaudeVLM(VLMProvider):
                         ]
                     }
                 ],
-            )
+            }
+            if self.max_tokens is not None:
+                message_kwargs["max_tokens"] = self.max_tokens
+
+            message = await self.client.messages.create(**message_kwargs)
             
             # Extract response
             content = message.content[0].text if message.content else ""

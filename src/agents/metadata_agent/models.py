@@ -249,7 +249,7 @@ class PaperGenerationRequest(BaseModel):
         - `template_path` (str, optional): Path to .zip template file
         - `style_guide` (str, optional): Writing style guide
         - `target_pages` (int, optional): Target page count
-        - `compile_pdf` (bool): Whether to compile PDF (default: True if template provided)
+        - `compile_pdf` (bool): Whether to compile PDF
         - `figures_source_dir` (str, optional): Directory containing figure files
         - `save_output` (bool): Whether to save output to disk
         - `output_dir` (str, optional): Directory for output files
@@ -278,7 +278,7 @@ class PaperGenerationRequest(BaseModel):
     target_pages: Optional[int] = None       # Target page count
     
     # Compilation options
-    compile_pdf: bool = True                 # Compile to PDF if template provided
+    compile_pdf: bool = True                 # Compile to PDF
     figures_source_dir: Optional[str] = None # Directory with figure files (legacy)
     
     # Review options

@@ -293,7 +293,6 @@ class SkillGenerator:
                 {"role": "user", "content": user_message},
             ],
             temperature=0.3,
-            max_tokens=2000,
         )
 
         raw = response.choices[0].message.content or ""

@@ -299,7 +299,6 @@ class ConflictResolver:
                             },
                         ],
                         temperature=0.1,
-                        max_tokens=300,
                     )
                     raw = response.choices[0].message.content or ""
                     cleaned = re.sub(r"^```(?:json)?\s*\n?", "", raw.strip())
