@@ -235,8 +235,12 @@ remove_item() {
 
 # ---- enumerate items ------------------------------------------------------
 
-mapfile -t SKILL_DIRS < <(find "$SKILLS_SRC" -mindepth 1 -maxdepth 1 -type d | sort)
-mapfile -t COMMAND_FILES < <(find "$COMMANDS_SRC" -mindepth 1 -maxdepth 1 -name '*.md' | sort)
+# mapfile replacement for bash 3.2 compatibility
+SKILL_DIRS=()
+while IFS= read -r d; do SKILL_DIRS+=("$d"); done < <(find "$SKILLS_SRC" -mindepth 1 -maxdepth 1 -type d | sort)
+
+COMMAND_FILES=()
+while IFS= read -r f; do COMMAND_FILES+=("$f"); done < <(find "$COMMANDS_SRC" -mindepth 1 -maxdepth 1 -name '*.md' | sort)
 
 if [[ ${#SKILL_DIRS[@]} -eq 0 && ${#COMMAND_FILES[@]} -eq 0 ]]; then
   err "no skills or commands found under $PLUGIN_ROOT"
