@@ -6,7 +6,12 @@ calls WriterAgent.generate_paragraph with the right parameter names,
 handles no-claim paragraphs, and uses _all_paragraphs().
 """
 import inspect
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 import pytest
+from src.agents.metadata_agent.metadata_agent import MetaDataAgent
+from src.agents.planner_agent.models import FigureUsagePlan, ParagraphPlan
+from src.agents.shared.session_memory import SessionMemory
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -151,3 +156,150 @@ class TestGenerateParagraphSignature:
             f"_generate_section_decomposed passes forbidden kwargs to "
             f"generate_paragraph: {found_forbidden}"
         )
+
+
+class TestRequiredFigureUsageValidation:
+
+    def test_accepts_writer_authored_float_marker(self):
+        para = ParagraphPlan(
+            key_point="Discuss the main figure",
+            figure_usages=[
+                FigureUsagePlan(
+                    figure_id="fig:arch",
+                    must_appear=True,
+                    supported_claim="The architecture motivates the paragraph.",
+                ),
+            ],
+        )
+        passed, feedback, missing = MetaDataAgent._validate_required_figure_usages(
+            raw_latex="As shown in [FLOAT:fig:arch], the architecture is modular.",
+            final_latex="As shown in Figure~\\ref{fig:arch}, the architecture is modular.",
+            paragraph_plan=para,
+        )
+        assert passed is True
+        assert feedback == ""
+        assert missing == []
+
+    def test_rejects_auto_appended_ref_without_writer_marker(self):
+        para = ParagraphPlan(
+            key_point="Discuss the main figure",
+            figure_usages=[
+                FigureUsagePlan(
+                    figure_id="fig:arch",
+                    must_appear=True,
+                    supported_claim="The architecture motivates the paragraph.",
+                ),
+            ],
+        )
+        passed, feedback, missing = MetaDataAgent._validate_required_figure_usages(
+            raw_latex="As visualized in, the architecture is modular.",
+            final_latex="As visualized in Figure~\\ref{fig:arch}, the architecture is modular.",
+            paragraph_plan=para,
+        )
+        assert passed is False
+        assert "fig:arch" in missing
+        assert "[FLOAT:fig:arch]" in feedback
+        assert "auto-appended references" in feedback or "dangling phrases" in feedback
+
+
+class TestLocalMiniReview:
+
+    @pytest.mark.asyncio
+    async def test_local_mini_review_fixes_missing_figure_ref_in_place(self):
+        agent = MetaDataAgent.__new__(MetaDataAgent)
+        agent._writer = SimpleNamespace(
+            rewrite_content=AsyncMock(return_value="As shown in [FLOAT:fig:arch], the architecture is modular.")
+        )
+        para = ParagraphPlan(
+            figure_usages=[
+                FigureUsagePlan(
+                    figure_id="fig:arch",
+                    must_appear=True,
+                    supported_claim="The architecture motivates the paragraph.",
+                )
+            ]
+        )
+        memory = SessionMemory()
+
+        result = await agent._run_local_mini_review(
+            section_type="method",
+            paragraph_index=0,
+            paragraph_plan=para,
+            raw_latex="As visualized in, the architecture is modular.",
+            final_latex="As visualized in, the architecture is modular.",
+            figs_to_ref=["fig:arch"],
+            tables_to_ref=[],
+            attempt=0,
+            max_attempts=2,
+            memory=memory,
+        )
+
+        assert result["status"] == "fixed_locally"
+        assert "Figure~\\ref{fig:arch}" in result["latex"]
+        assert memory.local_review_events[-1].disposition == "fixed_locally"
+
+    @pytest.mark.asyncio
+    async def test_local_mini_review_requests_retry_when_fix_is_still_invalid(self):
+        agent = MetaDataAgent.__new__(MetaDataAgent)
+        agent._writer = SimpleNamespace(
+            rewrite_content=AsyncMock(return_value="As visualized in, the architecture is modular.")
+        )
+        para = ParagraphPlan(
+            figure_usages=[
+                FigureUsagePlan(
+                    figure_id="fig:arch",
+                    must_appear=True,
+                    supported_claim="The architecture motivates the paragraph.",
+                )
+            ]
+        )
+        memory = SessionMemory()
+
+        result = await agent._run_local_mini_review(
+            section_type="method",
+            paragraph_index=0,
+            paragraph_plan=para,
+            raw_latex="As visualized in, the architecture is modular.",
+            final_latex="As visualized in, the architecture is modular.",
+            figs_to_ref=["fig:arch"],
+            tables_to_ref=[],
+            attempt=0,
+            max_attempts=2,
+            memory=memory,
+        )
+
+        assert result["status"] == "retry_required"
+        assert memory.local_review_events[-1].disposition == "retry_required"
+
+    @pytest.mark.asyncio
+    async def test_local_mini_review_escalates_on_final_failed_attempt(self):
+        agent = MetaDataAgent.__new__(MetaDataAgent)
+        agent._writer = SimpleNamespace(
+            rewrite_content=AsyncMock(return_value="As visualized in, the architecture is modular.")
+        )
+        para = ParagraphPlan(
+            figure_usages=[
+                FigureUsagePlan(
+                    figure_id="fig:arch",
+                    must_appear=True,
+                    supported_claim="The architecture motivates the paragraph.",
+                )
+            ]
+        )
+        memory = SessionMemory()
+
+        result = await agent._run_local_mini_review(
+            section_type="method",
+            paragraph_index=0,
+            paragraph_plan=para,
+            raw_latex="As visualized in, the architecture is modular.",
+            final_latex="As visualized in, the architecture is modular.",
+            figs_to_ref=["fig:arch"],
+            tables_to_ref=[],
+            attempt=1,
+            max_attempts=2,
+            memory=memory,
+        )
+
+        assert result["status"] == "escalate"
+        assert memory.local_review_events[-1].disposition == "escalate"

@@ -1617,16 +1617,63 @@ def inject_float_refs(
     """
     known_ids = set(figures_to_ref or []) | set(tables_to_ref or [])
     fig_set = set(figures_to_ref or [])
+    table_set = set(tables_to_ref or [])
+
+    def _ref_text(float_id: str) -> str:
+        kind = "Figure" if float_id in fig_set else "Table"
+        return f"{kind}~\\ref{{{float_id}}}"
 
     def _replace(m: re.Match) -> str:
         fid = m.group(1)
-        if fid in fig_set:
-            return f"Figure~\\ref{{{fid}}}"
         if fid in known_ids:
-            return f"Table~\\ref{{{fid}}}"
+            return _ref_text(fid)
         return ""
 
+    def _has_explicit_ref(text: str, float_id: str) -> bool:
+        return f"\\ref{{{float_id}}}" in text
+
+    def _repair_dangling_slot(text: str, float_id: str) -> str:
+        ref_text = _ref_text(float_id)
+
+        patterns = [
+            (
+                re.compile(
+                    r'(?P<prefix>\b(?:shown|illustrated|visualized|depicted|captured|'
+                    r'reported|detailed|summarized|presented|compared|displayed|listed|'
+                    r'tabulated)\s+in)(?P<suffix>[,.;:])',
+                    re.IGNORECASE,
+                ),
+                lambda m: f"{m.group('prefix')} {ref_text}{m.group('suffix')}",
+            ),
+            (
+                re.compile(
+                    r'(?P<prefix>\bin)\s+'
+                    r'(?=(?:demonstrate|demonstrates|show|shows|illustrate|illustrates|'
+                    r'highlight|highlights|reveal|reveals|detail|details|compare|compares|'
+                    r'capture|captures|present|presents)\b)',
+                    re.IGNORECASE,
+                ),
+                lambda m: f"{m.group('prefix')} {ref_text} ",
+            ),
+        ]
+
+        for pattern, replacement in patterns:
+            updated, count = pattern.subn(replacement, text, count=1)
+            if count:
+                return updated
+        return text
+
     result = _FLOAT_MARKER_RE.sub(_replace, latex)
+    for float_id in list(fig_set) + list(table_set):
+        if _has_explicit_ref(result, float_id):
+            continue
+        repaired = _repair_dangling_slot(result, float_id)
+        if repaired != result:
+            result = repaired
+            continue
+        suffix = "" if result.rstrip().endswith((".", "!", "?")) else "."
+        joiner = "" if not result.strip() else " "
+        result = f"{result.rstrip()}{suffix}{joiner}See {_ref_text(float_id)}."
     result = re.sub(r'\s{2,}', ' ', result)
     return result
 

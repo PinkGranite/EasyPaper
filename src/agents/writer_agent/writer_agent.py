@@ -12,7 +12,6 @@ Writer Agent
 """
 from langchain_core.messages import AnyMessage
 from typing_extensions import TypedDict, Annotated, Optional
-from langgraph.graph import StateGraph, START, END
 import operator
 import re
 import logging
@@ -227,47 +226,6 @@ class WriterAgent(ReActAgent):
                 max_react_iterations=3,
             )
         super().__init__(config, tools_config)
-        self.agent = self.init_agent()
-
-    def init_agent(self):
-        """
-        Initialize the agent workflow graph with iterative review.
-        
-        .. deprecated::
-            This LangGraph workflow is no longer used. All generation now goes
-            through the decomposed 3-stage pipeline (generate_core_content ->
-            inject_citations -> inject_float_refs). Kept for backward
-            compatibility with external callers only.
-        """
-        agent_builder = StateGraph(WriterAgentState)
-        
-        # Add nodes
-        agent_builder.add_node("generate_content", self.generate_content)
-        agent_builder.add_node("mini_review", self.mini_review)
-        agent_builder.add_node("revise_content", self.revise_content)
-        agent_builder.add_node("extract_references", self.extract_references)
-        
-        # Add edges
-        agent_builder.add_edge(START, "generate_content")
-        agent_builder.add_edge("generate_content", "mini_review")
-        
-        # Conditional edge after mini_review
-        agent_builder.add_conditional_edges(
-            "mini_review",
-            self._should_revise,
-            {
-                "revise": "revise_content",
-                "done": "extract_references",
-            }
-        )
-        
-        # After revision, go back to review
-        agent_builder.add_edge("revise_content", "mini_review")
-        
-        # Final extraction leads to end
-        agent_builder.add_edge("extract_references", END)
-        
-        return agent_builder.compile()
 
     def _should_revise(self, state: WriterAgentState) -> str:
         """
@@ -770,7 +728,7 @@ class WriterAgent(ReActAgent):
         peers: Optional[Dict[str, Any]] = None,
         mode: str = "draft",
         current_content: Optional[str] = None,
-    ):
+        ):
         """
         .. deprecated::
             All section generation now uses the decomposed 3-stage pipeline.
@@ -796,7 +754,7 @@ class WriterAgent(ReActAgent):
         - **Returns**:
             - `dict`: Generated content and review results
         """
-        initial_state = {
+        state: WriterAgentState = {
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
             "section_type": section_type,
@@ -823,8 +781,41 @@ class WriterAgent(ReActAgent):
             "mode": mode,
             "current_content": current_content,
         }
+        generated = await self.generate_content(state)
+        state.update(generated)
 
-        return await self.agent.ainvoke(initial_state)
+        while True:
+            if state.get("enable_review", True):
+                review_update = await self.mini_review(state)
+                state.update({
+                    k: v for k, v in review_update.items()
+                    if k not in {"review_history"}
+                })
+                state["review_history"] = (
+                    list(state.get("review_history", []))
+                    + list(review_update.get("review_history", []))
+                )
+
+                if self._should_revise(state) == "revise":
+                    revised = await self.revise_content(state)
+                    state.update({
+                        k: v for k, v in revised.items()
+                        if k not in {"writer_response_section", "writer_response_paragraph"}
+                    })
+                    state["writer_response_section"] = (
+                        list(state.get("writer_response_section", []))
+                        + list(revised.get("writer_response_section", []))
+                    )
+                    state["writer_response_paragraph"] = (
+                        list(state.get("writer_response_paragraph", []))
+                        + list(revised.get("writer_response_paragraph", []))
+                    )
+                    continue
+            break
+
+        extracted = await self.extract_references(state)
+        state.update(extracted)
+        return state
 
     @property
     def name(self) -> str:
@@ -1165,3 +1156,53 @@ class WriterAgent(ReActAgent):
         except Exception as e:
             logger.error("writer.inject_citations error: %s", str(e))
             return CitationEditResult(raw_response=str(e))
+
+    # -----------------------------------------------------------------
+    # Direct rewrite helper for migrated internal revision flows
+    # -----------------------------------------------------------------
+
+    async def rewrite_content(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        section_type: str,
+        max_retries: int = 2,
+    ) -> str:
+        """
+        Rewrite content directly without using the deprecated LangGraph writer flow.
+        - **Description**:
+            - Used by internal revision paths that need direct rewrite behavior
+              instead of the decomposed draft/citation pipeline.
+            - Keeps router/backward-compatibility behavior separate from the
+              active internal execution path.
+
+        - **Args**:
+            - `system_prompt` (str): Rewrite instructions for the model.
+            - `user_prompt` (str): Concrete content and revision request.
+            - `section_type` (str): Section identifier for logging.
+            - `max_retries` (int): Retry count.
+
+        - **Returns**:
+            - `str`: Rewritten content, or empty string on failure.
+        """
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.3,
+                )
+                content = (response.choices[0].message.content or "").strip()
+                if content:
+                    return content
+            except Exception as e:
+                logger.error(
+                    "writer.rewrite_content error attempt=%d section=%s: %s",
+                    attempt, section_type, str(e),
+                )
+        return ""

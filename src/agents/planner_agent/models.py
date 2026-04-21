@@ -187,6 +187,26 @@ class SentencePlan(BaseModel):
 # Paragraph-level models
 # =========================================================================
 
+class FigureUsagePlan(BaseModel):
+    """
+    Executable paragraph-level contract for figure usage.
+    - **Description**:
+        - Carries the figure semantics the active writer path needs.
+        - May be planned directly or derived from section-level placements plus
+          metadata figure specs before prompt compilation.
+    """
+    figure_id: str
+    mode: str = "reference"  # define | reference
+    rhetorical_role: str = "reference"  # introduce | analyze | compare | reference
+    claim_binding: str = ""
+    semantic_role: str = ""
+    what_it_shows: str = ""
+    supported_claim: str = ""
+    owner_section: str = ""
+    must_appear: bool = False
+    caption: str = ""
+    caption_guidance: str = ""
+
 class ParagraphPlan(BaseModel):
     """
     Planning details for a single paragraph.
@@ -203,6 +223,7 @@ class ParagraphPlan(BaseModel):
     role: str = "evidence"
     references_to_cite: List[str] = Field(default_factory=list)
     figures_to_reference: List[str] = Field(default_factory=list)
+    figure_usages: List[FigureUsagePlan] = Field(default_factory=list)
     tables_to_reference: List[str] = Field(default_factory=list)
     # Evidence DAG bindings (populated by DAGBuilder)
     claim_id: str = ""

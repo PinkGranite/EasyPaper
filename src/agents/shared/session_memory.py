@@ -188,6 +188,19 @@ class AgentLogEntry(BaseModel):
     details: Dict[str, Any] = Field(default_factory=dict)
 
 
+class LocalReviewEvent(BaseModel):
+    """Structured local mini-review event for paragraph/section repair history."""
+    timestamp: str = ""
+    section_type: str
+    target_id: str
+    level: str  # section | paragraph
+    disposition: str  # fixed_locally | retry_required | escalate
+    issue_type: str
+    message: str = ""
+    paragraph_index: Optional[int] = None
+    evidence: Dict[str, Any] = Field(default_factory=dict)
+
+
 # =========================================================================
 # Session Memory
 # =========================================================================
@@ -207,6 +220,9 @@ class SessionMemory:
         self.contributions: List[str] = []
         self.review_history: List[ReviewRecord] = []
         self.agent_logs: List[AgentLogEntry] = []
+        self.local_review_events: List[LocalReviewEvent] = []
+        self._pending_local_writer_response_section: List[Dict[str, Any]] = []
+        self._pending_local_writer_response_paragraph: List[Dict[str, Any]] = []
         self.issue_store: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
@@ -262,6 +278,86 @@ class SessionMemory:
         if not record.timestamp:
             record.timestamp = datetime.now().isoformat()
         self.review_history.append(record)
+
+    def add_local_review_event(
+        self,
+        *,
+        section_type: str,
+        target_id: str,
+        level: str,
+        disposition: str,
+        issue_type: str,
+        message: str = "",
+        paragraph_index: Optional[int] = None,
+        evidence: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Record a structured local mini-review event and queue compatibility receipts.
+        """
+        event = LocalReviewEvent(
+            timestamp=datetime.now().isoformat(),
+            section_type=section_type,
+            target_id=target_id,
+            level=level,
+            disposition=disposition,
+            issue_type=issue_type,
+            message=message,
+            paragraph_index=paragraph_index,
+            evidence=evidence or {},
+        )
+        self.local_review_events.append(event)
+
+        receipt = {
+            "target_id": target_id,
+            "section_type": section_type,
+            "paragraph_index": paragraph_index,
+            "instruction": message,
+            "constraints": {"source": "local_mini_review"},
+            "disposition": disposition,
+            "evidence": {"source": "local_mini_review", "issue_type": issue_type, **(evidence or {})},
+        }
+        if level == "section":
+            self._pending_local_writer_response_section.append(receipt)
+        else:
+            self._pending_local_writer_response_paragraph.append(receipt)
+
+        self.log(
+            "metadata",
+            "local_mini_review",
+            disposition,
+            narrative=(
+                f"Local mini-review {disposition} for {target_id}: "
+                f"{message[:160]}"
+            ),
+            target_id=target_id,
+            issue_type=issue_type,
+            paragraph_index=paragraph_index,
+            evidence=evidence or {},
+        )
+
+    def consume_local_writer_responses(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Return and clear queued local mini-review receipts."""
+        section = list(self._pending_local_writer_response_section)
+        paragraph = list(self._pending_local_writer_response_paragraph)
+        self._pending_local_writer_response_section = []
+        self._pending_local_writer_response_paragraph = []
+        return {
+            "writer_response_section": section,
+            "writer_response_paragraph": paragraph,
+        }
+
+    def get_recent_local_review_summary(self, limit: int = 8) -> str:
+        """Return a compact text summary of recent local mini-review activity."""
+        recent = self.local_review_events[-limit:]
+        if not recent:
+            return ""
+        lines = ["## Recent Local Mini-Review Activity"]
+        for event in reversed(recent):
+            lines.append(
+                f"- [{event.disposition}] {event.target_id} ({event.issue_type})"
+                + (f": {event.message[:160]}" if event.message else "")
+            )
+        return "\n".join(lines)
 
     @staticmethod
     def _make_issue_id(item: Dict[str, Any]) -> str:
@@ -327,6 +423,7 @@ class SessionMemory:
         lifecycle_events: List[Dict[str, Any]] = []
         section_resp = writer_response_section or []
         para_resp = writer_response_paragraph or []
+        resolving_dispositions = {"executed", "no_change", "fixed_locally", "resolved"}
 
         for raw in hierarchical_feedbacks or []:
             if not isinstance(raw, dict):
@@ -377,6 +474,7 @@ class SessionMemory:
             str(r.get("target_id") or r.get("section_type") or "")
             for r in section_resp + para_resp
             if isinstance(r, dict)
+            and str(r.get("disposition", "")).lower() in resolving_dispositions
         }
         reopened_hard = 0
         for issue_id, rec in self.issue_store.items():
@@ -434,6 +532,9 @@ class SessionMemory:
         return {
             "unresolved_issues": unresolved,
             "recent_resolved_issues": resolved,
+            "recent_local_review_events": [
+                e.model_dump() for e in self.local_review_events[-10:]
+            ],
             "issue_store_size": len(all_items),
         }
 
@@ -551,6 +652,9 @@ class SessionMemory:
         parts.append(
             "IMPORTANT: Do NOT regress on issues already fixed in earlier revisions."
         )
+        local_summary = self.get_recent_local_review_summary(limit=6)
+        if local_summary:
+            parts.append(local_summary)
         return "\n".join(parts)
 
     def get_cross_section_summary(self) -> str:
@@ -1032,6 +1136,9 @@ class SessionMemory:
             "contributions": self.contributions,
             "review_history": [r.model_dump() for r in self.review_history],
             "agent_logs": [e.model_dump() for e in self.agent_logs],
+            "local_review_events": [e.model_dump() for e in self.local_review_events],
+            "pending_local_writer_response_section": self._pending_local_writer_response_section,
+            "pending_local_writer_response_paragraph": self._pending_local_writer_response_paragraph,
             "issue_store": self.issue_store,
         }
 
@@ -1056,5 +1163,10 @@ class SessionMemory:
         mem.agent_logs = [
             AgentLogEntry(**e) for e in data.get("agent_logs", [])
         ]
+        mem.local_review_events = [
+            LocalReviewEvent(**e) for e in data.get("local_review_events", [])
+        ]
+        mem._pending_local_writer_response_section = data.get("pending_local_writer_response_section", [])
+        mem._pending_local_writer_response_paragraph = data.get("pending_local_writer_response_paragraph", [])
         mem.issue_store = data.get("issue_store", {})
         return mem

@@ -318,7 +318,7 @@ async def test_execute_generation_save_output_false_skips_writes(
 
 
 @pytest.mark.integration
-async def test_execute_generation_compile_without_template_skips_iteration_outputs(
+async def test_execute_generation_compile_without_template_creates_iteration_outputs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -343,6 +343,17 @@ async def test_execute_generation_compile_without_template_skips_iteration_outpu
     )
     _patch_generation_flow(agent, monkeypatch, mock_orchestration=False)
 
+    async def _fake_compile_pdf(**kwargs: object):
+        output_dir = Path(str(kwargs["output_dir"]))
+        sections_dir = output_dir / "sections"
+        sections_dir.mkdir(parents=True, exist_ok=True)
+        (sections_dir / "introduction.tex").write_text("Introduction content.", encoding="utf-8")
+        (output_dir / "main.tex").write_text("\\input{sections/introduction}", encoding="utf-8")
+        (output_dir / "references.bib").write_text("", encoding="utf-8")
+        return str(output_dir / "main.pdf"), str(output_dir), [], {}
+
+    monkeypatch.setattr(agent, "_compile_pdf", AsyncMock(side_effect=_fake_compile_pdf))
+
     result = await agent.execute_generation(
         plan_result=plan_result,
         enable_review=False,
@@ -352,7 +363,10 @@ async def test_execute_generation_compile_without_template_skips_iteration_outpu
     )
 
     assert result.status == "ok"
-    assert not (tmp_path / "iteration_01").exists()
+    assert (tmp_path / "iteration_01").is_dir()
+    assert (tmp_path / "iteration_01" / "main.tex").is_file()
+    assert (tmp_path / "iteration_01" / "references.bib").is_file()
+    assert (tmp_path / "iteration_01" / "sections" / "introduction.tex").is_file()
     assert not (tmp_path / "iteration_01_final").exists()
 
 

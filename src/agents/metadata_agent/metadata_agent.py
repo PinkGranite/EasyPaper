@@ -87,12 +87,15 @@ from ..writer_agent.section_models import (
 )
 from ..planner_agent.models import (
     PaperPlan,
+    ParagraphPlan,
     SectionPlan,
+    FigureUsagePlan,
     PlanRequest,
     calculate_total_words,
 )
 from ..shared.table_converter import convert_tables, inject_float_refs
 from ..shared.session_memory import SessionMemory, ReviewRecord
+from ..shared.tools import KeyPointCoverageTool
 from ..shared.code_context import (
     CodeContextBuilder,
     format_code_context_for_prompt,
@@ -2979,6 +2982,7 @@ class MetaDataAgent(ReActAgent):
                 section_plan=section_plan,
                 writer_valid_keys=writer_valid_keys,
                 section_title_str=section_title_str,
+                figures=figures,
                 evidence_dag=evidence_dag,
                 memory=memory,
                 emitter=emitter,
@@ -3018,12 +3022,334 @@ class MetaDataAgent(ReActAgent):
     # Decomposed (claim-level) generation helper
     # =========================================================================
 
+    @staticmethod
+    def _validate_required_figure_usages(
+        raw_latex: str,
+        final_latex: str,
+        paragraph_plan: ParagraphPlan,
+    ) -> Tuple[bool, str, List[str]]:
+        """
+        Validate that required figure usages were realized by the writer itself.
+        - **Description**:
+            - A required figure usage is satisfied only when the paragraph
+              contains a real figure reference signal authored in the paragraph
+              output itself: either a ``[FLOAT:fig:id]`` marker or an explicit
+              ``\\ref{fig:id}``.
+            - Late mechanical repair should not turn a semantic miss into a pass.
+
+        - **Returns**:
+            - ``Tuple[bool, str, List[str]]``:
+              ``(passed, feedback_for_retry, missing_figure_ids)``
+        """
+        required_usages = [
+            usage for usage in (getattr(paragraph_plan, "figure_usages", []) or [])
+            if getattr(usage, "must_appear", False)
+        ]
+        if not required_usages:
+            return True, "", []
+
+        raw_latex = raw_latex or ""
+        final_latex = final_latex or ""
+        missing: List[str] = []
+        hints: List[str] = []
+
+        dangling_pattern = re.compile(
+            r'\b(?:shown|illustrated|visualized|depicted|captured|reported|'
+            r'detailed|summarized|presented|compared|displayed|listed|tabulated)\s+in(?=[,.;:])',
+            re.IGNORECASE,
+        )
+
+        for usage in required_usages:
+            fig_id = getattr(usage, "figure_id", "")
+            if not fig_id:
+                continue
+
+            marker_present = f"[FLOAT:{fig_id}]" in raw_latex
+            direct_ref_present = (
+                f"\\ref{{{fig_id}}}" in raw_latex
+                or f"Figure~\\ref{{{fig_id}}}" in raw_latex
+            )
+            final_ref_present = f"Figure~\\ref{{{fig_id}}}" in final_latex
+
+            if marker_present or direct_ref_present:
+                continue
+
+            missing.append(fig_id)
+            semantic_hint = getattr(usage, "supported_claim", "") or getattr(usage, "what_it_shows", "")
+            base = (
+                f"Required figure reference missing for {fig_id}. "
+                f"Insert `[FLOAT:{fig_id}]` exactly where the paragraph discusses this figure."
+            )
+            if semantic_hint:
+                base += f" Figure purpose: {semantic_hint}"
+            if final_ref_present and not marker_present and not direct_ref_present:
+                base += " Do not rely on auto-appended references; author the figure reference in the sentence itself."
+            elif dangling_pattern.search(raw_latex) or dangling_pattern.search(final_latex):
+                base += " Replace dangling phrases like 'as visualized in,' with an explicit figure reference."
+            hints.append(base)
+
+        if missing:
+            return False, "\n".join(hints), missing
+        return True, "", []
+
+    async def _run_local_mini_review(
+        self,
+        *,
+        section_type: str,
+        paragraph_index: int,
+        paragraph_plan: ParagraphPlan,
+        raw_latex: str,
+        final_latex: str,
+        figs_to_ref: List[str],
+        tables_to_ref: List[str],
+        attempt: int,
+        max_attempts: int,
+        memory: Optional[SessionMemory] = None,
+    ) -> Dict[str, Any]:
+        """
+        Run bounded local mini-review for one paragraph in the active decomposed path.
+        - **Description**:
+            - Owns paragraph-local correctness and polish only.
+            - May repair in place, request a retry, or escalate upward.
+            - Must not mutate global plan or cross-section structure.
+        """
+        issues: List[Dict[str, Any]] = []
+
+        figures_ok, figure_feedback, missing_figures = self._validate_required_figure_usages(
+            raw_latex=raw_latex,
+            final_latex=final_latex,
+            paragraph_plan=paragraph_plan,
+        )
+        if not figures_ok:
+            issues.append({
+                "issue_type": "missing_required_figure_ref",
+                "message": figure_feedback,
+                "missing_figures": missing_figures,
+                "repairable": True,
+            })
+
+        key_point = getattr(paragraph_plan, "key_point", "") or ""
+        if key_point:
+            kp_tool = KeyPointCoverageTool([key_point])
+            kp_result = await kp_tool.execute(content=final_latex)
+            coverage = (kp_result.data or {}).get("coverage", 1.0) if kp_result else 1.0
+            if coverage < 1.0:
+                issues.append({
+                    "issue_type": "missing_key_point",
+                    "message": (
+                        "The paragraph does not clearly realize its key point. "
+                        f"Key point: {key_point}"
+                    ),
+                    "repairable": True,
+                })
+
+        if not issues:
+            return {
+                "status": "passed",
+                "latex": final_latex,
+                "feedback": "",
+                "issues": [],
+            }
+
+        repairable = all(bool(issue.get("repairable", False)) for issue in issues)
+        target_id = f"{section_type}.p{paragraph_index}"
+        combined_feedback = "\n".join(issue["message"] for issue in issues if issue.get("message"))
+
+        if repairable:
+            system_prompt = (
+                "You are performing a local mini-review fix for one paragraph.\n"
+                "Only repair paragraph-local issues.\n"
+                "Preserve LaTeX correctness, citations, and the scientific claim.\n"
+                "Return ONLY the revised paragraph text."
+            )
+            user_prompt = (
+                f"Section: {section_type}\n"
+                f"Paragraph index: {paragraph_index}\n"
+                f"Current paragraph:\n{final_latex}\n\n"
+                "Local issues to fix:\n"
+                f"{combined_feedback}\n\n"
+                "Rules:\n"
+                "- Keep the revision local to this paragraph.\n"
+                "- Do not change section-level structure or unrelated claims.\n"
+                "- If a figure must be referenced, author a real reference in the paragraph itself.\n"
+                "- You may use either `[FLOAT:fig:id]` or `Figure~\\ref{fig:id}`.\n"
+            )
+            revised = await self._writer.rewrite_content(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                section_type=section_type,
+            )
+            if revised and revised.strip():
+                revised_latex = inject_float_refs(revised.strip(), figs_to_ref, tables_to_ref)
+                revised_figures_ok, _, revised_missing_figures = self._validate_required_figure_usages(
+                    raw_latex=revised.strip(),
+                    final_latex=revised_latex,
+                    paragraph_plan=paragraph_plan,
+                )
+                kp_ok = True
+                if key_point:
+                    kp_tool = KeyPointCoverageTool([key_point])
+                    kp_result = await kp_tool.execute(content=revised_latex)
+                    kp_ok = ((kp_result.data or {}).get("coverage", 1.0) if kp_result else 1.0) >= 1.0
+
+                if revised_figures_ok and kp_ok:
+                    if memory is not None:
+                        memory.add_local_review_event(
+                            section_type=section_type,
+                            target_id=target_id,
+                            level="paragraph",
+                            disposition="fixed_locally",
+                            issue_type="+".join(issue["issue_type"] for issue in issues),
+                            message=combined_feedback,
+                            paragraph_index=paragraph_index,
+                            evidence={
+                                "attempt": attempt + 1,
+                                "max_attempts": max_attempts,
+                            },
+                        )
+                    return {
+                        "status": "fixed_locally",
+                        "latex": revised_latex,
+                        "feedback": "",
+                        "issues": issues,
+                    }
+
+                if attempt + 1 < max_attempts:
+                    if memory is not None:
+                        memory.add_local_review_event(
+                            section_type=section_type,
+                            target_id=target_id,
+                            level="paragraph",
+                            disposition="retry_required",
+                            issue_type="+".join(issue["issue_type"] for issue in issues),
+                            message=combined_feedback,
+                            paragraph_index=paragraph_index,
+                            evidence={
+                                "attempt": attempt + 1,
+                                "max_attempts": max_attempts,
+                                "missing_figures": revised_missing_figures,
+                            },
+                        )
+                    return {
+                        "status": "retry_required",
+                        "latex": revised_latex,
+                        "feedback": combined_feedback,
+                        "issues": issues,
+                    }
+
+        if memory is not None:
+            memory.add_local_review_event(
+                section_type=section_type,
+                target_id=target_id,
+                level="paragraph",
+                disposition="escalate",
+                issue_type="+".join(issue["issue_type"] for issue in issues),
+                message=combined_feedback,
+                paragraph_index=paragraph_index,
+                evidence={
+                    "attempt": attempt + 1,
+                    "max_attempts": max_attempts,
+                    "repairable": repairable,
+                    "missing_figures": missing_figures,
+                },
+            )
+        return {
+            "status": "escalate",
+            "latex": final_latex,
+            "feedback": combined_feedback,
+            "issues": issues,
+        }
+
+    @staticmethod
+    def _ensure_paragraph_figure_usages(
+        *,
+        section_type: str,
+        section_plan: SectionPlan,
+        figure_map: Dict[str, FigureSpec],
+        placement_map: Dict[str, Any],
+    ) -> None:
+        """
+        Ensure paragraph-owned figure semantics exist and are rich enough for
+        prompt compilation and placement anchoring.
+        """
+        first_ref_by_figure: Dict[str, int] = {}
+        for pidx, para in enumerate(section_plan._all_paragraphs()):
+            figs_to_ref = getattr(para, "figures_to_reference", []) or []
+            if getattr(para, "figure_usages", None):
+                enriched: List[FigureUsagePlan] = []
+                for usage in para.figure_usages:
+                    fig_id = getattr(usage, "figure_id", "")
+                    fig = figure_map.get(fig_id)
+                    placement = placement_map.get(fig_id)
+                    if fig_id and fig_id not in first_ref_by_figure:
+                        first_ref_by_figure[fig_id] = pidx
+                    enriched.append(FigureUsagePlan(
+                        figure_id=fig_id,
+                        mode=getattr(usage, "mode", "") or (
+                            "define"
+                            if placement and first_ref_by_figure.get(fig_id, pidx) == pidx
+                            else "reference"
+                        ),
+                        rhetorical_role=getattr(usage, "rhetorical_role", "") or (
+                            "introduce"
+                            if placement and first_ref_by_figure.get(fig_id, pidx) == pidx
+                            else "support"
+                        ),
+                        claim_binding=getattr(usage, "claim_binding", "") or getattr(para, "claim_id", "") or "",
+                        semantic_role=getattr(usage, "semantic_role", "") or (getattr(placement, "semantic_role", "") if placement else ""),
+                        what_it_shows=getattr(usage, "what_it_shows", "") or (
+                            getattr(placement, "message", "") if placement and getattr(placement, "message", "") else (
+                                getattr(fig, "description", "") if fig else ""
+                            )
+                        ),
+                        supported_claim=getattr(usage, "supported_claim", "") or getattr(para, "key_point", "") or "",
+                        owner_section=getattr(usage, "owner_section", "") or (getattr(fig, "section", "") if fig else "") or section_type,
+                        must_appear=bool(getattr(usage, "must_appear", False)),
+                        caption=getattr(usage, "caption", "") or (getattr(fig, "caption", "") if fig else ""),
+                        caption_guidance=getattr(usage, "caption_guidance", "") or (getattr(placement, "caption_guidance", "") if placement else ""),
+                    ))
+                para.figure_usages = enriched
+                continue
+
+            derived_figure_usages: List[FigureUsagePlan] = []
+            for fig_id in figs_to_ref:
+                fig = figure_map.get(fig_id)
+                placement = placement_map.get(fig_id)
+                if fig_id not in first_ref_by_figure:
+                    first_ref_by_figure[fig_id] = pidx
+                is_first_ref = first_ref_by_figure.get(fig_id) == pidx
+
+                supported_claim = getattr(para, "key_point", "") or ""
+                what_it_shows = ""
+                if placement and getattr(placement, "message", ""):
+                    what_it_shows = placement.message
+                elif fig and getattr(fig, "description", ""):
+                    what_it_shows = fig.description
+                elif fig and getattr(fig, "caption", ""):
+                    what_it_shows = fig.caption
+
+                derived_figure_usages.append(FigureUsagePlan(
+                    figure_id=fig_id,
+                    mode="define" if placement and is_first_ref else "reference",
+                    rhetorical_role="introduce" if placement and is_first_ref else "support",
+                    claim_binding=getattr(para, "claim_id", "") or "",
+                    semantic_role=getattr(placement, "semantic_role", "") if placement else "",
+                    what_it_shows=what_it_shows,
+                    supported_claim=supported_claim,
+                    owner_section=(getattr(fig, "section", "") if fig else "") or section_type,
+                    must_appear=True,
+                    caption=getattr(fig, "caption", "") if fig else "",
+                    caption_guidance=getattr(placement, "caption_guidance", "") if placement else "",
+                ))
+            para.figure_usages = derived_figure_usages
+
     async def _generate_section_decomposed(
         self,
         section_type: str,
         section_plan: SectionPlan,
         writer_valid_keys: List[str],
         section_title_str: str = "",
+        figures: Optional[List[FigureSpec]] = None,
         evidence_dag: Optional[EvidenceDAG] = None,
         memory: Optional[SessionMemory] = None,
         emitter: Optional[ProgressEmitter] = None,
@@ -3063,6 +3389,21 @@ class MetaDataAgent(ReActAgent):
         verifier = ClaimVerifier()
         paragraph_outputs: List[str] = []
         section_context = ""
+        figure_map = {
+            fig.id: fig for fig in (figures or [])
+            if getattr(fig, "id", "")
+        }
+        placement_map = {
+            placement.figure_id: placement
+            for placement in (section_plan.figures or [])
+            if getattr(placement, "figure_id", "")
+        }
+        self._ensure_paragraph_figure_usages(
+            section_type=section_type,
+            section_plan=section_plan,
+            figure_map=figure_map,
+            placement_map=placement_map,
+        )
         all_paras = section_plan._all_paragraphs()
         total_paras = len(all_paras)
         verify_stats = {"passed": 0, "retried": 0, "degraded": 0, "skipped": 0}
@@ -3124,7 +3465,11 @@ class MetaDataAgent(ReActAgent):
             figs_to_ref = getattr(para, "figures_to_reference", []) or []
             tables_to_ref = getattr(para, "tables_to_reference", []) or []
 
-            max_attempts = MAX_CLAIM_RETRIES if has_claim else 1
+            requires_figure_ref = any(
+                getattr(usage, "must_appear", False)
+                for usage in (getattr(para, "figure_usages", []) or [])
+            )
+            max_attempts = MAX_CLAIM_RETRIES if (has_claim or requires_figure_ref) else 1
             for attempt in range(max_attempts):
                 # === Stage 1: Core content (no citations, CITE/FLOAT markers) ===
                 core_prompt = compile_core_prompt(
@@ -3167,6 +3512,44 @@ class MetaDataAgent(ReActAgent):
 
                 # === Stage 3: Float reference injection ===
                 latex = inject_float_refs(latex, figs_to_ref, tables_to_ref)
+                # === Local mini-review: paragraph-local repair only ===
+                # Boundary rule: local review may repair/retry only the current
+                # paragraph. Cross-section and paper-level concerns belong to
+                # the outer review loop.
+                local_review = await self._run_local_mini_review(
+                    section_type=section_type,
+                    paragraph_index=pidx,
+                    paragraph_plan=para,
+                    raw_latex=raw_latex,
+                    final_latex=latex,
+                    figs_to_ref=figs_to_ref,
+                    tables_to_ref=tables_to_ref,
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                    memory=memory,
+                )
+                latex = local_review.get("latex", latex)
+                local_status = local_review.get("status", "passed")
+                if local_status == "retry_required":
+                    verification_feedback = local_review.get("feedback", "")
+                    verify_stats["retried"] += 1
+                    print(
+                        f"[MetaDataAgent] Paragraph {pidx} attempt {attempt + 1} "
+                        f"requested local retry: {local_review.get('issues', [])}"
+                    )
+                    continue
+                if local_status == "escalate":
+                    verify_stats["skipped"] += 1
+                    print(
+                        f"[MetaDataAgent] Paragraph {pidx} attempt {attempt + 1} "
+                        "escalated unresolved local issues to outer review"
+                    )
+                    break
+                if local_status == "fixed_locally":
+                    print(
+                        f"[MetaDataAgent] Paragraph {pidx} attempt {attempt + 1} "
+                        "fixed issues locally before outer verification"
+                    )
 
                 # === Verification (only when claim bindings exist) ===
                 if not has_claim:
@@ -3829,7 +4212,24 @@ class MetaDataAgent(ReActAgent):
             fig_pattern = rf'\\begin{{figure\*?}}.*?\\label{{{re.escape(fig.id)}}}.*?\\end{{figure\*?}}'
             if re.search(fig_pattern, all_content, re.DOTALL):
                 globally_defined_figs.add(fig.id)
-        
+
+        def _split_rendered_blocks(content: str) -> List[str]:
+            return [b for b in re.split(r"\n\s*\n", content) if b.strip()]
+
+        def _paragraph_block_positions(blocks: List[str]) -> List[int]:
+            positions: List[int] = []
+            for idx, block in enumerate(blocks):
+                stripped = block.strip()
+                if stripped.startswith("\\subsection{"):
+                    continue
+                positions.append(idx)
+            return positions
+
+        def _insert_after_block(blocks: List[str], block_idx: int, figure_latex: str) -> str:
+            updated = list(blocks)
+            updated.insert(block_idx + 1, figure_latex.strip())
+            return "\n\n".join(updated)
+
         for section in paper_plan.sections:
             section_type = section.section_type
             figures_to_define = section.get_figure_ids_to_define()
@@ -3872,19 +4272,53 @@ class MetaDataAgent(ReActAgent):
 \\caption{{{fig.caption}}}\\label{{{fig_id}}}
 \\end{{{env_name}}}
 """
-                
-                # Find a good insertion point:
-                # 1. After the first paragraph that mentions this figure
-                # 2. Or at the end of the section
-                ref_pattern = rf'(Figure~?\\ref{{{re.escape(fig_id)}}}[^.]*\.)'
-                match = re.search(ref_pattern, content)
-                if match:
-                    # Insert after the sentence that references the figure
-                    insert_pos = match.end()
-                    content = content[:insert_pos] + "\n" + figure_latex + content[insert_pos:]
+
+                blocks = _split_rendered_blocks(content)
+                para_positions = _paragraph_block_positions(blocks)
+                anchor_para_idx: Optional[int] = None
+                anchor_claim: str = ""
+                all_paragraphs = section._all_paragraphs() if hasattr(section, "_all_paragraphs") else []
+                for pidx, para in enumerate(all_paragraphs):
+                    usages = getattr(para, "figure_usages", []) or []
+                    for usage in usages:
+                        if getattr(usage, "figure_id", "") != fig_id:
+                            continue
+                        if getattr(usage, "mode", "") == "define" or getattr(usage, "rhetorical_role", "") in {"introduce", "analyze"}:
+                            anchor_para_idx = pidx
+                            anchor_claim = getattr(usage, "supported_claim", "") or getattr(para, "key_point", "") or ""
+                            break
+                    if anchor_para_idx is not None:
+                        break
+
+                inserted = False
+                if anchor_para_idx is not None and anchor_para_idx < len(para_positions):
+                    block_idx = para_positions[anchor_para_idx]
+                    content = _insert_after_block(blocks, block_idx, figure_latex)
+                    inserted = True
                 else:
-                    # Insert at the beginning of the section
-                    content = figure_latex + "\n" + content
+                    # Fallback 1: after the first paragraph block with a real authored ref
+                    ref_pattern = re.compile(rf'Figure~?\\ref{{{re.escape(fig_id)}}}')
+                    for para_pos in para_positions:
+                        if ref_pattern.search(blocks[para_pos]):
+                            content = _insert_after_block(blocks, para_pos, figure_latex)
+                            inserted = True
+                            break
+
+                if not inserted and anchor_claim:
+                    # Fallback 2: after the first paragraph block matching the supported claim
+                    claim_tokens = [w for w in re.findall(r"[A-Za-z0-9]+", anchor_claim.lower()) if len(w) > 4][:4]
+                    if claim_tokens:
+                        for para_pos in para_positions:
+                            block_lower = blocks[para_pos].lower()
+                            if any(tok in block_lower for tok in claim_tokens):
+                                content = _insert_after_block(blocks, para_pos, figure_latex)
+                                inserted = True
+                                break
+
+                if not inserted:
+                    # Fallback 3: end of owner section
+                    blocks.append(figure_latex.strip())
+                    content = "\n\n".join(blocks)
                 
                 generated_sections[section_type] = content
         
@@ -4343,7 +4777,7 @@ class MetaDataAgent(ReActAgent):
     async def _compile_pdf(
         self,
         generated_sections: Dict[str, str],
-        template_path: str,
+        template_path: Optional[str],
         references: List[Dict[str, Any]],
         output_dir: Path,
         paper_title: str,
@@ -4364,7 +4798,7 @@ class MetaDataAgent(ReActAgent):
 
         - **Args**:
             - `generated_sections` (Dict[str, str]): Section contents
-            - `template_path` (str): Path to .zip template file
+            - `template_path` (Optional[str]): Path to .zip template file
             - `references` (List[Dict[str, Any]]): Parsed reference list
             - `output_dir` (Path): Output directory
             - `paper_title` (str): Paper title

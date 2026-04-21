@@ -645,9 +645,15 @@ class RevisionExecutor:
                 revision_prompt = "\n".join(p for p in prompt_parts if p)
 
                 try:
-                    revised_sentence = await self.host._writer.run(
-                        content=revision_prompt,
-                        mode="revision",
+                    system_prompt = (
+                        "You are an expert academic editor revising one sentence.\n"
+                        "Keep the same scientific meaning and preserve LaTeX correctness.\n"
+                        "Return ONLY the revised sentence."
+                    )
+                    revised_sentence = await self.host._writer.rewrite_content(
+                        system_prompt=system_prompt,
+                        user_prompt=revision_prompt,
+                        section_type=section_type,
                     )
                     if revised_sentence and revised_sentence.strip():
                         sentences[sidx] = revised_sentence.strip()
@@ -840,32 +846,11 @@ class RevisionExecutor:
                 "- Do not drop citations during style or structure edits.\n"
             )
 
-            result = await self.host._writer.run(
+            revised = await self.host._writer.rewrite_content(
                 system_prompt=system_prompt,
                 user_prompt=user_message,
                 section_type=section_type,
-                enable_review=False,
-                valid_citation_keys=sorted(list(valid_citation_keys or [])),
-                mode="revision",
-                current_content=current_content,
-                revision_plan={
-                    **(task_contract or {}),
-                    "section_type": section_type,
-                    "target": str((task_contract or {}).get("target") or section_type),
-                    "target_level": "section",
-                    "instruction": str((task_contract or {}).get("instruction") or revision_prompt),
-                    "constraints": (
-                        (task_contract or {}).get("constraints")
-                        or {
-                            "preserve_claims": ["Preserve factual claims and citations."],
-                            "do_not_change": [],
-                        }
-                    ),
-                },
-                memory=memory,
-                peers={"planner": self.host._planner, "reviewer": self.host._reviewer},
             )
-            revised = result.get("generated_content", "")
             return revised if revised else None
 
         except Exception as e:
@@ -933,34 +918,11 @@ class RevisionExecutor:
                 "- Only remove citations when they are explicitly marked invalid.\n"
             )
 
-            result = await self.host._writer.run(
+            revised = await self.host._writer.rewrite_content(
                 system_prompt=system_prompt,
                 user_prompt=user_message,
                 section_type=section_type,
-                enable_review=False,
-                valid_citation_keys=sorted(list(valid_citation_keys or [])),
-                mode="revision",
-                current_content=paragraph_text,
-                revision_plan={
-                    **(task_contract or {}),
-                    "section_type": section_type,
-                    "target": f"{section_type}.p{paragraph_index}",
-                    "target_level": "paragraph",
-                    "instruction": instruction,
-                    "constraints": (
-                        (task_contract or {}).get("constraints")
-                        or {
-                            "preserve_claims": ["Preserve the original scientific claim and evidence links."],
-                            "do_not_change": [],
-                        }
-                    ),
-                    "target_paragraphs": [paragraph_index],
-                    "paragraph_instructions": {paragraph_index: instruction},
-                },
-                memory=memory,
-                peers={"planner": self.host._planner, "reviewer": self.host._reviewer},
             )
-            revised = result.get("generated_content", "")
             return revised if revised else None
         except Exception as e:
             print(

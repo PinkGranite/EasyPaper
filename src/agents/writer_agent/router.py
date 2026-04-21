@@ -123,6 +123,10 @@ def create_writer_router(agent_instance):
     """
     router = APIRouter()
     logger = logging.getLogger("uvicorn.error")
+    # Compatibility boundary:
+    # These endpoints preserve the public writer API surface. Core production
+    # paper generation should continue to flow through MetaDataAgent's
+    # decomposed writing path, not through router-specific behavior.
 
     @router.post("/agent/writer/generate", response_model=WriterResult, status_code=status.HTTP_200_OK)
     async def generate_section(payload: WriterPayload):

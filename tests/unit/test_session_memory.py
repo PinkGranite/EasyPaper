@@ -135,3 +135,96 @@ class TestUpdateSection:
         memory = SessionMemory()
 
         assert memory.get_section("nonexistent") is None
+
+
+class TestLocalReviewEvents:
+    def test_add_local_review_event_and_summary(self):
+        memory = SessionMemory()
+        memory.add_local_review_event(
+            section_type="method",
+            target_id="method.p0",
+            level="paragraph",
+            disposition="fixed_locally",
+            issue_type="missing_required_figure_ref",
+            message="Inserted a required figure reference.",
+            paragraph_index=0,
+        )
+
+        assert len(memory.local_review_events) == 1
+        summary = memory.get_recent_local_review_summary()
+        assert "fixed_locally" in summary
+        assert "method.p0" in summary
+
+    def test_consume_local_writer_responses_clears_pending_receipts(self):
+        memory = SessionMemory()
+        memory.add_local_review_event(
+            section_type="result",
+            target_id="result.p1",
+            level="paragraph",
+            disposition="retry_required",
+            issue_type="missing_key_point",
+            message="Retry with the paragraph key point included.",
+            paragraph_index=1,
+        )
+
+        consumed = memory.consume_local_writer_responses()
+        assert len(consumed["writer_response_paragraph"]) == 1
+        assert consumed["writer_response_paragraph"][0]["disposition"] == "retry_required"
+
+        consumed_again = memory.consume_local_writer_responses()
+        assert consumed_again["writer_response_paragraph"] == []
+
+
+class TestIssueLifecycleRespectsDisposition:
+    def test_escalated_local_response_does_not_resolve_issue(self):
+        memory = SessionMemory()
+        issue = {
+            "target_id": "method.p0",
+            "section_type": "method",
+            "issue_type": "missing_required_figure_ref",
+            "checker": "local_mini_review",
+            "message": "Figure reference missing",
+            "severity": "warning",
+        }
+        memory.update_issue_lifecycle(iteration=1, hierarchical_feedbacks=[issue])
+
+        result = memory.update_issue_lifecycle(
+            iteration=2,
+            hierarchical_feedbacks=[],
+            writer_response_paragraph=[
+                {
+                    "target_id": "method.p0",
+                    "section_type": "method",
+                    "disposition": "escalate",
+                }
+            ],
+        )
+
+        unresolved = result["regression_report"]["unresolved_issues"]
+        assert unresolved == 1
+
+    def test_fixed_local_response_can_resolve_issue(self):
+        memory = SessionMemory()
+        issue = {
+            "target_id": "method.p0",
+            "section_type": "method",
+            "issue_type": "missing_required_figure_ref",
+            "checker": "local_mini_review",
+            "message": "Figure reference missing",
+            "severity": "warning",
+        }
+        memory.update_issue_lifecycle(iteration=1, hierarchical_feedbacks=[issue])
+
+        result = memory.update_issue_lifecycle(
+            iteration=2,
+            hierarchical_feedbacks=[],
+            writer_response_paragraph=[
+                {
+                    "target_id": "method.p0",
+                    "section_type": "method",
+                    "disposition": "fixed_locally",
+                }
+            ],
+        )
+
+        assert result["regression_report"]["resolved_issues"] == 1

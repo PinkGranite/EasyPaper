@@ -489,13 +489,23 @@ class TestPromptLoader:
 
     def test_compile_paragraph_prompt(self):
         from src.agents.shared.prompt_compiler import compile_paragraph_prompt
-        from src.agents.planner_agent.models import ParagraphPlan
+        from src.agents.planner_agent.models import FigureUsagePlan, ParagraphPlan
         para = ParagraphPlan(
             key_point="Fine-tuned BERT for NER",
             supporting_points=["CRF decoding", "Data augmentation"],
             approx_sentences=5,
             role="evidence",
             references_to_cite=["devlin2019"],
+            figures_to_reference=["fig:bert"],
+            figure_usages=[
+                FigureUsagePlan(
+                    figure_id="fig:bert",
+                    rhetorical_role="introduce",
+                    what_it_shows="BERT architecture used in the tagging pipeline.",
+                    supported_claim="The encoder structure motivates the tagging setup.",
+                    must_appear=True,
+                ),
+            ],
         )
         prompt = compile_paragraph_prompt(
             paragraph_plan=para,
@@ -510,6 +520,8 @@ class TestPromptLoader:
         assert "Fine-tuned BERT" in prompt
         assert "devlin2019" in prompt
         assert "BERT uses bidirectional attention" in prompt
+        assert "Figure Reference Briefs" in prompt
+        assert "BERT architecture used in the tagging pipeline." in prompt
 
 
 # =========================================================================

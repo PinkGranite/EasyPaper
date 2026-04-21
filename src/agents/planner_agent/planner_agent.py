@@ -3113,6 +3113,7 @@ class PlannerAgent(BaseAgent):
                 role=raw.get("role", "evidence"),
                 references_to_cite=raw.get("references_to_cite", []),
                 figures_to_reference=raw.get("figures_to_reference", []),
+                figure_usages=raw.get("figure_usages", []),
                 tables_to_reference=raw.get("tables_to_reference", []),
                 cluster_index=raw.get("cluster_index"),
             ))

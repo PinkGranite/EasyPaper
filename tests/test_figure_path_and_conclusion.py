@@ -181,6 +181,99 @@ class TestFigurePlacementGuidance:
         assert "fig_1" not in result
 
 
+class TestEnsureFiguresDefinedAnchoring:
+    def test_inserts_figure_after_anchor_paragraph_not_section_start(self):
+        from src.agents.metadata_agent.metadata_agent import MetaDataAgent
+        from src.agents.metadata_agent.models import FigureSpec
+        from src.agents.planner_agent.models import (
+            FigurePlacement,
+            FigureUsagePlan,
+            PaperPlan,
+            ParagraphPlan,
+            SectionPlan,
+        )
+
+        agent = MetaDataAgent.__new__(MetaDataAgent)
+        paper_plan = PaperPlan(
+            title="Demo",
+            sections=[
+                SectionPlan(
+                    section_type="introduction",
+                    paragraphs=[
+                        ParagraphPlan(key_point="Context paragraph."),
+                        ParagraphPlan(
+                            key_point="This paragraph introduces the figure.",
+                            figures_to_reference=["fig:overview"],
+                            figure_usages=[
+                                FigureUsagePlan(
+                                    figure_id="fig:overview",
+                                    mode="define",
+                                    rhetorical_role="introduce",
+                                    supported_claim="This paragraph introduces the figure.",
+                                    must_appear=True,
+                                ),
+                            ],
+                        ),
+                        ParagraphPlan(key_point="Closing paragraph."),
+                    ],
+                    figures=[
+                        FigurePlacement(
+                            figure_id="fig:overview",
+                            semantic_role="data_visualization",
+                            message="Overview message",
+                        )
+                    ],
+                )
+            ],
+        )
+        figures = [
+            FigureSpec(
+                id="fig:overview",
+                caption="Overview of the framework.",
+                description="A diagram.",
+            )
+        ]
+        generated_sections = {
+            "introduction": (
+                "First paragraph.\n\n"
+                "Second paragraph introduces Figure~\\ref{fig:overview} for the reader.\n\n"
+                "Third paragraph."
+            )
+        }
+
+        updated = agent._ensure_figures_defined(generated_sections, paper_plan, figures)
+        content = updated["introduction"]
+
+        assert content.index("First paragraph.") < content.index("Second paragraph introduces")
+        assert content.index("Second paragraph introduces") < content.index("\\begin{figure}")
+        assert content.index("\\begin{figure}") < content.index("Third paragraph.")
+
+    def test_falls_back_to_end_of_section_when_no_anchor_found(self):
+        from src.agents.metadata_agent.metadata_agent import MetaDataAgent
+        from src.agents.metadata_agent.models import FigureSpec
+        from src.agents.planner_agent.models import FigurePlacement, PaperPlan, ParagraphPlan, SectionPlan
+
+        agent = MetaDataAgent.__new__(MetaDataAgent)
+        paper_plan = PaperPlan(
+            title="Demo",
+            sections=[
+                SectionPlan(
+                    section_type="discussion",
+                    paragraphs=[ParagraphPlan(key_point="Only paragraph.")],
+                    figures=[FigurePlacement(figure_id="fig:missing")],
+                )
+            ],
+        )
+        figures = [FigureSpec(id="fig:missing", caption="Late figure", description="Desc")]
+        generated_sections = {"discussion": "Only paragraph."}
+
+        updated = agent._ensure_figures_defined(generated_sections, paper_plan, figures)
+        content = updated["discussion"]
+
+        assert content.startswith("Only paragraph.")
+        assert content.rstrip().endswith("\\end{figure}")
+
+
 # =========================================================================
 # 3. Conclusion CITE/FLOAT cleanup
 # =========================================================================

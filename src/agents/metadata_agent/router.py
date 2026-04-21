@@ -480,7 +480,7 @@ def create_metadata_router(agent: "MetaDataAgent") -> APIRouter:
                 },
                 "compile_pdf": {
                     "type": "boolean",
-                    "description": "Whether to compile PDF (requires template_path)",
+                    "description": "Whether to compile PDF",
                     "required": False,
                     "default": True,
                 },
